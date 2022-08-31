@@ -77,6 +77,8 @@ We provide support for convolutions as follows:
 * Input may be provided in any order (specified using `dimension_numbers`).
 * Only one of depthwise, atrous and transposed convolutions may be used at the
   same time, though depthwise atrous convolutions are supported.
+* Convolutions are known to have a somewhat higher numeric inaccuracy, so if you 
+  are using many large convolutions, this may lead to large deviations.
 
 ### XlaGather
 
@@ -185,6 +187,19 @@ This op is called by `lax.scatter`, `lax.scatter_min`, `lax.scatter_max`,
 We support all these ops for unique indices. For non-unique indices we
 support (min,max,mul,add) for single depth scatters.
 
+We implement support for this op through
+[tf.tensor_scatter_nd_update](https://www.tensorflow.org/api_docs/python/tf/tensor_scatter_nd_update).
+
 There are a few more limitations:
-* the GatherScatterMode must be PROMISE_IN_BOUNDS.
-* dtypes `np.bool` and `jnp.complex*` are not supported.
+
+* Dtypes `np.bool` and `jnp.complex*` are not supported.
+* We disallow scatter mode `lax.GatherScatterMode.CLIP` because it may lead to
+  incorrect behavior for out-of-bounds indices (see next point).
+* The behavior for out-of-bounds scatter indices is as follows:
+  - When running in eager or graph mode, it throws an error. This is because
+    `tf.scatter` throws an error as well. If this is problematic for your use
+    case, please let us know and we can add more support for this.
+  - When running in compile mode, the out-of-bounds indices are dropped, which
+    is the behavior of both `lax.GatherScatterMode.FILL_OR_DROP` and
+    `lax.GatherScatterMode.PROMISE_IN_BOUNDS`. This is why `CLIP` is not
+    allowed.

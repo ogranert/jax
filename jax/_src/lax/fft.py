@@ -29,7 +29,11 @@ from jax import lax
 from jax.interpreters import ad
 from jax.interpreters import batching
 from jax._src.lib.mlir.dialects import mhlo
+from jax._src.lib import mlir_api_version
 from jax._src.lib import xla_client
+# TODO(phawkins): remove pocketfft references when the minimum jaxlib version
+# is 0.3.17 or newer.
+from jax._src.lib import ducc_fft
 from jax._src.lib import pocketfft
 from jax._src.numpy.util import _promote_dtypes_complex, _promote_dtypes_inexact
 
@@ -106,7 +110,7 @@ def fft_abstract_eval(x, fft_type, fft_lengths):
 
 def _fft_lowering(ctx, x, *, fft_type, fft_lengths):
   out_aval, = ctx.avals_out
-  if jax._src.lib.mlir_api_version < 31:
+  if mlir_api_version < 31:
     return [
         mhlo.FftOp(
             mlir.aval_to_ir_type(out_aval), x,
@@ -122,8 +126,12 @@ def _fft_lowering(ctx, x, *, fft_type, fft_lengths):
 
 def _fft_lowering_cpu(ctx, x, *, fft_type, fft_lengths):
   x_aval, = ctx.avals_in
-  return [pocketfft.pocketfft_mhlo(x, x_aval.dtype, fft_type=fft_type,
+  if ducc_fft:
+    return [ducc_fft.ducc_fft_mhlo(x, x_aval.dtype, fft_type=fft_type,
                                    fft_lengths=fft_lengths)]
+  else:
+    return [pocketfft.pocketfft_mhlo(x, x_aval.dtype, fft_type=fft_type,
+                                    fft_lengths=fft_lengths)]
 
 
 def _naive_rfft(x, fft_lengths):
@@ -187,5 +195,4 @@ fft_p.def_abstract_eval(fft_abstract_eval)
 mlir.register_lowering(fft_p, _fft_lowering)
 ad.deflinear2(fft_p, _fft_transpose_rule)
 batching.primitive_batchers[fft_p] = _fft_batching_rule
-if pocketfft:
-  mlir.register_lowering(fft_p, _fft_lowering_cpu, platform='cpu')
+mlir.register_lowering(fft_p, _fft_lowering_cpu, platform='cpu')

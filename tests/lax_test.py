@@ -38,6 +38,7 @@ import jax.util
 from jax.interpreters import xla
 from jax.interpreters import mlir
 from jax.interpreters import batching
+from jax.interpreters import pxla
 from jax.experimental import array
 from jax._src.lib.mlir.dialects import mhlo
 from jax._src import dispatch
@@ -1386,6 +1387,30 @@ class LaxTest(jtu.JaxTestCase):
     self._CompileAndCheck(op, args_maker)
     self._CheckAgainstNumpy(numpy_op, op, args_maker)
     check_grads(op, args_maker(), 2, ["fwd", "rev"], eps=1.)
+
+  @parameterized.named_parameters(jtu.cases_from_list(
+      {"testcase_name": f"_input_type={input_type}_jit={jit}",
+       "input_type": input_type, "jit": jit}
+      for input_type in ["np.array", "jnp.array", "float", "np.float32"]
+      for jit in [True, False]))
+  def testEmptySqueezeReturnType(self, input_type, jit):
+    if input_type == "np.array":
+      operand = np.arange(5)
+    elif input_type == "jnp.array":
+      operand = jnp.arange(5)
+    elif input_type == "float":
+      operand = 2.0
+    elif input_type == "np.float32":
+      operand = np.float32(2.0)
+    else:
+      raise ValueError(f"Unrecognized input_type={input_type}")
+
+    op = lambda x: lax.squeeze(x, dimensions=())
+    if jit:
+      op = jax.jit(op)
+    result = op(operand)
+    expected_type = array.Array if config.jax_array else jnp.DeviceArray
+    self.assertIsInstance(result, expected_type)
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_inshape={}_outshape={}".format(
@@ -2929,9 +2954,9 @@ class LazyConstantTest(jtu.JaxTestCase):
       unary_op_types[r.op] = (unary_op_types.get(r.op, set()) |
                               {np.dtype(t) for t in r.dtypes})
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-        {"testcase_name": f"_{op}", "op_name": op, "rec_dtypes": dtypes}
-      for op, dtypes in unary_op_types.items()))
+  @parameterized.named_parameters(
+      {"testcase_name": f"_{op}", "op_name": op, "rec_dtypes": dtypes}
+      for op, dtypes in unary_op_types.items())
   def testUnaryWeakTypes(self, op_name, rec_dtypes):
     """Test that all lax unary ops propagate weak_type information appropriately."""
     # Find a valid dtype for the function.
@@ -2949,8 +2974,12 @@ class LazyConstantTest(jtu.JaxTestCase):
     lax_op = op(lax_val)
 
     self.assertAllClose(py_op, lax_op, check_dtypes=True)
-    self.assertTrue(py_op.aval.weak_type)
     self.assertFalse(lax_op.aval.weak_type)
+    if type(py_val) == bool:
+      # Booleans should have weak types stripped.
+      self.assertFalse(py_op.aval.weak_type)
+    else:
+      self.assertTrue(py_op.aval.weak_type)
 
   def testCumsumLengthOne(self):
     # regression test for issue 4672
@@ -2986,17 +3015,7 @@ class LaxNamedShapeTest(jtu.JaxTestCase):
       (out,), _ = lax.psum_p.abstract_eval(aval1, axes=('i',), axis_index_groups=None)
       self.assertEqual(out, expected)
 
-
-class FooTy:
-  name = 'foo'
-  def __hash__(self) -> int:
-    return hash(FooTy)
-  def __eq__(self, other) -> bool:
-    return type(other) is FooTy
-  def __repr__(self) -> str:
-    return self.name
-  __str__ = __repr__
-
+class FooTyRules:
   # handlers
 
   @staticmethod
@@ -3007,6 +3026,14 @@ class FooTy:
   @staticmethod
   def result_handler(sticky_device, aval):
     def handler(_, buf):
+      buf.aval = core.ShapedArray(buf.shape, buf.dtype)
+      return FooArray(aval.shape, buf)
+    return handler
+
+  @staticmethod
+  def global_sharded_result_handler(aval, out_sharding, committed):
+    def handler(bufs):
+      buf, = bufs
       buf.aval = core.ShapedArray(buf.shape, buf.dtype)
       return FooArray(aval.shape, buf)
     return handler
@@ -3075,6 +3102,19 @@ class FooTy:
                                   avals_in=[aval_x_raw, aval_indices],
                                   avals_out=[aval_y_raw])
 
+
+class FooTy:
+  name = 'foo'
+  _rules = FooTyRules
+
+  def __hash__(self) -> int:
+    return hash(FooTy)
+  def __eq__(self, other) -> bool:
+    return type(other) is FooTy
+  def __repr__(self) -> str:
+    return self.name
+  __str__ = __repr__
+
 # primitives
 
 make_p = core.Primitive('make')
@@ -3121,6 +3161,12 @@ def device_put_foo_array(x: FooArray, device):
     return array._device_put_array(x.data, device)
   return dispatch._device_put_array(x.data, device)
 
+def shard_foo_array_handler(x, devices, indices, mode):
+  device, = devices
+  if isinstance(x.data, array.Array):
+    return array._device_put_array(x.data, device)
+  return dispatch._device_put_array(x.data, device)
+
 def foo_array_constant_handler(x, c):
   if config.jax_array:
     return array._array_mlir_constant_handler(x.data, c)
@@ -3155,6 +3201,7 @@ class CustomElementTypesTest(jtu.JaxTestCase):
     xla.pytype_aval_mappings[FooArray] = \
         lambda x: core.ShapedArray(x.shape, FooTy())
     dispatch.device_put_handlers[FooArray] = device_put_foo_array
+    pxla.shard_arg_handlers[FooArray] = shard_foo_array_handler
     mlir._constant_handlers[FooArray] = foo_array_constant_handler
     mlir.register_lowering(make_p, mlir.lower_fun(make_lowering, False))
     mlir.register_lowering(bake_p, mlir.lower_fun(bake_lowering, False))

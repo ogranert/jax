@@ -72,8 +72,10 @@ class State:
     if self.client is not None:
       raise RuntimeError('distributed.initialize should only be called once.')
 
+    # Set init_timeout to 5 min to leave time for all the processes to connect
     self.client = xla_extension.get_distributed_runtime_client(
-        coordinator_address, process_id, config.jax_coordination_service)
+        coordinator_address, process_id, config.jax_coordination_service,
+        init_timeout=300)
     logging.info('Connecting to JAX distributed service on %s', coordinator_address)
     self.client.connect()
 
@@ -87,6 +89,8 @@ class State:
     if self.service:
       self.service.shutdown()
       self.service = None
+    if self.preemption_sync_manager:
+      self.preemption_sync_manager = None
 
   def initialize_preemption_sync_manager(self):
     if self.preemption_sync_manager is not None:

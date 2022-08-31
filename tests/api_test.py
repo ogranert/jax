@@ -55,13 +55,15 @@ from jax.interpreters import pxla
 from jax.interpreters import partial_eval as pe
 from jax.interpreters.pxla import PartitionSpec as P
 from jax.experimental import array, sharding
+from jax._src import config as jax_config
+from jax._src import custom_derivatives
 from jax._src import device_array
-import jax._src.lib
+from jax._src import prng
 from jax._src.lib import xla_client
 from jax._src import test_util as jtu
 from jax import tree_util
 from jax import linear_util as lu
-import jax._src.util
+import jax._src.util as jax_util
 from jax._src.ad_checkpoint import saved_residuals
 from jax.ad_checkpoint import checkpoint as new_checkpoint, checkpoint_name
 
@@ -72,7 +74,6 @@ FLAGS = config.FLAGS
 
 python_version = (sys.version_info[0], sys.version_info[1])
 numpy_version = tuple(map(int, np.__version__.split('.')[:3]))
-jaxlib_version = jax._src.lib.version
 
 
 def _check_instance(self, x):
@@ -238,13 +239,13 @@ class CPPJitTest(jtu.BufferDonationTestCase):
       assert len(side) == 3
 
   def test_jit_device(self):
+    if config.jax_array:
+      self.skipTest('The device parameter of jit has been deprecated. Array '
+                    'is not compatible with it and will not work.')
     device = jax.devices()[-1]
     x = self.jit(lambda x: x, device=device)(3.)
     _check_instance(self, x)
-    if config.jax_array:
-      self.assertEqual(x.device(), device)
-    else:
-      self.assertEqual(x.device_buffer.device(), device)
+    self.assertEqual(x.device_buffer.device(), device)
 
   @jtu.skip_on_devices("cpu")
   def test_jit_default_device(self):
@@ -266,10 +267,13 @@ class CPPJitTest(jtu.BufferDonationTestCase):
     self.assertEqual(f(1).device(), system_default_device)
 
     with jax.default_device(test_device):
-      # Explicit `device` or `backend` argument to jit overrides default_device
-      self.assertEqual(
-          jax.jit(f, device=system_default_device)(1).device(),
-          system_default_device)
+      # Skip this for jax.Array because using the device argument of `jit` is
+      # deprecated.
+      if not config.jax_array:
+        # Explicit `device` or `backend` argument to jit overrides default_device
+        self.assertEqual(
+            jax.jit(f, device=system_default_device)(1).device(),
+            system_default_device)
       out = jax.jit(f, backend="cpu")(1)
       if config.jax_array:
         self.assertIsInstance(out.sharding, sharding.SingleDeviceSharding)
@@ -768,7 +772,7 @@ class CPPJitTest(jtu.BufferDonationTestCase):
     def wrap(arr):
       arr = np.array(arr, dtype=np.uint32)
       if config.jax_enable_custom_prng:
-        return jax._src.prng.random_wrap(arr, impl=jax.random.default_prng_impl())
+        return prng.random_wrap(arr, impl=jax.random.default_prng_impl())
       else:
         return arr
 
@@ -1066,7 +1070,10 @@ class CPPJitTest(jtu.BufferDonationTestCase):
     jitted_f = self.jit(lambda x, y: x, keep_unused=True)
     with jtu.count_device_put() as count:
       _ = jitted_f(1, 2)
-    self.assertEqual(count[0], 1)
+    if config.jax_array:
+      self.assertEqual(count[0], 2)
+    else:
+      self.assertEqual(count[0], 1)
 
   @jtu.ignore_warning(category=DeprecationWarning)
   def test_jit_lower_compile_compiler_ir(self):
@@ -1205,7 +1212,7 @@ class APITest(jtu.JaxTestCase):
       ('no_array', False)
   )
   def test_grad_item(self, array_enabled):
-    with jax._src.config.jax_array(array_enabled):
+    with jax_config.jax_array(array_enabled):
       def f(x):
         if x.astype(bool).item():
           return x ** 2
@@ -1219,7 +1226,7 @@ class APITest(jtu.JaxTestCase):
       ('no_array', False)
   )
   def test_jit_item(self, array_enabled):
-    with jax._src.config.jax_array(array_enabled):
+    with jax_config.jax_array(array_enabled):
       def f(x):
         return x.item()
       x = jnp.array(1.0)
@@ -4490,7 +4497,7 @@ class RematTest(jtu.JaxTestCase):
     with assertEvals(3):
       vjp(v)
 
-    @jax._src.util.curry
+    @jax_util.curry
     def call(f, *args):
       return jax.core.call(
           jax.linear_util.wrap_init(lambda *args: [f(*args)]),
@@ -6872,11 +6879,10 @@ class CustomJVPTest(jtu.JaxTestCase):
     # This is a unit test for an internal API. We include it so as not to
     # regress https://github.com/google/jax/issues/9567. For an explanation of
     # this helper function, see https://github.com/google/jax/issues/6415.
-    from jax._src.custom_derivatives import _maybe_perturbed
     def f(x):
       def g(y, _):
         z = y * x
-        self.assertTrue(_maybe_perturbed(z))
+        self.assertTrue(custom_derivatives._maybe_perturbed(z))
         return y, None
       g(1, None)
       return lax.scan(g, 1, xs=None, length=1)[0]
@@ -6885,12 +6891,11 @@ class CustomJVPTest(jtu.JaxTestCase):
 
   def test_maybe_perturbed_int_regression(self):
     # see https://github.com/google/jax/discussions/9951
-    from jax._src.custom_derivatives import closure_convert
 
     @jax.jit
     def f():
       x = jnp.array(1)
-      _, aux_args = closure_convert(lambda: x)
+      _, aux_args = custom_derivatives.closure_convert(lambda: x)
       self.assertEmpty(aux_args)
     f()
 

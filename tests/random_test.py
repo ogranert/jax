@@ -38,7 +38,7 @@ from jax._src import test_util as jtu
 from jax import vmap
 from jax.interpreters import xla
 
-import jax._src.random
+from jax._src import random as jax_random
 from jax._src import prng as prng_internal
 
 from jax.config import config
@@ -56,7 +56,7 @@ def _prng_key_as_array(key):
 
 def _maybe_unwrap(key):
   # TODO(frostig): remove once we upgrade to always enable_custom_prng
-  unwrap = jax._src.prng.random_unwrap
+  unwrap = prng_internal.random_unwrap
   return unwrap(key) if config.jax_enable_custom_prng else key
 
 
@@ -236,8 +236,8 @@ class PrngTest(jtu.JaxTestCase):
 
     # TODO(frostig): remove once we always enable_custom_prng
     def random_bits(key, *args):
-      key, _ = jax._src.random._check_prng_key(key)
-      return jax._src.random._random_bits(key, *args)
+      key, _ = jax_random._check_prng_key(key)
+      return jax_random._random_bits(key, *args)
 
     key = random.PRNGKey(1701)
 
@@ -272,8 +272,8 @@ class PrngTest(jtu.JaxTestCase):
 
     # TODO(frostig): remove once we always enable_custom_prng
     def random_bits(key, *args):
-      key, _ = jax._src.random._check_prng_key(key)
-      return jax._src.random._random_bits(key, *args)
+      key, _ = jax_random._check_prng_key(key)
+      return jax_random._random_bits(key, *args)
 
     with jax.default_prng_impl(prng_name):
       key = random.PRNGKey(1701)
@@ -302,8 +302,8 @@ class PrngTest(jtu.JaxTestCase):
 
     # TODO(frostig): remove once we always enable_custom_prng
     def random_bits(key, *args):
-      key, _ = jax._src.random._check_prng_key(key)
-      return jax._src.random._random_bits(key, *args)
+      key, _ = jax_random._check_prng_key(key)
+      return jax_random._random_bits(key, *args)
 
     N = 10
     key = random.PRNGKey(1701)
@@ -1451,7 +1451,10 @@ class LaxRandomTest(jtu.JaxTestCase):
     key = self.seed_prng(1).block_until_ready()
     with jtu.count_device_put() as count:
       jax.jit(random.split)(key)
-    self.assertEqual(count[0], 1)  # 1 for the argument device_put
+    if config.jax_array:
+      self.assertEqual(count[0], 0)
+    else:
+      self.assertEqual(count[0], 1)  # 1 for the argument device_put
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": f"_dtype={dtype}", "dtype": dtype}
@@ -1505,9 +1508,29 @@ class KeyArrayTest(jtu.JaxTestCase):
   # might also be a more general test of extended/custom eltypes. If
   # so, add a corresponding test to to CustomElementTypesTest as well.
 
-  def make_keys(self, *shape):
-    key = prng.seed_with_impl(prng.threefry_prng_impl, 28)
-    return jnp.reshape(jax.random.split(key, np.prod(shape)), shape)
+  def make_keys(self, *shape, seed=None):
+    if seed is None:
+      seed = 28
+    seeds = seed + jnp.arange(np.prod(shape), dtype=jnp.uint32)
+    make_key = partial(prng.seed_with_impl, prng.threefry_prng_impl)
+    return jnp.reshape(jax.vmap(make_key)(seeds), shape)
+
+  def test_dtype_property(self):
+    k1, k2 = self.make_keys(), self.make_keys()
+    self.assertEqual(k1.dtype, k2.dtype)
+
+    k3, k4 = jax.random.split(k1, 2)
+    self.assertEqual(k1.dtype, k3.dtype)
+    self.assertEqual(k3.dtype, k4.dtype)
+
+    g = []
+    def f(k):
+      g.append(k.dtype)
+      return jax.random.split(k)
+    _ = jax.jit(f)(k1)
+    self.assertEqual(g[0], k1.dtype)
+    self.assertEqual(g[0], k2.dtype)
+
 
   # -- prng primitives
 
@@ -1521,7 +1544,39 @@ class KeyArrayTest(jtu.JaxTestCase):
     self.assertIsInstance(keys, random.KeyArray)
     self.assertEqual(keys.shape, (3,))
 
-  # -- eltype-polymorphic operations
+  def test_eval_shape_keys_in(self):
+    def f(key):
+      return prng_internal.random_bits(key, bit_width=32, shape=(5,))
+    out = jax.eval_shape(f, self.make_keys())
+    self.assertEqual(out.shape, (5,))
+    self.assertEqual(out.dtype, np.dtype('uint32'))
+
+    def f(key):
+      return prng_internal.random_bits(key, bit_width=16, shape=(5,))
+    out = jax.eval_shape(f, self.make_keys())
+    self.assertEqual(out.shape, (5,))
+    self.assertEqual(out.dtype, np.dtype('uint16'))
+
+  def test_eval_shape_keys_out(self):
+    def f(seed):
+      return self.make_keys(seed=seed)
+    out = jax.eval_shape(f, 28)
+    self.assertEqual(out.shape, ())
+    # TODO(frostig): check dtype too when available
+
+  def test_eval_shape_keys_in_out(self):
+    def f(key):
+      return jax.random.split(key)
+    out = jax.eval_shape(f, self.make_keys())
+    self.assertEqual(out.shape, (2,))
+    # TODO(frostig): check dtype too when available
+
+  def test_vmap(self):
+    ks = self.make_keys(3, 4, 5)
+    ys = jax.vmap(jax.jit(lambda k: k.T))(ks)
+    self.assertEqual(ys.shape, (3, 5, 4))
+
+  # -- dtype-polymorphic operation (esp. lowerings)
 
   def test_scan_jaxpr(self):
     ks = self.make_keys(3, 4, 5)
@@ -1538,14 +1593,14 @@ class KeyArrayTest(jtu.JaxTestCase):
     a, = jaxpr.invars
     self.assertIsInstance(a.aval, core.ShapedArray)
     self.assertEqual(a.aval.shape, (3, 4, 5))
-    self.assertIs(type(a.aval.dtype), jax._src.prng.KeyTy)
+    self.assertIs(type(a.aval.dtype), prng_internal.KeyTy)
     self.assertLen(jaxpr.eqns, 1)
     e, = jaxpr.eqns
     self.assertLen(e.outvars, 1)
     b, = e.outvars
     self.assertIsInstance(b.aval, core.ShapedArray)
     self.assertEqual(b.aval.shape, (3, 5, 4))
-    self.assertIs(type(b.aval.dtype), jax._src.prng.KeyTy)
+    self.assertIs(type(b.aval.dtype), prng_internal.KeyTy)
 
   def test_scan_lowering(self):
     ks = self.make_keys(3, 4)
@@ -1553,11 +1608,6 @@ class KeyArrayTest(jtu.JaxTestCase):
     _, out = jax.jit(f)(ks)  # doesn't crash
     self.assertIsInstance(out, random.KeyArray)
     self.assertEqual(out.shape, (3, 4))
-
-  def test_vmap(self):
-    ks = self.make_keys(3, 4, 5)
-    ys = jax.vmap(jax.jit(lambda k: k.T))(ks)
-    self.assertEqual(ys.shape, (3, 5, 4))
 
   def test_slice(self):
     ks = self.make_keys(3, 4)
@@ -1604,10 +1654,10 @@ class KeyArrayTest(jtu.JaxTestCase):
   # TODO(frostig,mattjj): more polymorphic primitives tests
 
 
-threefry_seed = jax._src.prng.threefry_seed
-threefry_split = jax._src.prng.threefry_split
-threefry_random_bits = jax._src.prng.threefry_random_bits
-threefry_fold_in = jax._src.prng.threefry_fold_in
+threefry_seed = prng_internal.threefry_seed
+threefry_split = prng_internal.threefry_split
+threefry_random_bits = prng_internal.threefry_random_bits
+threefry_fold_in = prng_internal.threefry_fold_in
 
 def _double_threefry_seed(seed):
   int_t = seed.dtype.type if hasattr(seed, 'dtype') else type(seed)

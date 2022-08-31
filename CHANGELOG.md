@@ -10,12 +10,19 @@ PLEASE REMEMBER TO CHANGE THE '..main' WITH AN ACTUAL TAG in GITHUB LINK.
 
 ## jax 0.3.17 (Unreleased)
 * [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.16...main).
+* Bugs
+  * Fix corner case issue in gradient of `lax.pow` with an exponent of zero
+    ({jax-issue}`12041`)
 * Breaking changes
   * {func}`jax.checkpoint`, also known as {func}`jax.remat`, no longer supports
     the `concrete` option, following the previous version's deprecation; see
     [JEP 11830](https://jax.readthedocs.io/en/latest/jep/11830-new-remat-checkpoint.html).
 * Changes
   * Added {func}`jax.pure_callback` that enables calling back to pure Python functions from compiled functions (e.g. functions decorated with `jax.jit` or `jax.pmap`).
+* Deprecations:
+  * The deprecated `DeviceArray.tile()` method has been removed. Use {func}`jax.numpy.tile`
+    ({jax-issue}`#11944`).
+  * `DeviceArray.to_py()` has been deprecated. Use `np.asarray(x)` instead.
 
 ## jax 0.3.16
 * [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.15...main).

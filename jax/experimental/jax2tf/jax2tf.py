@@ -37,14 +37,14 @@ from jax.interpreters import partial_eval
 from jax.interpreters import pxla
 from jax.interpreters import xla
 
-import jax._src.prng
-import jax._src.random
 from jax._src import ad_checkpoint
 from jax._src import ad_util
 from jax._src import api
 from jax._src import api_util
 from jax._src import dispatch
 from jax._src import dtypes
+from jax._src import prng
+from jax._src import random as random_internal
 from jax._src import source_info_util
 from jax._src import util
 from jax._src.lax import control_flow as lax_control_flow
@@ -55,8 +55,10 @@ from jax._src.lax import windowed_reductions as lax_windowed_reductions
 from jax._src import lib as jaxlib
 from jax._src.lib import xla_client
 
+from jax.experimental.global_device_array import GlobalDeviceArray
 from jax.experimental.jax2tf import shape_poly
 from jax.experimental.jax2tf import impl_no_xla
+
 
 import numpy as np
 import tensorflow as tf  # type: ignore[import]
@@ -777,7 +779,7 @@ def _jax_physical_aval(aval: core.ShapedArray) -> core.ShapedArray:
   there is only one and return it.
   """
   if type(aval.dtype) in core.custom_eltypes:
-    aval, = aval.dtype.physical_avals(aval)
+    aval, = aval.dtype._rules.physical_avals(aval)
     return aval
   return aval
 
@@ -814,6 +816,16 @@ def _to_jax_dtype(tf_dtype):
   # Note that converting _to_tf_dtype and _to_jax_dtype are not inverses,
   # due to float0 and 64-bit behavior.
   return dtypes.canonicalize_dtype(tf_dtype.as_numpy_dtype)
+
+
+def _maybe_decode_gda(gda_or_py_object: Any):
+  """Convert GlobalDeviceArray into numpy object."""
+  if isinstance(gda_or_py_object, GlobalDeviceArray):
+    if jax.process_count() != 1:
+      raise RuntimeError("GlobalDeviceArray does not support multi-process"
+                         f" currently. Process num = {jax.process_count()}")
+    return gda_or_py_object._value
+  return gda_or_py_object
 
 
 def _tfval_to_tensor_jax_dtype(val: TfVal,
@@ -862,7 +874,8 @@ def _tfval_to_tensor_jax_dtype(val: TfVal,
       # The float0 type is not known to TF.
       if jax_dtype == dtypes.float0:
         val = np.zeros(np.shape(val), conversion_dtype.as_numpy_dtype)
-      tf_val = tf.convert_to_tensor(val, dtype=conversion_dtype)
+      tf_val = tf.convert_to_tensor(
+          _maybe_decode_gda(val), dtype=conversion_dtype)
       if do_memoize:
         _thread_local_state.constant_cache[const_key] = (val, tf_val)
     return tf_val, jax_dtype
@@ -2364,18 +2377,18 @@ tf_impl_with_avals[jax._src.prng.random_unwrap_p] = _random_unwrap_impl
 
 def _threefry2x32_jax_impl(*args: TfVal, _in_avals, _out_aval):
   res = _convert_jax_impl(
-      partial(jax._src.prng._threefry2x32_lowering, use_rolled_loops=False),
+      partial(prng._threefry2x32_lowering, use_rolled_loops=False),
       multiple_results=True, extra_name_stack="threefry")(
           *args, _in_avals=_in_avals, _out_aval=_out_aval)
   return res
 
 
-tf_impl_with_avals[jax._src.prng.threefry2x32_p] = _threefry2x32_jax_impl
+tf_impl_with_avals[prng.threefry2x32_p] = _threefry2x32_jax_impl
 
 # Use the vmap implementation, otherwise on TPU the performance is really bad
 # With use_vmap=True on, we get about the same performance for JAX and jax2tf.
 tf_impl_with_avals[random.random_gamma_p] = _convert_jax_impl(
-    partial(jax._src.random._gamma_impl, use_vmap=True),
+    partial(random_internal._gamma_impl, use_vmap=True),
     multiple_results=False, extra_name_stack="random_gamma")
 
 

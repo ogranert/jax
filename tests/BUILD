@@ -21,7 +21,7 @@ load(
     "pytype_library",
 )
 
-licenses(["notice"])  # Apache 2
+licenses(["notice"])
 
 package(default_visibility = ["//visibility:private"])
 
@@ -78,6 +78,10 @@ jax_test(
 jax_test(
     name = "custom_object_test",
     srcs = ["custom_object_test.py"],
+    # TODO(yashkatariya,mattjj,phawkins): Enable custom_object_test once
+    # `ExecuteReplicated` supports the use case of having more
+    # than 1 buffer on a single device.
+    disable_configs = ["cpu_jax_array"],
 )
 
 py_test(
@@ -90,17 +94,8 @@ py_test(
 )
 
 py_test(
-    name = "distributed_multinode_test",
-    srcs = ["distributed_multinode_test.py"],
-    deps = [
-        "//jax",
-        "//jax:test_util",
-    ],
-)
-
-py_test(
-    name = "distributed_test",
-    srcs = ["distributed_test.py"],
+    name = "multiprocess_gpu_test",
+    srcs = ["multiprocess_gpu_test.py"],
     args = [
         "--exclude_test_targets=MultiProcessGpuTest",
     ],

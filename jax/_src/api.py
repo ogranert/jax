@@ -1458,7 +1458,7 @@ def vmap(fun: F,
     axis_name: Optional, a hashable Python object used to identify the mapped
       axis so that parallel collectives can be applied.
     axis_size: Optional, an integer indicating the size of the axis to be
-      mapped. If not provided, the mapped axis size is inferred from arguments..
+      mapped. If not provided, the mapped axis size is inferred from arguments.
 
   Returns:
     Batched/vectorized version of ``fun`` with arguments that correspond to
@@ -2796,7 +2796,7 @@ def device_put_sharded(shards: Sequence[Any], devices: Sequence[xc.Device]):  # 
       return array.Array(
           stacked_aval,
           sharding.PmapSharding(np.array(devices), sharding_spec),
-          buffers, committed=True)
+          buffers, committed=True, _skip_checks=True)
     else:
       return pxla.make_sharded_device_array(stacked_aval, None, buffers)
 
@@ -2850,7 +2850,7 @@ def device_put_replicated(x: Any, devices: Sequence[xc.Device]):  # noqa: F811
       sharding_spec = pxla._create_pmap_sharding_spec(aval)
       return array.Array(
           aval, sharding.PmapSharding(np.array(devices), sharding_spec),
-          [buf, *rest_bufs], committed=True)
+          [buf, *rest_bufs], committed=True, _skip_checks=True)
     else:
       return pxla.make_sharded_device_array(aval, None, [buf, *rest_bufs])
 
@@ -3180,6 +3180,8 @@ def named_scope(
     ...   logits = w.dot(x)
     ...   return jax.nn.relu(logits)
   """
+  if not isinstance(name, str):
+    raise ValueError("named_scope name argument must be a string.")
   with source_info_util.extend_name_stack(name):
     yield
 

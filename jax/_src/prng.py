@@ -16,7 +16,6 @@
 import abc
 from functools import partial
 from typing import Any, Callable, Hashable, Iterator, NamedTuple, Sequence
-import warnings
 
 import numpy as np
 
@@ -24,7 +23,6 @@ import jax
 from jax import lax
 from jax import core
 from jax import numpy as jnp
-from jax import tree_util
 from jax.config import config
 from jax.dtypes import float0
 from jax.interpreters import ad
@@ -32,6 +30,8 @@ from jax.interpreters import batching
 from jax.interpreters import mlir
 from jax.interpreters import pxla
 from jax.interpreters import xla
+from jax.experimental.sharding import (
+    MeshPspecSharding, SingleDeviceSharding, PmapSharding, OpShardingSharding)
 
 from jax._src import dispatch
 from jax._src import dtypes
@@ -165,6 +165,10 @@ class PRNGKeyArray(metaclass=PRNGKeyArrayMeta):
   def ndim(self):
     return len(self.shape)
 
+  @property
+  def dtype(self):
+    return KeyTy(self.impl)
+
   def _is_scalar(self):
     base_ndim = len(self.impl.key_shape)
     return self._base_array.ndim == base_ndim
@@ -270,30 +274,17 @@ def base_arr_shape_to_keys_shape(impl, base_arr_shape):
   return base_arr_shape[:-base_ndim]
 
 
-class KeyTy:
-  impl: Hashable  # prng.PRNGImpl. TODO(mattjj,frostig): protocol really
-  def __init__(self, impl):
-    self.impl = impl
-  @property
-  def name(self) -> str:
-    return f'key<{self.impl.tag}>'
-  def __repr__(self) -> str:
-    return self.name
-  def __eq__(self, other):
-    return type(other) is KeyTy and self.impl is other.impl
-  def __hash__(self) -> int:
-    return hash((self.__class__, self.impl))
-
-  # handlers
+class KeyTyRules:
 
   @staticmethod
-  def physical_avals(aval):
+  def physical_avals(aval):  # TODO(frostig): rename to `grounded_avals`
+    # TODO(frostig): dedup with `keys_aval_to_base_arr_aval``
     return [core.ShapedArray((*aval.shape, *aval.dtype.impl.key_shape),
                              jnp.dtype('uint32'))]
 
   @staticmethod
   def aval_to_ir_types(aval):
-    phys_aval, = KeyTy.physical_avals(aval)
+    phys_aval, = KeyTyRules.physical_avals(aval)
     return mlir.aval_to_ir_types(phys_aval)
 
   @staticmethod
@@ -304,11 +295,80 @@ class KeyTy:
     return handler
 
   @staticmethod
-  def sharded_result_handler(aval, sharding, indices):
-    phys_aval, = KeyTy.physical_avals(aval)
+  def local_sharded_result_handler(aval, sharding, indices):
+    phys_aval, = KeyTyRules.physical_avals(aval)
+    key_shape = aval.dtype.impl.key_shape
+
+    # TODO(yashkatariya,frostig): remove this conditional and inline it when
+    # the transient config ever settles
+    if config.jax_array:
+      output_type = pxla.OutputType.Array
+    else:
+      output_type = pxla.OutputType.ShardedDeviceArray
     phys_handler_maker = pxla.local_result_handlers[
-        (core.ShapedArray, pxla.OutputType.ShardedDeviceArray)]
-    phys_handler = phys_handler_maker(phys_aval, sharding, indices)
+        (core.ShapedArray, output_type)]
+
+    # set up a grounded sharding (with a grounded sharding spec)
+    if isinstance(sharding, PmapSharding):
+      trailing_sharding = [pxla.NoSharding()] * len(key_shape)
+      phys_sharding_spec = pxla.ShardingSpec(
+          sharding=(*sharding.sharding_spec.sharding, *trailing_sharding),
+          mesh_mapping=sharding.sharding_spec.mesh_mapping)
+      phys_sharding = PmapSharding(devices=sharding.devices,
+                                   sharding_spec=phys_sharding_spec)
+    elif isinstance(sharding, MeshPspecSharding):
+      trailing_spec = [None] * len(key_shape)
+      phys_sharding = MeshPspecSharding(
+          sharding.mesh,
+          pxla.PartitionSpec(*sharding.spec, *trailing_spec))
+    else:
+      assert False, f'impossible sharding {sharding} in local sharded result handler'
+
+    # set up grounded indices
+    trailing_inds = [slice(None)] * len(key_shape)
+    phys_indices = [(*inds, *trailing_inds) for inds in indices]
+
+    # make a physical handler
+    phys_handler = phys_handler_maker(phys_aval, phys_sharding, phys_indices)
+
+    # set up a handler that calls the physical one and wraps back up
+    def handler(bufs):
+      return PRNGKeyArray(aval.dtype.impl, phys_handler(bufs))
+
+    return handler
+
+  @staticmethod
+  def global_sharded_result_handler(aval, out_sharding, committed):
+    phys_aval, = KeyTyRules.physical_avals(aval)
+    key_shape = aval.dtype.impl.key_shape
+
+    # TODO(yashkatariya,frostig): remove this conditional and inline it when
+    # the transient config ever settles
+    if config.jax_array:
+      output_type = pxla.OutputType.Array
+    else:
+      output_type = pxla.OutputType.GlobalDeviceArray
+
+    phys_handler_maker = pxla.global_result_handlers[
+        (core.ShapedArray, output_type)]
+
+    if isinstance(out_sharding, SingleDeviceSharding):
+      phys_sharding = out_sharding
+    elif isinstance(out_sharding, MeshPspecSharding):
+      # TODO(yashkatariya,frostig): not covered by tests until we write a test
+      # that uses pjit with axis resource annotations (using GDA, not Array)
+      trailing_spec = [None] * len(key_shape)
+      phys_sharding = MeshPspecSharding(
+          out_sharding.mesh,
+          pxla.PartitionSpec(*out_sharding.spec, *trailing_spec))
+    else:
+      # TODO(yashkatariya,frostig): implement. Plan: accept an argument in
+      # this handler indicating whether the sharding came from XLA or not.
+      # Pass the sharding through if it's from XLA, otherwise maybe create
+      # a new op sharding with a trivially extended `tile_assignment_dimensions`
+      raise NotImplementedError
+
+    phys_handler = phys_handler_maker(phys_aval, phys_sharding, committed)
     def handler(bufs):
       return PRNGKeyArray(aval.dtype.impl, phys_handler(bufs))
     return handler
@@ -318,7 +378,7 @@ class KeyTy:
   @staticmethod
   def empty_mlir(ctx):
     aval_out, = ctx.avals_out
-    return mlir.ir_constants(np.empty(aval_out.dtype.impl.key_shape,
+    return mlir.ir_constants(np.zeros(aval_out.dtype.impl.key_shape,
                                       dtype=np.dtype('uint32')))
 
   @staticmethod
@@ -393,6 +453,28 @@ class KeyTy:
         ctx, gather_lower, x, indices,
         avals_in=[keys_aval_to_base_arr_aval(aval_x), aval_indices],
         avals_out=[keys_aval_to_base_arr_aval(aval_y)])
+
+
+class KeyTy:
+  impl: Hashable  # prng.PRNGImpl. TODO(mattjj,frostig): protocol really
+  _rules = KeyTyRules
+
+  def __init__(self, impl):
+    self.impl = impl
+
+  @property
+  def name(self) -> str:
+    return f'key<{self.impl.tag}>'
+
+  def __repr__(self) -> str:
+    return self.name
+
+  def __eq__(self, other):
+    return type(other) is KeyTy and self.impl is other.impl
+
+  def __hash__(self) -> int:
+    return hash((self.__class__, self.impl))
+
 
 core.custom_eltypes.add(KeyTy)
 

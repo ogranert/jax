@@ -38,6 +38,7 @@ from jax.experimental import array
 from jax.ad_checkpoint import checkpoint as new_checkpoint, checkpoint_policies
 import jax.numpy as jnp  # scan tests use numpy
 import jax.scipy as jsp
+from jax._src.lax import control_flow as lax_control_flow
 from jax._src.lax.control_flow import for_loop
 
 from jax.config import config
@@ -137,9 +138,9 @@ class LaxControlFlowTest(jtu.JaxTestCase):
 
   def setUp(self):
     super().setUp()
-    jax._src.lax.control_flow._initial_style_open_jaxpr.cache_clear()
-    jax._src.lax.control_flow._initial_style_jaxpr.cache_clear()
-    jax._src.lax.control_flow._initial_style_jaxprs_with_common_consts.cache_clear()
+    lax_control_flow._initial_style_open_jaxpr.cache_clear()
+    lax_control_flow._initial_style_jaxpr.cache_clear()
+    lax_control_flow._initial_style_jaxprs_with_common_consts.cache_clear()
 
   def testCallableErrors(self):
     not_callable = 42
@@ -1812,7 +1813,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
        "scan": scan_impl}
       for jit_scan in [False, True]
       for jit_f in [False, True]
-      for scan_impl, scan_name in SCAN_IMPLS
+      for scan_impl, scan_name in SCAN_IMPLS_WITH_FOR
       for in_axes in itertools.product([None, 0, 1], [None, 0, 1, 2])
       if in_axes != (None, None))
   def testScanVmap(self, jit_scan, jit_f, in_axes, scan):
@@ -1878,7 +1879,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
       {"testcase_name": "_impl={}".format(scan_name), "scan": scan_impl}
-      for scan_impl, scan_name in SCAN_IMPLS)
+      for scan_impl, scan_name in SCAN_IMPLS_WITH_FOR)
   def testScanVmapFixpoint(self, scan):
     def f(carry_init):
       def scan_body(c, x):
@@ -2555,7 +2556,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
       {"testcase_name": "impl={}".format(scan_name), "scan": scan_impl}
-      for scan_impl, scan_name in SCAN_IMPLS)
+      for scan_impl, scan_name in SCAN_IMPLS_WITH_FOR)
   def test_scan_hoisting_consts(self, scan):
     A = jnp.arange(4.).reshape(2, 2)
     B = jnp.arange(4.).reshape(2, 2) + 1.

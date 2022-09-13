@@ -8,8 +8,19 @@ Remember to align the itemized text with the first line of an item within a list
 PLEASE REMEMBER TO CHANGE THE '..main' WITH AN ACTUAL TAG in GITHUB LINK.
 -->
 
-## jax 0.3.17 (Unreleased)
-* [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.16...main).
+## jax 0.3.18 (Unreleased)
+* [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.17...main).
+* Changes
+  * Ahead-of-time lowering and compilation functionality (tracked in
+    {jax-issue}`#7733`) is stable and public. See [the
+    overview](https://jax.readthedocs.io/en/latest/aot.html) and the API docs
+    for {mod}`jax.stages`.
+* Breaking changes
+  * `jax._src` is no longer imported into the from the public `jax` namespace.
+    This may break users that were using JAX internals.
+
+## jax 0.3.17 (Aug 31, 2022)
+* [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.16...jax-v0.3.17).
 * Bugs
   * Fix corner case issue in gradient of `lax.pow` with an exponent of zero
     ({jax-issue}`12041`)

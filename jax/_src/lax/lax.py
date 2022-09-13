@@ -30,6 +30,7 @@ from jax._src import ad_util
 from jax._src import api
 from jax._src import api_util
 from jax._src import device_array
+from jax._src import dispatch
 from jax import linear_util as lu
 from jax._src import dtypes
 from jax import tree_util
@@ -83,6 +84,14 @@ T = TypeVar("T")
 
 map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
+
+# TODO(jakevdp): replace this with an isinstance() check when JEP 12049 is complete.
+def _is_array_or_tracer(operand: Any) -> bool:
+  if config.jax_array:
+    from jax.experimental import array  # pylint: disable=g-import-not-at-top
+    return isinstance(operand, (core.Tracer, array.Array))
+  else:
+    return isinstance(operand, (core.Tracer, device_array.DeviceArray))
 
 def _validate_shapes(shapes: Sequence[Shape]):
   def _check_static_shape(shape: Shape):
@@ -148,8 +157,7 @@ def _broadcast_shapes_uncached(*shapes):
   shape_list = [(1,) * (ndim - len(shape)) + shape for shape in shapes]
   result_shape = _try_broadcast_shapes(shape_list)
   if result_shape is None:
-    raise ValueError("Incompatible shapes for broadcasting: {}"
-                     .format(tuple(shape_list)))
+    raise ValueError(f"Incompatible shapes for broadcasting: shapes={list(shapes)}")
   return result_shape
 
 def _broadcast_ranks(s1, s2):
@@ -299,6 +307,10 @@ def log1p(x: Array) -> Array:
 def tanh(x: Array) -> Array:
   r"""Elementwise hyperbolic tangent: :math:`\mathrm{tanh}(x)`."""
   return tanh_p.bind(x)
+
+def logistic(x: Array) -> Array:
+  r"""Elementwise logistic (sigmoid) function: :math:`\frac{1}{1 + e^{-x}}`."""
+  return logistic_p.bind(x)
 
 def sin(x: Array) -> Array:
   r"""Elementwise sine: :math:`\mathrm{sin}(x)`."""
@@ -544,8 +556,6 @@ def convert_element_type(operand: Array, new_dtype: DType) -> Array:
 
 def _convert_element_type(operand: Array, new_dtype: Optional[DType] = None,
                           weak_type: bool = False):
-  from jax.experimental import array
-
   # Don't canonicalize old_dtype because x64 context might cause
   # un-canonicalized operands to be passed in.
   old_dtype = dtypes.dtype(operand, canonicalize=False)
@@ -572,8 +582,7 @@ def _convert_element_type(operand: Array, new_dtype: Optional[DType] = None,
     operand = np.asarray(operand, new_dtype)
     old_weak_type = False
 
-  if ((old_dtype, old_weak_type) == (new_dtype, new_weak_type)
-      and isinstance(operand, (core.Tracer, device_array.DeviceArray, array.Array))):
+  if (old_dtype, old_weak_type) == (new_dtype, new_weak_type) and _is_array_or_tracer(operand):
     return operand
   else:
     return convert_element_type_p.bind(operand, new_dtype=new_dtype,
@@ -626,6 +635,10 @@ def concatenate(operands: Sequence[Array], dimension: int) -> Array:
   """
   if len(operands) == 0:
     raise ValueError("concatenate requires a non-empty sequences of arrays")
+  if len(operands) == 1:
+    op, = operands
+    if _is_array_or_tracer(op):
+      return op
   return concatenate_p.bind(*operands, dimension=dimension)
 
 
@@ -792,10 +805,7 @@ def broadcast_in_dim(operand: Array, shape: Shape,
   See Also:
     jax.lax.broadcast : simpler interface to add new leading dimensions.
   """
-  from jax.experimental import array
-
-  if (np.ndim(operand) == len(shape) and not len(broadcast_dimensions)
-      and isinstance(operand, (device_array.DeviceArray, core.Tracer, array.Array))):
+  if np.ndim(operand) == len(shape) and not len(broadcast_dimensions) and _is_array_or_tracer(operand):
     return operand
   if config.jax_dynamic_shapes:
     # We must gate this behavior under a flag because otherwise the errors
@@ -850,8 +860,6 @@ def reshape(operand: Array, new_sizes: Shape,
     >>> reshape(y, (6,), (1, 0))
     DeviceArray([0, 3, 1, 4, 2, 5], dtype=int32)
   """
-  from jax.experimental import array
-
   new_sizes = canonicalize_shape(new_sizes)  # TODO
   new_sizes = tuple(new_sizes)
   same_shape = core.symbolic_equal_shape(np.shape(operand), new_sizes)
@@ -861,8 +869,7 @@ def reshape(operand: Array, new_sizes: Shape,
   else:
     dims = api_util._ensure_index_tuple(dimensions)
     same_dims = tuple(dims) == tuple(range(np.ndim(operand)))
-  if (np.shape(operand) and same_shape and same_dims
-      and isinstance(operand, (core.Tracer, device_array.DeviceArray, array.Array))):
+  if np.shape(operand) and same_shape and same_dims and _is_array_or_tracer(operand):
     return operand
   else:
     dyn_shape, static_new_sizes = _extract_tracers_dyn_shape(new_sizes)
@@ -941,8 +948,7 @@ def transpose(operand: Array, permutation: Sequence[int]) -> Array:
   operator.
   """
   permutation = tuple(operator.index(d) for d in permutation)
-  if (permutation == tuple(range(np.ndim(operand)))
-      and isinstance(operand, (core.Tracer, device_array.DeviceArray))):
+  if permutation == tuple(range(np.ndim(operand))) and _is_array_or_tracer(operand):
     return operand
   else:
     return transpose_p.bind(operand, permutation=permutation)
@@ -1246,7 +1252,7 @@ def stop_gradient(x: T) -> T:
   """
   def stop(x):
     # only bind primitive on inexact dtypes, to avoid some staging
-    if core.has_custom_eltype(x):
+    if core.has_opaque_dtype(x):
       return x
     elif (dtypes.issubdtype(_dtype(x), np.floating) or
         dtypes.issubdtype(_dtype(x), np.complexfloating)):
@@ -1272,7 +1278,7 @@ def squeeze(array: Array, dimensions: Sequence[int]) -> Array:
   """Squeeze any number of size 1 dimensions from an array."""
   ndim = np.ndim(array)
   dimensions = tuple(sorted(canonicalize_axis(i, ndim) for i in dimensions))
-  if not dimensions and isinstance(array, (core.Tracer, device_array.DeviceArray)):
+  if not dimensions and _is_array_or_tracer(array):
     return array
   return squeeze_p.bind(array, dimensions=dimensions)
 
@@ -1322,7 +1328,7 @@ def full_like(x: Array, fill_value: Array, dtype: Optional[DType] = None,
   # (so it works in staged-out code as well as 'eager' code). Related to
   # equi-sharding.
   if (config.jax_array and hasattr(x, 'sharding') and
-      not isinstance(x.sharding, sharding.SingleDeviceSharding)):
+      not dispatch.is_single_device_sharding(x.sharding)):
     return array.make_array_from_callback(
         fill_shape, x.sharding, lambda idx: val[idx])  # type: ignore[arg-type]
   return val
@@ -1736,19 +1742,25 @@ ad.defjvp2(tanh_p, lambda g, ans, x: mul(add(g, mul(g, ans)),
                                          sub(_one(x), ans)))
 mlir.register_lowering(tanh_p, partial(_nary_lower_mhlo, mhlo.TanhOp))
 
+logistic_p = standard_unop(_float | _complex, 'logistic')
+ad.defjvp2(logistic_p, lambda g, ans, x: mul(g, mul(ans, sub(_one(ans), ans))))
+# TODO(phawkins): switch to mhlo.logistic lowering; debug numerical problems.
+# mlir.register_lowering(logistic_p, partial(_nary_lower_mhlo, mhlo.LogisticOp))
+
+def logistic_impl(x):
+  one = _const(x, 1)
+  return div(one, add(one, exp(neg(x))))
+
+mlir.register_lowering(logistic_p,
+                       mlir.lower_fun(logistic_impl, multiple_results=False))
+
 sin_p = standard_unop(_float | _complex, 'sin')
 ad.defjvp(sin_p, lambda g, x: mul(g, cos(x)))
-if mlir_api_version < 27:
-  mlir.register_lowering(sin_p, partial(_nary_lower_mhlo, mhlo.SinOp))
-else:
-  mlir.register_lowering(sin_p, partial(_nary_lower_mhlo, mhlo.SineOp))
+mlir.register_lowering(sin_p, partial(_nary_lower_mhlo, mhlo.SineOp))
 
 cos_p = standard_unop(_float | _complex, 'cos')
 ad.defjvp(cos_p, lambda g, x: neg(mul(g, sin(x))))
-if mlir_api_version < 28:
-  mlir.register_lowering(cos_p, partial(_nary_lower_mhlo, mhlo.CosOp))
-else:
-  mlir.register_lowering(cos_p, partial(_nary_lower_mhlo, mhlo.CosineOp))
+mlir.register_lowering(cos_p, partial(_nary_lower_mhlo, mhlo.CosineOp))
 
 @_upcast_fp16_for_computation
 def _tan_impl(x):
@@ -2153,10 +2165,7 @@ def _sub_transpose(t, x, y):
 sub_p = standard_naryop([_num, _num], 'sub')
 ad.primitive_jvps[sub_p] = _sub_jvp
 ad.primitive_transposes[sub_p] = _sub_transpose
-if mlir_api_version < 29:
-  mlir.register_lowering(sub_p, partial(_nary_lower_mhlo, mhlo.SubOp))
-else:
-  mlir.register_lowering(sub_p, partial(_nary_lower_mhlo, mhlo.SubtractOp))
+mlir.register_lowering(sub_p, partial(_nary_lower_mhlo, mhlo.SubtractOp))
 
 
 def _mul_transpose(ct, x, y):
@@ -2241,8 +2250,12 @@ mlir.register_lowering(shift_right_logical_p,
                        partial(_nary_lower_mhlo, mhlo.ShiftRightLogicalOp))
 
 def _compare_lower_mhlo(direction: str, ctx, x, y):
-  x_aval, y_aval = ctx.avals_in
-  aval_out, = ctx.avals_out
+  avals_in, (aval_out,) = ctx.avals_in, ctx.avals_out
+  if config.jax_dynamic_shapes:
+    substitute = partial(_substitute_axis_sizes_in_aval, ctx.axis_size_env)
+    avals_in = map(substitute, avals_in)
+    aval_out = substitute(aval_out)
+  x_aval, y_aval = avals_in
   x, y = broadcast_mhlo(aval_out.update(dtype=x_aval.dtype), ctx.avals_in,
                         (x, y))
   if dtypes.issubdtype(x_aval.dtype, np.inexact):
@@ -2749,8 +2762,9 @@ def _broadcast_in_dim_transpose_rule(ct, operand, *dyn_shape,
   return ([expand_dims(_reduce_sum(ct, axes), unit_dims)] +
           [None] * len(dyn_shape))
 
-def _broadcast_in_dim_batch_rule(batched_args, batch_dims, *, shape,
+def _broadcast_in_dim_batch_rule(batched_args, batch_dims, *dyn_shape, shape,
                                  broadcast_dimensions):
+  if dyn_shape: raise NotImplementedError  # TODO(mattjj)
   operand, = batched_args
   bdim, = batch_dims
   new_operand = batching.moveaxis(operand, bdim, 0)
@@ -2826,7 +2840,7 @@ def _broadcast_in_dim_partial_eval(
 
 def _broadcast_in_dim_lower(ctx, x, *dyn_shape, shape, broadcast_dimensions):
   aval_out, = ctx.avals_out
-  if type(aval_out.dtype) in core.custom_eltypes:
+  if core.is_opaque_dtype(aval_out.dtype):
     return aval_out.dtype._rules.broadcast_in_dim_mlir(
         ctx, x, *dyn_shape, shape=shape,
         broadcast_dimensions=broadcast_dimensions)
@@ -3149,7 +3163,16 @@ batching.primitive_batchers[squeeze_p] = _squeeze_batch_rule
 def _squeeze_lower(ctx, operand, *, dimensions):
   del dimensions  # Implied by the output aval.
   aval_out, = ctx.avals_out
-  return mhlo.ReshapeOp(mlir.aval_to_ir_type(aval_out), operand).results
+  if config.jax_dynamic_shapes:
+    substitute = partial(_substitute_axis_sizes_in_aval, ctx.axis_size_env)
+    aval_out = substitute(aval_out)
+  if any(isinstance(d, ir.Value) for d in aval_out.shape):
+    return mhlo.DynamicReshapeOp(
+        mlir.aval_to_ir_type(aval_out), operand,
+        mlir.shape_tensor(aval_out.shape),
+    ).results
+  else:
+    return mhlo.ReshapeOp(mlir.aval_to_ir_type(aval_out), operand).results
 
 mlir.register_lowering(squeeze_p, _squeeze_lower)
 
@@ -3310,7 +3333,7 @@ def _transpose_batch_rule(batched_args, batch_dims, *, permutation):
 
 def _transpose_lower(ctx, x, *, permutation):
   aval_out, = ctx.avals_out
-  if type(aval_out.dtype) in core.custom_eltypes:
+  if core.is_opaque_dtype(aval_out.dtype):
     return aval_out.dtype._rules.transpose_mlir(ctx, x, permutation=permutation)
   return mhlo.TransposeOp(x, mlir.dense_int_elements(permutation)).results
 
@@ -4092,6 +4115,9 @@ def _after_all_lowering(ctx, *operands):
 mlir.register_lowering(after_all_p, _after_all_lowering)
 
 
+InOutFeedEffect = enum.Enum('InOutFeedEffect', ['Infeed', 'Outfeed'])
+
+
 def infeed(token, shape=None, partitions=None):
   """Consumes an infeed value of `shape` from the host. Experimental.
 
@@ -4117,13 +4143,14 @@ def infeed(token, shape=None, partitions=None):
 def _infeed_abstract_eval(token, *, shapes, partitions):
   if token is not abstract_token:
     raise TypeError("First argument to infeed must be a token")
-  return shapes + (abstract_token,)
+  return (*shapes, abstract_token), {InOutFeedEffect.Infeed}
 
 
 infeed_p = Primitive("infeed")
 infeed_p.multiple_results = True
 infeed_p.def_impl(partial(xla.apply_primitive, infeed_p))
-infeed_p.def_abstract_eval(_infeed_abstract_eval)
+infeed_p.def_effectful_abstract_eval(_infeed_abstract_eval)
+mlir.lowerable_effects.add(InOutFeedEffect.Infeed)
 
 
 def _infeed_lowering(ctx, token, *, shapes, partitions):
@@ -4169,11 +4196,12 @@ def outfeed(token, xs, partitions = None):
 def _outfeed_abstract_eval(token, *xs, partitions):
   if token is not abstract_token:
     raise TypeError("First argument to outfeed must be a token")
-  return abstract_token
+  return abstract_token, {InOutFeedEffect.Outfeed}
 
 outfeed_p = Primitive("outfeed")
 outfeed_p.def_impl(partial(xla.apply_primitive, outfeed_p))
-outfeed_p.def_abstract_eval(_outfeed_abstract_eval)
+outfeed_p.def_effectful_abstract_eval(_outfeed_abstract_eval)
+mlir.lowerable_effects.add(InOutFeedEffect.Outfeed)
 
 
 def _outfeed_lowering(ctx, token, *xs, partitions):
@@ -4222,11 +4250,8 @@ def _rng_uniform_lowering(ctx, a, b, *, shape):
   aval_out, = ctx.avals_out
   shape, = mlir.ir_constants(np.array(aval_out.shape, np.int64),
                              canonicalize_types=False)
-  if mlir_api_version <= 22:
-    return mhlo.RngUniformOp(a, b, shape).results
-  else:
-    return mhlo.RngOp(a, b, shape,
-                      mhlo.RngDistributionAttr.get('UNIFORM')).results
+  return mhlo.RngOp(a, b, shape,
+                    mhlo.RngDistributionAttr.get('UNIFORM')).results
 
 mlir.register_lowering(rng_uniform_p, _rng_uniform_lowering)
 
@@ -4557,7 +4582,7 @@ def _check_same_dtypes(name, ignore_fp_precision, *ttypes):
   """Check that dtypes agree, possibly ignoring float precision."""
   # the `ignore_fp_precision` flag exists because the XLA shape inference logic
   # allows mixed floating point precision, but the HLO verifier often rejects it
-  if any(type(t) in core.custom_eltypes for t in ttypes):
+  if any(core.is_opaque_dtype(t) for t in ttypes):
     return  # TODO(mattjj,frostig): do some checking, friend
   types = map(np.dtype, ttypes)  # canonicalize
   if ignore_fp_precision:
@@ -4720,12 +4745,12 @@ def _check_user_dtype_supported(dtype, fun_name=None):
     warnings.warn(msg.format(dtype, fun_name , truncated_dtype), stacklevel=3)
 
 
-def empty(eltype):
-  return empty_p.bind(eltype=eltype)
+def empty(dtype):
+  return empty_p.bind(dtype=dtype)
 empty_p = core.Primitive('empty')
-empty_p.def_abstract_eval(lambda *, eltype: core.ShapedArray((), eltype))
-def _empty_lower(ctx, *, eltype):
-  if type(eltype) in core.custom_eltypes:
-    return eltype._rules.empty_mlir(ctx)
-  return mlir.ir_constants(np.zeros((), np.dtype(eltype)))
+empty_p.def_abstract_eval(lambda *, dtype: core.ShapedArray((), dtype))
+def _empty_lower(ctx, *, dtype):
+  if core.is_opaque_dtype(dtype):
+    return dtype._rules.empty_mlir(ctx)
+  return mlir.ir_constants(np.zeros((), np.dtype(dtype)))
 mlir.register_lowering(empty_p, _empty_lower)

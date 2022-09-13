@@ -15,6 +15,7 @@
 
 import abc
 from functools import partial
+import operator as op
 from typing import Any, Callable, Hashable, Iterator, NamedTuple, Sequence
 
 import numpy as np
@@ -31,7 +32,7 @@ from jax.interpreters import mlir
 from jax.interpreters import pxla
 from jax.interpreters import xla
 from jax.experimental.sharding import (
-    MeshPspecSharding, SingleDeviceSharding, PmapSharding, OpShardingSharding)
+    MeshPspecSharding, PmapSharding, OpShardingSharding)
 
 from jax._src import dispatch
 from jax._src import dtypes
@@ -114,8 +115,7 @@ class PRNGKeyArrayMeta(abc.ABCMeta):
 
   def __instancecheck__(self, instance):
     try:
-      return (hasattr(instance, 'aval') and
-              isinstance(instance.aval, core.ShapedArray) and
+      return (isinstance(instance.aval, core.ShapedArray) and
               type(instance.aval.dtype) is KeyTy)
     except AttributeError:
       super().__instancecheck__(instance)
@@ -169,6 +169,10 @@ class PRNGKeyArray(metaclass=PRNGKeyArrayMeta):
   def dtype(self):
     return KeyTy(self.impl)
 
+  _device = property(op.attrgetter('_base_array._device'))
+  _committed = property(op.attrgetter('_base_array._committed'))
+  sharding = property(op.attrgetter('_base_array.sharding'))
+
   def _is_scalar(self):
     base_ndim = len(self.impl.key_shape)
     return self._base_array.ndim == base_ndim
@@ -189,7 +193,7 @@ class PRNGKeyArray(metaclass=PRNGKeyArrayMeta):
     # * unpack upfront into shape[0] many keyarray slices
     # * return iter over these unpacked slices
     # Whatever we do, we'll want to do it by overriding
-    # ShapedArray._iter when the eltype is KeyTy...
+    # ShapedArray._iter when the element type is KeyTy...
     return (PRNGKeyArray(self.impl, k) for k in iter(self._base_array))
 
   # TODO(frostig): are all of the stackable methods below (reshape,
@@ -288,6 +292,17 @@ class KeyTyRules:
     return mlir.aval_to_ir_types(phys_aval)
 
   @staticmethod
+  def physical_op_sharding(aval, sharding):
+    op_sharding = sharding._to_xla_op_sharding(aval.ndim)
+    key_shape = aval.dtype.impl.key_shape
+
+    new_op_sharding = op_sharding.clone()
+    tad = list(new_op_sharding.tile_assignment_dimensions)
+    tad.extend([1] * len(key_shape))
+    new_op_sharding.tile_assignment_dimensions = tad
+    return new_op_sharding
+
+  @staticmethod
   def result_handler(sticky_device, aval):
     def handler(_, buf):
       buf.aval = core.ShapedArray(buf.shape, buf.dtype)
@@ -338,7 +353,8 @@ class KeyTyRules:
     return handler
 
   @staticmethod
-  def global_sharded_result_handler(aval, out_sharding, committed):
+  def global_sharded_result_handler(aval, out_sharding, committed,
+                                    is_out_sharding_from_xla):
     phys_aval, = KeyTyRules.physical_avals(aval)
     key_shape = aval.dtype.impl.key_shape
 
@@ -352,28 +368,28 @@ class KeyTyRules:
     phys_handler_maker = pxla.global_result_handlers[
         (core.ShapedArray, output_type)]
 
-    if isinstance(out_sharding, SingleDeviceSharding):
+    if dispatch.is_single_device_sharding(out_sharding):
       phys_sharding = out_sharding
     elif isinstance(out_sharding, MeshPspecSharding):
-      # TODO(yashkatariya,frostig): not covered by tests until we write a test
-      # that uses pjit with axis resource annotations (using GDA, not Array)
       trailing_spec = [None] * len(key_shape)
       phys_sharding = MeshPspecSharding(
           out_sharding.mesh,
           pxla.PartitionSpec(*out_sharding.spec, *trailing_spec))
     else:
-      # TODO(yashkatariya,frostig): implement. Plan: accept an argument in
-      # this handler indicating whether the sharding came from XLA or not.
-      # Pass the sharding through if it's from XLA, otherwise maybe create
-      # a new op sharding with a trivially extended `tile_assignment_dimensions`
-      raise NotImplementedError
+      if is_out_sharding_from_xla:
+        phys_sharding = out_sharding
+      else:
+        phys_sharding = OpShardingSharding(
+            out_sharding._device_assignment,
+            KeyTyRules.physical_op_sharding(aval, out_sharding))
 
-    phys_handler = phys_handler_maker(phys_aval, phys_sharding, committed)
+    phys_handler = phys_handler_maker(phys_aval, phys_sharding, committed,
+                                      is_out_sharding_from_xla)
     def handler(bufs):
       return PRNGKeyArray(aval.dtype.impl, phys_handler(bufs))
     return handler
 
-  # eltype-polymorphic primitive lowering rules
+  # element-type-polymorphic primitive lowering rules
 
   @staticmethod
   def empty_mlir(ctx):
@@ -470,13 +486,13 @@ class KeyTy:
     return self.name
 
   def __eq__(self, other):
-    return type(other) is KeyTy and self.impl is other.impl
+    return type(other) is KeyTy and self.impl == other.impl
 
   def __hash__(self) -> int:
     return hash((self.__class__, self.impl))
 
 
-core.custom_eltypes.add(KeyTy)
+core.opaque_dtypes.add(KeyTy)
 
 
 core.pytype_aval_mappings[PRNGKeyArray] = (
@@ -492,9 +508,17 @@ def device_put_key_array(x: PRNGKeyArray, device):
 dispatch.device_put_handlers[PRNGKeyArray] = device_put_key_array
 
 def key_array_shard_arg_handler(x: PRNGKeyArray, devices, indices, mode):
+  # TODO(frostig): Remove the need for `core.get_aval`.
+  key_shape = core.get_aval(x).dtype.impl.key_shape
   arr = x.unsafe_raw_array()
-  return pxla.shard_arg_handlers[type(arr)](arr, devices, indices, mode)
+
+  # TODO(yashkatariya,frostig): This assumes that the last dimensions are not
+  # sharded. This is only true when enable_custom_prng is True.
+  trailing_inds = [slice(None)] * len(key_shape)
+  phys_indices = [(*inds, *trailing_inds) for inds in indices]
+  return pxla.shard_arg_handlers[type(arr)](arr, devices, phys_indices, mode)
 pxla.shard_arg_handlers[PRNGKeyArray] = key_array_shard_arg_handler
+
 
 def key_array_constant_handler(x, canonicalize_dtypes):
   arr = x.unsafe_raw_array()
@@ -754,7 +778,8 @@ batching.primitive_batchers[random_wrap_p] = random_wrap_batch_rule
 
 
 def random_unwrap(keys):
-  assert isinstance(keys, PRNGKeyArray)
+  if not isinstance(keys, PRNGKeyArray):
+    raise TypeError(f'random_unwrap takes key array operand, got {type(keys)}')
   return random_unwrap_p.bind(keys)
 
 random_unwrap_p = core.Primitive('random_unwrap')
@@ -1008,9 +1033,12 @@ def _threefry_fold_in(key, data):
   return threefry_2x32(key, threefry_seed(data))
 
 
-@partial(jit, static_argnums=(1, 2), inline=True)
 def threefry_random_bits(key: jnp.ndarray, bit_width, shape):
   """Sample uniform random bits of given width and shape using PRNG key."""
+  return _threefry_random_bits(key, bit_width, shape)
+
+@partial(jit, static_argnums=(1, 2), inline=True)
+def _threefry_random_bits(key: jnp.ndarray, bit_width, shape):
   if not _is_threefry_prng_key(key):
     raise TypeError("threefry_random_bits got invalid prng key.")
   if bit_width not in (8, 16, 32, 64):

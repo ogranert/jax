@@ -42,6 +42,8 @@ from jax._src.lax.lax import (
   _const, ranges_like, remaining, _dot_general_batch_dim_nums, _dot_general_shape_rule,
   DotDimensionNumbers)
 from jax._src.lib.mlir import ir
+from jax._src.lib import xla_bridge
+from jax._src.lib import version as jaxlib_version
 from jax._src.lib.mlir.dialects import mhlo
 from jax._src.numpy.setops import _unique
 
@@ -736,9 +738,8 @@ def _bcoo_dot_general_cuda_lowering(
 
   # Checks the shapes of lhs and rhs.
   assert props.n_dense == 0
-  assert props.n_batch == 0
-  assert props.n_sparse in [1, 2]
-  assert rhs_ndim in [1, 2]
+  assert (props.n_batch, props.n_sparse, rhs_ndim) in [
+      (0, 1, 1), (0, 1, 2), (0, 2, 1), (0, 2, 2), (1, 2, 2)]
 
   # Checks the operation dimensions.
   assert len(lhs_batch) == 0
@@ -761,54 +762,123 @@ def _bcoo_dot_general_cuda_lowering(
   else:
     raise ValueError(f"rhs has to be 1d or 2d; get {rhs_ndim}d.")
 
-  lhs_transpose = False
-  if props.n_sparse == 1:
-    # Converts lhs to a row vector.
-    col = _collapse_mhlo(lhs_indices, start=0, end=1)
-    row = mlir.full_like_aval(
-        0, core.ShapedArray(ir.RankedTensorType(col.type).shape,
-                            np.dtype(np.int32)))
-    lhs_shape = (1, lhs_spinfo.shape[0])
-    dot_product = bcoo_dot_general_fn(
-        lhs_data, row, col, rhs, shape=lhs_shape, transpose=lhs_transpose,
-        data_dtype=lhs_data_aval.dtype, index_dtype=lhs_indices_aval.dtype,
-        x_dtype=rhs_aval.dtype)
+  if props.n_batch == 0:
+    # non-batch mode.
+    lhs_transpose = False
+    if props.n_sparse == 1:
+      # Converts lhs to a row vector.
+      col = _collapse_mhlo(lhs_indices, start=0, end=1)
+      row = mlir.full_like_aval(
+          0, core.ShapedArray(ir.RankedTensorType(col.type).shape,
+                              np.dtype(np.int32)))
+      lhs_shape = (1, lhs_spinfo.shape[0])
+      dot_product = bcoo_dot_general_fn(
+          lhs_data, row, col, rhs, shape=lhs_shape, transpose=lhs_transpose,
+          data_dtype=lhs_data_aval.dtype, index_dtype=lhs_indices_aval.dtype,
+          x_dtype=rhs_aval.dtype)
 
-    if rhs_ndim == 1:
-      # Transforms a single-element array to a scalar.
-      return [mhlo.ReshapeOp(
-          ir.RankedTensorType.get(
-              [], ir.RankedTensorType(dot_product.type).element_type),
-          dot_product).result]
+      if rhs_ndim == 1:
+        # Transforms a single-element array to a scalar.
+        return [mhlo.ReshapeOp(
+            ir.RankedTensorType.get(
+                [], ir.RankedTensorType(dot_product.type).element_type),
+            dot_product).result]
+      else:
+        return [_collapse_mhlo(dot_product, start=0, end=1)]
+    elif props.n_sparse == 2:
+      lhs_indices_shape = ir.RankedTensorType(lhs_indices.type).shape
+      row = _collapse_mhlo(
+          mhlo.SliceOp(
+              lhs_indices,
+              start_indices=mlir.dense_int_elements([0, 0]),
+              limit_indices=mlir.dense_int_elements([lhs_indices_shape[0], 1]),
+              strides=mlir.dense_int_elements([1, 1])).result,
+          start=0, end=1)
+      col = _collapse_mhlo(
+          mhlo.SliceOp(
+              lhs_indices,
+              start_indices=mlir.dense_int_elements([0, 1]),
+              limit_indices=mlir.dense_int_elements([lhs_indices_shape[0], 2]),
+              strides=mlir.dense_int_elements([1, 1])).result,
+          start=0, end=1)
+
+      if lhs_contract[0] == 0:
+        lhs_transpose = True
+
+      return [bcoo_dot_general_fn(
+          lhs_data, row, col, rhs, shape=lhs_spinfo.shape,
+          transpose=lhs_transpose, data_dtype=lhs_data_aval.dtype,
+          index_dtype=lhs_indices_aval.dtype,
+          x_dtype=rhs_aval.dtype)]
     else:
-      return [_collapse_mhlo(dot_product, start=0, end=1)]
-  elif props.n_sparse == 2:
+      raise ValueError(f"lhs has to be 1d or 2d; get {props.n_sparse}d.")
+  elif props.n_batch == 1:
+    # batch mode.
     lhs_indices_shape = ir.RankedTensorType(lhs_indices.type).shape
+    lhs_data_shape = ir.RankedTensorType(lhs_data.type).shape
+    batch_count, _, _ = lhs_indices_shape
+    rhs_shape = ir.RankedTensorType(rhs.type).shape
+
+    # Squeeze the batch dimension for both indices and data.
+    lhs_indices_2d_shape = (np.prod(np.array(lhs_indices_shape)[:-1]),
+                            lhs_indices_shape[-1])
+    lhs_data_1d_shape = (np.prod(np.array(lhs_data_shape)), )
+
+    lhs_indices_2d = mhlo.ReshapeOp(
+        ir.RankedTensorType.get(
+            lhs_indices_2d_shape,
+            ir.RankedTensorType(lhs_indices.type).element_type),
+        lhs_indices).result
+
+    lhs_data_1d = mhlo.ReshapeOp(
+        ir.RankedTensorType.get(
+            lhs_data_1d_shape,
+            ir.RankedTensorType(lhs_data.type).element_type),
+        lhs_data).result
+
     row = _collapse_mhlo(
         mhlo.SliceOp(
-            lhs_indices,
+            lhs_indices_2d,
             start_indices=mlir.dense_int_elements([0, 0]),
-            limit_indices=mlir.dense_int_elements([lhs_indices_shape[0], 1]),
+            limit_indices=mlir.dense_int_elements([lhs_indices_2d_shape[0], 1]),
             strides=mlir.dense_int_elements([1, 1])).result,
         start=0, end=1)
+
     col = _collapse_mhlo(
         mhlo.SliceOp(
-            lhs_indices,
+            lhs_indices_2d,
             start_indices=mlir.dense_int_elements([0, 1]),
-            limit_indices=mlir.dense_int_elements([lhs_indices_shape[0], 2]),
+            limit_indices=mlir.dense_int_elements([lhs_indices_2d_shape[0], 2]),
             strides=mlir.dense_int_elements([1, 1])).result,
         start=0, end=1)
 
-    if lhs_contract[0] == 0:
-      lhs_transpose = True
+    # Broadcast rhs to have the same batch size as lhs.
+    # TODO(tianjianlu): remove broadcasting.
+    # Use batch_stride = 0 for non-batch.
+    # The issue (https://github.com/NVIDIA/CUDALibrarySamples/issues/81#issuecomment-1205562643)
+    # in cusparse library does not allow batch_stride = 0 for a non-batched rhs.
+    batched_rhs_shape = (batch_count,) + tuple(rhs_shape)
+    batched_rhs = mhlo.BroadcastInDimOp(
+        ir.RankedTensorType.get(batched_rhs_shape,
+                                ir.RankedTensorType(rhs.type).element_type),
+        rhs,
+        broadcast_dimensions=mlir.dense_int_elements([1, 2])).result
+    batched_rhs_2d_shape = (np.prod(np.array(batched_rhs_shape)[:-1]), batched_rhs_shape[-1])
+    batched_rhs_2d = mhlo.ReshapeOp(
+        ir.RankedTensorType.get(
+            batched_rhs_2d_shape,
+            ir.RankedTensorType(batched_rhs.type).element_type),
+        batched_rhs).result
+
+    lhs_transpose = True if lhs_contract[0] == props.n_batch else False
 
     return [bcoo_dot_general_fn(
-        lhs_data, row, col, rhs, shape=lhs_spinfo.shape,
+        lhs_data_1d, row, col, batched_rhs_2d, shape=lhs_spinfo.shape,
         transpose=lhs_transpose, data_dtype=lhs_data_aval.dtype,
         index_dtype=lhs_indices_aval.dtype,
         x_dtype=rhs_aval.dtype)]
   else:
-    raise ValueError(f"lhs has to be 1d or 2d; get {props.n_sparse}d.")
+    raise ValueError(f"n_batch has to be 0 or 1; get {props.n_batch}.")
 
 def _bcoo_dot_general_gpu_lowering(
     coo_matvec_lowering, coo_matmat_lowering,
@@ -820,7 +890,7 @@ def _bcoo_dot_general_gpu_lowering(
       ctx, lhs_data, lhs_indices, rhs,
       dimension_numbers=dimension_numbers, lhs_spinfo=lhs_spinfo)
 
-  (lhs_contract, _), (lhs_batch, rhs_batch) = dimension_numbers
+  (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
   lhs_data_aval, lhs_indices_aval, rhs_aval, = ctx.avals_in
   n_batch, n_sparse, n_dense, _ = _validate_bcoo(
       lhs_data_aval, lhs_indices_aval, lhs_spinfo.shape)
@@ -834,7 +904,7 @@ def _bcoo_dot_general_gpu_lowering(
       ctx, lhs_data, lhs_indices, rhs,
       dimension_numbers=dimension_numbers, lhs_spinfo=lhs_spinfo)
 
-  if (n_batch or n_dense or
+  if (n_batch > 1 or n_dense or
       n_sparse not in [1, 2] or rhs_aval.ndim not in [1, 2] or
       lhs_batch or rhs_batch or len(lhs_contract) != 1):
     return _bcoo_dot_general_default_lowering(
@@ -849,6 +919,25 @@ def _bcoo_dot_general_gpu_lowering(
       return _bcoo_dot_general_default_lowering(
         ctx, lhs_data, lhs_indices, rhs,
         dimension_numbers=dimension_numbers, lhs_spinfo=lhs_spinfo)
+
+    if n_batch == 1:
+      # The support for batched computation in cusparseSpMM COO was added in
+      # 11.6.1: https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html#cusparse-11.6.1
+      cuda_version = int(xla_bridge.get_backend().platform_version.split()[-1])
+
+      # TODO(tianjianlu): enable the batch mode of cusparseSpMv.
+      cuda_supported_batch_mode = (
+          n_sparse == 2 and rhs_aval.ndim == 2 and
+          len(lhs_contract) == 1 and lhs_contract[0] in [1, 2] and
+          len(rhs_contract) == 1 and rhs_contract[0] in [0, 1] and
+          cuda_version >= 11061 and jaxlib_version >= (0, 3, 18))
+      if not cuda_supported_batch_mode:
+        warnings.warn("bcoo_dot_general GPU lowering currently does not "
+                      "support this batch-mode computation. Falling back to "
+                      "the default implementation.", CuSparseEfficiencyWarning)
+        return _bcoo_dot_general_default_lowering(
+          ctx, lhs_data, lhs_indices, rhs,
+          dimension_numbers=dimension_numbers, lhs_spinfo=lhs_spinfo)
 
     return _bcoo_dot_general_cuda_lowering(
       coo_matvec_lowering, coo_matmat_lowering, ctx, lhs_data, lhs_indices, rhs,
@@ -1790,13 +1879,13 @@ def bcoo_slice(mat, *, start_indices: Sequence[int], limit_indices: Sequence[int
   """Sparse implementation of {func}`jax.lax.slice`.
 
   Args:
-    operand: BCOO array to be reshaped.
+    mat: BCOO array to be reshaped.
     start_indices: sequence of integers of length `mat.ndim` specifying the starting
       indices of each slice.
     limit_indices: sequence of integers of length `mat.ndim` specifying the ending
       indices of each slice
-    strides: sequence of integers of length `mat.ndim` specifying the stride for
-      each slice
+    strides: (not implemented) sequence of integers of length `mat.ndim` specifying
+      the stride for each slice
 
   Returns:
     out: BCOO array containing the slice.
@@ -1847,6 +1936,78 @@ def bcoo_slice(mat, *, start_indices: Sequence[int], limit_indices: Sequence[int
     new_data = jnp.where(keep_data, new_data, 0)
 
   return BCOO((new_data, new_indices), shape=new_shape)
+
+def bcoo_dynamic_slice(mat, start_indices: Sequence[Any], slice_sizes: Sequence[int]):
+  """Sparse implementation of {func}`jax.lax.dynamic_slice`.
+
+  Args:
+    mat: BCOO array to slice.
+    start_indices: a list of scalar indices, one per dimension. These values
+      may be dynamic.
+    slice_sizes: the size of the slice. Must be a sequence of non-negative
+      integers with length equal to `ndim(operand)`. Inside a JIT compiled
+      function, only static values are supported (all JAX arrays inside JIT
+      must have statically known size).
+
+  Returns:
+    out: BCOO array containing the slice.
+  """
+  if not isinstance(mat, BCOO):
+    raise ValueError(f"bcoo_slice: input should be BCOO array, got type(mat)={type(mat)}")
+  start_indices = tuple(jnp.asarray(i) for i in start_indices)
+  assert all(jnp.issubdtype(i.dtype, np.integer) for i in start_indices)
+  assert all(i.shape == () for i in start_indices)
+  slice_sizes = tuple(operator.index(i) for i in slice_sizes)
+  if len(start_indices) != len(slice_sizes) != mat.ndim:
+    raise ValueError(f"bcoo_dynamic_slice: indices must have size mat.ndim={mat.ndim}")
+  if not all(0 <= slice_size <= axis_size for slice_size, axis_size in zip(slice_sizes, mat.shape)):
+    raise TypeError("slice_sizes must be less than or equal to operand shape, "
+                    f"got slice_sizes {slice_sizes} for operand shape {mat.shape}")
+
+  start_batch, start_sparse, start_dense = split_list(start_indices, [mat.n_batch, mat.n_sparse])
+  size_batch, size_sparse, size_dense = split_list(slice_sizes, [mat.n_batch, mat.n_sparse])
+
+  data_start = []
+  data_sizes = []
+  indices_start = []
+  indices_sizes = []
+  for i, (start, size) in enumerate(zip(start_batch, size_batch)):
+    data_is_broadcast = mat.data.shape[i] != mat.shape[i]
+    indices_is_broadcast = mat.indices.shape[i] != mat.shape[i]
+    data_start.append(0 if data_is_broadcast else start)
+    data_sizes.append(1 if data_is_broadcast else size)
+    indices_start.append(0 if indices_is_broadcast else start)
+    indices_sizes.append(1 if indices_is_broadcast else size)
+  data_start.append(0)
+  data_sizes.append(mat.nse)
+  indices_start.extend([0, 0])
+  indices_sizes.extend([mat.nse, mat.n_sparse])
+  data_start.extend(start_dense)
+  data_sizes.extend(size_dense)
+
+  new_data = lax.dynamic_slice(mat.data, data_start, data_sizes)
+  new_indices = lax.dynamic_slice(mat.indices, indices_start, indices_sizes)
+  new_shape = slice_sizes
+
+  if mat.n_sparse:
+    starts = jnp.array(start_sparse, dtype=new_indices.dtype)
+    sizes = jnp.array(size_sparse, dtype=new_indices.dtype)
+    sparse_shape = jnp.array(mat.shape[mat.n_batch: mat.n_batch + mat.n_sparse], dtype=new_indices.dtype)
+    starts = jnp.where(starts < 0, starts + sparse_shape, starts)
+    starts = jnp.clip(starts, 0, sparse_shape - sizes)
+
+    starts = jnp.expand_dims(starts, range(mat.n_batch + 1))
+    sizes = jnp.expand_dims(sizes, range(mat.n_batch + 1))
+    sparse_shape = jnp.expand_dims(sparse_shape, range(mat.n_batch + 1))
+
+    keep = jnp.all((new_indices >= starts) & (new_indices < starts + sizes), -1, keepdims=True)
+    new_indices = jnp.where(keep, new_indices - starts, sparse_shape)
+
+    keep_data = lax.expand_dims(keep[..., 0], range(mat.n_batch + 1, mat.n_batch + 1 + mat.n_dense))
+    new_data = jnp.where(keep_data, new_data, 0)
+
+  return BCOO((new_data, new_indices), shape=new_shape)
+
 
 def _tuple_replace(tup, ind, val):
   return tuple(val if i == ind else t for i, t in enumerate(tup))

@@ -51,7 +51,6 @@ from jax._src.api_util import _ensure_index_tuple
 from jax._src.lax.lax import (_array_copy, _sort_lt_comparator,
                               _sort_le_comparator)
 from jax._src.lax import lax as lax_internal
-from jax._src.lax.slicing import _getslice
 from jax._src.numpy.ndarray import ndarray
 from jax._src.numpy.reductions import (  # noqa: F401
   _ensure_optional_axes, _reduction_dims,
@@ -988,7 +987,10 @@ def interp(x, xp, fp, left=None, right=None, period=None):
   df = fp[i] - fp[i - 1]
   dx = xp[i] - xp[i - 1]
   delta = x - xp[i - 1]
-  f = where((dx == 0), fp[i], fp[i - 1] + (delta / dx) * df)
+
+  epsilon = np.spacing(np.finfo(xp.dtype).eps)
+  dx0 = lax.abs(dx) <= epsilon  # Prevent NaN gradients when `dx` is small.
+  f = where(dx0, fp[i - 1], fp[i - 1] + (delta / where(dx0, 1, dx)) * df)
 
   if period is None:
     f = where(x < xp[0], fp[0] if left is None else left, f)
@@ -2351,7 +2353,7 @@ def indices(dimensions, dtype=int32, sparse=False):
 
 
 _TOTAL_REPEAT_LENGTH_DOC = """\
-Jax adds the optional `total_repeat_length` parameter which specifies the total
+JAX adds the optional `total_repeat_length` parameter which specifies the total
 number of repeat, and defaults to sum(repeats). It must be specified for repeat
 to be compilable. If `sum(repeats)` is larger than the specified
 `total_repeat_length` the remaining values will be discarded. In the case of
@@ -2362,7 +2364,8 @@ will be repeated.
 
 @_wraps(np.repeat, lax_description=_TOTAL_REPEAT_LENGTH_DOC)
 def repeat(a, repeats, axis: Optional[int] = None, *, total_repeat_length=None):
-  _check_arraylike("repeat", a, repeats)
+  _check_arraylike("repeat", a)
+  core.is_special_dim_size(repeats) or _check_arraylike("repeat", repeats)
 
   if axis is None:
     a = ravel(a)
@@ -2371,9 +2374,14 @@ def repeat(a, repeats, axis: Optional[int] = None, *, total_repeat_length=None):
   axis = core.concrete_or_error(operator.index, axis, "'axis' argument of jnp.repeat()")
   assert isinstance(axis, int)  # to appease mypy
 
-  # If total_repeat_length is not given, can't compile, use a default.
+  if core.is_special_dim_size(repeats):
+    if total_repeat_length is not None:
+      raise ValueError("jnp.repeat with a DimPolynomial `repeats` is supported only "
+                       "when `total_repeat_length` is None")
+
+  # If total_repeat_length is not given, use a default.
   if total_repeat_length is None:
-    repeats = core.concrete_or_error(np.array, repeats,
+    repeats = core.concrete_or_error(None, repeats,
       "When jit-compiling jnp.repeat, the total number of repeats must be static. "
       "To fix this, either specify a static value for `repeats`, or pass a static "
       "value to `total_repeat_length`.")
@@ -3611,14 +3619,16 @@ def _rewriting_take(arr, idx, indices_are_sorted=False, unique_indices=False,
         (start, stop, step) != (0, n, 1)):
       return lax.slice_in_dim(arr, start, stop, step)
 
-
   # TODO(mattjj,dougalm): expand dynamic shape indexing support
-  if (jax.config.jax_dynamic_shapes and type(idx) is slice and idx.step is None
-      and (isinstance(idx.start, core.Tracer) or isinstance(idx.stop, core.Tracer))
-      and arr.shape):
-    start = 0 if idx.start is None else idx.start
-    stop = arr.shape[0] if idx.stop is None else idx.stop
-    return _getslice(arr, start, stop)
+  if jax.config.jax_dynamic_shapes and arr.ndim > 0:
+    try: aval = core.get_aval(idx)
+    except: pass
+    else:
+      if (isinstance(aval, core.DShapedArray) and aval.shape == () and
+          dtypes.issubdtype(aval.dtype, np.integer) and
+          not dtypes.issubdtype(aval.dtype, dtypes.bool_) and
+          isinstance(arr.shape[0], int)):
+        return lax.dynamic_index_in_dim(arr, idx, keepdims=False)
 
   treedef, static_idx, dynamic_idx = _split_index_for_jit(idx, arr.shape)
   return _gather(arr, treedef, static_idx, dynamic_idx, indices_are_sorted,
@@ -5097,10 +5107,12 @@ _set_shaped_array_attributes(ShapedArray)
 _set_shaped_array_attributes(DShapedArray)
 
 
-def _set_device_array_base_attributes(device_array, include=None):
+def _set_device_array_base_attributes(device_array, include=None, exclude=None):
   # Forward operators, methods, and properties on DeviceArray to lax_numpy
   # functions (with no Tracers involved; this forwarding is direct)
   def maybe_setattr(attr_name, target):
+    if exclude is not None and attr_name in exclude:
+      return
     if not include or attr_name in include:
       setattr(device_array, attr_name, target)
 
@@ -5122,7 +5134,7 @@ def _set_device_array_base_attributes(device_array, include=None):
   maybe_setattr("clip", _clip)
 
 _set_device_array_base_attributes(device_array.DeviceArray)
-_set_device_array_base_attributes(Array)
+_set_device_array_base_attributes(Array, exclude={'__getitem__'})
 
 
 def _set_device_array_attributes(device_array):

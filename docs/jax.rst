@@ -24,6 +24,7 @@ Subpackages
     jax.ops
     jax.profiler
     jax.random
+    jax.stages
     jax.tree_util
 
 .. toctree::
@@ -108,3 +109,11 @@ Callbacks
 
     pure_callback
     debug.callback
+
+Miscellaneous
+-------------
+
+.. autosummary::
+  :toctree: _autosummary
+
+    print_environment_info

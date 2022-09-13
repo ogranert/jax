@@ -20,14 +20,16 @@ import numpy as np
 
 import jax
 import jax.numpy as jnp
+from jax._src import dispatch
 from jax._src import config as jax_config
 from jax._src import test_util as jtu
 from jax._src.lib import xla_client as xc
 from jax._src.lib import xla_bridge as xb
-from jax._src.util import prod
+from jax._src.util import prod, safe_zip
 from jax.experimental import PartitionSpec as P
 from jax.experimental import sharding
 from jax.experimental import array
+from jax.experimental import maps
 
 from jax.config import config
 config.parse_flags_with_absl()
@@ -188,7 +190,7 @@ class JaxArrayTest(jtu.JaxTestCase):
     with jax_config.jax_array(True):
       arr = jnp.array([1, 2, 3])
       self.assertIsInstance(arr, array.Array)
-      self.assertIsInstance(arr.sharding, sharding.SingleDeviceSharding)
+      self.assertTrue(dispatch.is_single_device_sharding(arr.sharding))
       self.assertEqual(arr._committed, False)
 
   def test_jnp_array_jit_add(self):
@@ -270,7 +272,7 @@ class JaxArrayTest(jtu.JaxTestCase):
     out = jnp.zeros_like(a)
     expected = np.zeros(a.shape, dtype=np.int32)
     self.assertArraysEqual(out, expected)
-    self.assertIsInstance(out.sharding, sharding.SingleDeviceSharding)
+    self.assertTrue(dispatch.is_single_device_sharding(out.sharding))
 
   @jax_config.jax_array(True)
   def test_wrong_num_arrays(self):
@@ -344,6 +346,70 @@ class JaxArrayTest(jtu.JaxTestCase):
       array.Array(jax.ShapedArray(shape, np.float32), s, bufs, committed=True)
 
   @jax_config.jax_array(True)
+  def test_array_iter_pmap_sharding(self):
+    if jax.device_count() < 2:
+      self.skipTest('Test requires >= 2 devices.')
+
+    x = jnp.array([[1., 0., 0.], [0., 2., 3.]])
+    y = jax.pmap(jnp.sin)(x)
+    self.assertArraysEqual([a.device() for a in y],
+                           [a.device() for a in y._arrays])
+
+    sin_x = iter(np.sin(x))
+    for i, j in zip(iter(y), sin_x):
+      self.assertIsInstance(i, array.Array)
+      self.assertArraysAllClose(i, j)
+
+  @jax_config.jax_array(True)
+  def test_array_iter_pmap_sharding_last_dim_sharded(self):
+    if jax.device_count() < 2:
+      self.skipTest('Test requires >= 2 devices.')
+
+    x = jnp.array([[1., 0., 0.], [0., 2., 3.]])
+    y = jax.pmap(jnp.sin, out_axes=1)(x)
+
+    for i, j in zip(iter(y), iter(np.sin(x).T)):
+      self.assertArraysAllClose(i, j)
+
+  @jax_config.jax_array(True)
+  def test_array_iter_mesh_pspec_sharding_multi_device(self):
+    global_mesh = jtu.create_global_mesh((4, 2), ('x', 'y'))
+    input_shape = (8, 2)
+    arr, input_data = create_array(
+        input_shape, sharding.MeshPspecSharding(global_mesh, P('x', 'y')))
+
+    for i, j in zip(iter(arr), iter(input_data)):
+      self.assertArraysEqual(i, j)
+
+  @jax_config.jax_array(True)
+  def test_array_getitem_mesh_pspec_sharding_multi_device(self):
+    global_mesh = jtu.create_global_mesh((4, 2), ('x', 'y'))
+    input_shape = (8, 2)
+    arr, input_data = create_array(
+        input_shape, sharding.MeshPspecSharding(global_mesh, P('x', 'y')))
+
+    # TODO(yashkatariya): `__getitem__` with a specific index takes the fast
+    # path after b/245667823 is fixed.
+    s = arr[2:4, 0:1]
+    self.assertArraysEqual(s, np.array([[4], [6]]))
+    self.assertArraysEqual(arr[:2], input_data[:2])
+
+  @jax_config.jax_array(True)
+  def test_array_iter_mesh_pspec_sharding_single_device(self):
+    if jax.device_count() < 2:
+      self.skipTest('Test requires >= 2 devices.')
+
+    single_dev = jax.devices()[1:2]
+    mesh = maps.Mesh(np.array(single_dev), ('x'))
+    input_shape = (8, 2)
+    arr, input_data = create_array(
+        input_shape, sharding.MeshPspecSharding(mesh, P('x')))
+
+    for i, j in zip(arr, iter(input_data)):
+      self.assertArraysEqual(i, j)
+      self.assertEqual(i.device(), single_dev[0])
+
+  @jax_config.jax_array(True)
   def test_array_shards_committed(self):
     if jax.device_count() < 2:
       self.skipTest('Test requires >= 2 devices.')
@@ -357,6 +423,24 @@ class JaxArrayTest(jtu.JaxTestCase):
     for s in y.addressable_shards:
       self.assertEqual(s.data._committed, y._committed)
       self.assertTrue(s.data._committed)
+
+  @jax_config.jax_array(True)
+  def test_array_jnp_array_copy_multi_device(self):
+    global_mesh = jtu.create_global_mesh((4, 2), ('x', 'y'))
+    input_shape = (8, 2)
+    arr, _ = create_array(
+        input_shape, sharding.MeshPspecSharding(global_mesh, P('x', 'y')))
+
+    c_arr = jnp.array(arr, copy=True)
+    self.assertArraysEqual(arr, c_arr)
+    self.assertEqual(arr._committed, c_arr._committed)
+    for a, c in safe_zip(arr.addressable_shards, c_arr.addressable_shards):
+      self.assertArraysEqual(a.data, c.data)
+      self.assertEqual(a.index, c.index)
+      self.assertEqual(a.replica_id, c.replica_id)
+      self.assertEqual(a.device, c.device)
+      self.assertNotEqual(a.data.unsafe_buffer_pointer(),
+                          c.data.unsafe_buffer_pointer())
 
 
 class ShardingTest(jtu.JaxTestCase):
@@ -419,6 +503,44 @@ class ShardingTest(jtu.JaxTestCase):
         r"dimension size is 3 \(full shape: \(8, 3\), per-dimension tiling "
         r"factors: \[4, 2\] should evenly divide the shape\)"):
       mps.shard_shape((8, 3))
+
+  @jax_config.jax_array(True)
+  def test_pmap_sharding_hash_eq(self):
+    if jax.device_count() < 2:
+      self.skipTest('Test needs >= 2 devices.')
+
+    shape = (2, 2)
+    num_elements = prod(shape)
+    inp_data = np.arange(num_elements).reshape(shape)
+    out = jax.pmap(lambda x: x)(inp_data)
+    self.assertIsInstance(out.sharding, sharding.PmapSharding)
+    # Populate the device_indices_map cache.
+    _ = out.sharding.devices_indices_map(shape)
+    cache_info1 = sharding.PmapSharding.devices_indices_map.cache_info()
+
+    inp_data2 = np.arange(num_elements, num_elements + num_elements).reshape(shape)
+    out2 = jax.pmap(lambda x: x)(inp_data2)
+    # Populate the device_indices_map cache.
+    _ = out2.sharding.devices_indices_map(shape)
+    cache_info2 = sharding.PmapSharding.devices_indices_map.cache_info()
+
+    self.assertGreater(cache_info2.hits, cache_info1.hits + 1)
+    self.assertEqual(cache_info2.misses, cache_info1.misses)
+
+  def test_is_compatible_error(self):
+    shape = (8, 2)
+    mesh = jtu.create_global_mesh((1, 1, 2), ('replica', 'data', 'mdl'))
+    mps = sharding.MeshPspecSharding(mesh, P(None, ('mdl',), None, None))
+    new_mps = sharding.MeshPspecSharding._from_parsed_pspec(
+        mps.mesh, mps._parsed_pspec)
+
+    with self.assertRaisesRegex(
+        ValueError,
+        r"Sharding MeshPspecSharding\(mesh={'replica': 1, 'data': 1, 'mdl': 2}, "
+        r"partition_spec=PartitionSpec\(None, \('mdl',\), None, None\)\) is only "
+        "valid for values of rank at least 4, but was applied to a value of rank 2"):
+      new_mps.is_compatible_aval(shape)
+
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

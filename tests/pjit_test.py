@@ -76,10 +76,11 @@ def tearDownModule():
   jtu.restore_spmd_lowering_flag()
 
 
-def create_gda(global_shape, global_mesh, mesh_axes, global_data=None):
+def create_gda(global_shape, global_mesh, mesh_axes, global_data=None,
+               dtype=np.float32):
   if global_data is None:
     global_data = np.arange(
-        prod(global_shape), dtype=np.float32).reshape(global_shape)
+        prod(global_shape), dtype=dtype).reshape(global_shape)
 
   if isinstance(mesh_axes, Sharding):
     mesh_axes = mesh_axes.spec
@@ -706,6 +707,8 @@ class PJitTest(jtu.BufferDonationTestCase):
     f_com = f_low.compile()
     f_low.donate_argnums == f_com.donate_argnums == (0,)
 
+  @unittest.skip('Fails in OSS builds on GPU with jax at HEAD and latest '
+                 'jaxlib on pypi.')
   def testInfeed(self):
     devices = np.array(jax.local_devices())
     nr_devices = len(devices)
@@ -1050,6 +1053,24 @@ class PJitTest(jtu.BufferDonationTestCase):
       self.assertIsInstance(out, jax.random.KeyArray)
       self.assertEqual(out.shape, input_shape)
       out.unsafe_raw_array()  # doesn't crash
+
+  def test_with_sharding_constraint_is_compatible_error(self):
+    mesh = jtu.create_global_mesh((1, 1, 2), ('replica', 'data', 'mdl'))
+
+    with mesh:
+      def f(x):
+        y = with_sharding_constraint(x, P(None, ('mdl',), None, None))
+        z = y + 2
+        return z
+      pjit_f = pjit(f, in_axis_resources=P(None), out_axis_resources=P(None))
+
+      with self.assertRaisesRegex(
+          ValueError,
+          r"One of with_sharding_constraint.*Sharding "
+          r"MeshPspecSharding\(mesh={'replica': 1, 'data': 1, 'mdl': 2}, "
+          r"partition_spec=PartitionSpec\(None, \('mdl',\), None, None\)\) is only "
+          "valid for values of rank at least 4, but was applied to a value of rank 1"):
+        pjit_f(jnp.array([1, 2, 3]))
 
 
 class GDAPjitTest(jtu.JaxTestCase):
@@ -1418,6 +1439,26 @@ class GDAPjitTest(jtu.JaxTestCase):
       f = pjit(lambda x: x, in_axis_resources=P(None), out_axis_resources=P('x'))
       compiled = f.lower(jax.ShapedArray(global_input_shape, jnp.float32)).compile()
       compiled(g1)  # no error
+
+  @parallel_functions_output_gda(True)
+  def test_globally_sharded_key_array_8x4_multi_device(self):
+    input_shape = (8, 4)
+    mesh = jtu.create_global_mesh((4, 2), ('x', 'y'))
+    spec = P('x', 'y')
+
+    seeds, _ = create_gda(input_shape, mesh, spec, dtype=np.uint32)
+
+    with mesh:
+      @partial(pjit, in_axis_resources=spec, out_axis_resources=spec)
+      def make_keys(seeds):
+        make_key = partial(prng.seed_with_impl, prng.threefry_prng_impl)
+        return make_key(seeds)
+
+      out = make_keys(seeds)
+      self.assertIsInstance(out, jax.random.KeyArray)
+      self.assertEqual(out.shape, input_shape)
+      out.unsafe_raw_array()  # doesn't crash
+
 
 class AutoShardingPjitTest(jtu.JaxTestCase):
 
@@ -1856,26 +1897,40 @@ class ArrayPjitTest(jtu.JaxTestCase):
     self.assertEqual(out.shape, input_shape)
     out.unsafe_raw_array()  # doesn't crash
 
-  # TODO(yashkatariya,frostig): re-enable together with implementation in the
-  # global result handler in `jax._src.prng.KeyTy`
-  @unittest.skip('XLA output sharding support not yet implemented')
   @jax_array(True)
-  def test_globally_sharded_key_array_result_8x4_multi_device(self):
+  def test_globally_sharded_key_array_8x4_multi_device_with_out_sharding(self):
     input_shape = (8, 4)
     mesh = jtu.create_global_mesh((4, 2), ('x', 'y'))
     spec = P('x', 'y')
 
     seeds, _ = create_array(input_shape, mesh, spec, dtype=np.uint32)
 
-    # TODO(yashkatariya,frostig): also test pjit with axis resource annotations
+    @partial(pjit, out_axis_resources=MeshPspecSharding(mesh, P('x', 'y')))
+    def make_keys(seeds):
+      make_key = partial(prng.seed_with_impl, prng.threefry_prng_impl)
+      return make_key(seeds)
+
+    out = make_keys(seeds)
+    self.assertIsInstance(out, jax.random.KeyArray)
+    self.assertEqual(out.shape, input_shape)
+    out.unsafe_raw_array()  # doesn't crash
+
+  @jax_array(True)
+  def test_globally_sharded_key_array_8x4_multi_device(self):
+    input_shape = (8, 4)
+    mesh = jtu.create_global_mesh((4, 2), ('x', 'y'))
+    spec = P('x', 'y')
+
+    seeds, _ = create_array(input_shape, mesh, spec, dtype=np.uint32)
+
     @pjit
     def make_keys(seeds):
       make_key = partial(prng.seed_with_impl, prng.threefry_prng_impl)
       return make_key(seeds)
 
-    # TODO(yashkatariya,frostig): also test shape, dype, maybe a reference
-    # value (from execution without pjit)
     out = make_keys(seeds)
+    self.assertIsInstance(out, jax.random.KeyArray)
+    self.assertEqual(out.shape, input_shape)
     out.unsafe_raw_array()  # doesn't crash
 
   def test_array_device_assignment_mismatch_out_shardings(self):
@@ -2145,8 +2200,7 @@ class PJitErrorTest(jtu.JaxTestCase):
     x = jnp.arange(2)
     spec = P('x', 'y')
     error = re.compile(
-        r"One of with_sharding_constraint arguments" + r".*" + spec_regex(
-            pxla.array_mapping_to_axis_resources(pxla._get_array_mapping(spec))) +
+        r"One of with_sharding_constraint arguments" + r".*" + spec_regex(spec) +
         r".*rank at least 2, but was applied to a value of rank 1", re.M | re.S)
     with self.assertRaisesRegex(ValueError, error):
       pjit(lambda x: with_sharding_constraint(x, spec),
@@ -2589,6 +2643,22 @@ class UtilTest(jtu.JaxTestCase):
     self.assertEqual(cache_info2.misses, cache_info1.misses)
     self.assertEqual(id(next_op_sharding_sharding._op_sharding),
                      id(op_sharding_sharding._op_sharding))
+
+  def test_get_partition_spec(self):
+    mesh = jtu.create_global_mesh((4, 2), ('x', 'y'))
+    s = MeshPspecSharding(mesh, P('x', 'y', None))
+
+    self.assertEqual(s._parsed_pspec.get_partition_spec(), P('x', 'y', None))
+
+    recovered_parsed_pspec = pjit_lib.parse_flatten_op_sharding(
+        s._to_xla_op_sharding(3), mesh)
+    self.assertEqual(recovered_parsed_pspec[0].get_partition_spec(),
+                     P(('x',), ('y',)))
+
+    out_of_sync_parsed_pspec = pjit_lib.ParsedPartitionSpec(
+        P('x', 'y'), ('x', 'y'), pjit_lib.SpecSync.OUT_OF_SYNC)
+    self.assertEqual(out_of_sync_parsed_pspec.get_partition_spec(),
+                     P(('x',), ('y',)))
 
 
 if __name__ == '__main__':

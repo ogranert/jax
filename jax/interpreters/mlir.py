@@ -35,6 +35,7 @@ from jax import linear_util as lu
 from jax._src import ad_util
 from jax._src import device_array
 from jax._src import dtypes
+from jax._src.lib import mlir_api_version
 from jax._src.lib import version as jaxlib_version
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import chlo
@@ -138,7 +139,7 @@ def dtype_to_ir_type(dtype: Union[np.dtype, np.generic]) -> ir.Type:
 
 def _array_ir_types(aval: Union[core.ShapedArray, core.DShapedArray]
                     ) -> Sequence[ir.Type]:
-  if type(aval.dtype) in core.custom_eltypes:
+  if core.is_opaque_dtype(aval.dtype):
     return aval.dtype._rules.aval_to_ir_types(aval)
   return (ir.RankedTensorType.get(aval.shape, dtype_to_ir_type(aval.dtype)),)
 
@@ -341,7 +342,7 @@ def make_ir_context() -> ir.Context:
   """Creates an MLIR context suitable for JAX IR."""
   context = ir.Context()
   mhlo.register_mhlo_dialect(context)
-  if jax._src.lib.mlir_api_version < 33:
+  if mlir_api_version < 33:
     chlo.register_chlo_dialect(context)
   else:
     chlo.register_dialect(context)
@@ -608,10 +609,13 @@ def lower_jaxpr_to_module(
     ]
   out_avals = jaxpr.out_avals
   if result_shardings is not None:
-    out_avals = [
-        sharded_aval(out_aval, out_sharding)
-        for out_aval, out_sharding in zip(out_avals, result_shardings)
-    ]
+    out_avals = []
+    for out_aval, out_sharding in zip(jaxpr.out_avals, result_shardings):
+      if (out_aval is not core.abstract_token and
+          core.is_opaque_dtype(out_aval.dtype)):
+        out_aval, = out_aval.dtype._rules.physical_avals(out_aval)
+      out_avals.append(sharded_aval(out_aval, out_sharding))
+
   platforms_with_donation = ("cuda", "rocm", "tpu")
   if platform in platforms_with_donation:
     input_output_aliases, donated_args = _set_up_aliases(
@@ -668,6 +672,12 @@ def module_to_string(module: ir.Module) -> str:
   module.operation.print(file=output, enable_debug_info=True,
                          print_generic_op_form=False)
   return output.getvalue()
+
+def module_to_bytecode(module: ir.Module) -> bytes:
+  output = io.BytesIO()
+  module.operation.write_bytecode(file=output)
+  return output.getvalue()
+
 
 def _set_up_aliases(avals_in, avals_out, donated_args):
   input_output_aliases = [None] * len(avals_in)

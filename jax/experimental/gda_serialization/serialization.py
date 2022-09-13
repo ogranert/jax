@@ -46,16 +46,19 @@ async def create_async_array_from_callback(
     data_callback: Callable[[array.Index], asyncio.Future],
 ):
   device_to_index_map = inp_sharding.devices_indices_map(global_shape)
+  addressable_da = inp_sharding._addressable_device_assignment
   future_arrays = [data_callback(device_to_index_map[d])  # type: ignore
-                   for d in inp_sharding._addressable_device_assignment]
+                   for d in addressable_da]
   # Pause here and come back to `from_async_callback()` when future_arrays are
   # ready. device_put cannot happen with future_arrays.
   local_arrays = await asyncio.gather(*future_arrays)
 
   dbs = [jax.device_put(array, device)
-         for array, device in zip(local_arrays, inp_sharding._addressable_device_assignment)]
+         for array, device in zip(local_arrays, addressable_da)]
   aval = jax.ShapedArray(global_shape, dbs[0].dtype)
-  return array.Array(aval, inp_sharding, dbs, committed=True)
+  return array.Array(
+      aval, inp_sharding, dbs, committed=True,
+      _fast_path_args=array._ArrayFastPathArgs(device_to_index_map, addressable_da))
 
 
 async def create_async_gda_from_callback(
@@ -133,6 +136,9 @@ class _LimitInFlightBytes:
     self._cv = asyncio.Condition(lock=asyncio.Lock())
 
   async def wait_for_bytes(self, requested_bytes):
+    if requested_bytes >= self._max_bytes:
+      raise ValueError('Requested more bytes than we reserved space for: '
+                       f'{requested_bytes} > {self._max_bytes}')
     async with self._cv:
       await self._cv.wait_for(lambda: self._available_bytes > requested_bytes)
       self._available_bytes -= requested_bytes
@@ -207,6 +213,14 @@ def estimate_read_memory_footprint(t: ts.TensorStore) -> int:
   chunk_origin = chunk_template.origin
   chunk_shape = chunk_template.shape
 
+  # Some TensorStore drivers are not chunked, e.g. the inline 'array' driver.
+  # For those, instead of returning a near-infinite memory footprint, estimate
+  # the footprint as the entire shape.
+  for i in range(rank):
+    if not chunk_template[i].finite:
+      return t.domain.size * num_bytes
+
+  # Otherwise, if we have a chunked driver, estimate based on chunk size.
   for i in range(rank):
     origin_value = origin[i]
     chunk_origin_value = chunk_origin[i]
@@ -216,6 +230,7 @@ def estimate_read_memory_footprint(t: ts.TensorStore) -> int:
     lower_aligned = lower // chunk_size * chunk_size
     upper_aligned = -(-upper // chunk_size) * chunk_size
     num_bytes *= (upper_aligned - lower_aligned)
+
   return num_bytes
 
 
@@ -246,7 +261,7 @@ async def async_deserialize(mesh, mesh_axes, tensorstore_spec,
     if dtype is not None:
       # Cast while reloading on process to avoid 2 copies on device if the
       # casting is done on device.
-      return out.astype(dtype)
+      out = out.astype(dtype)
 
     if byte_limiter is not None:
       await byte_limiter.release_bytes(requested_bytes)

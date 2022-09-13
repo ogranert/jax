@@ -436,12 +436,11 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
       # Use eager mode only for when all arg_shapes are known, in order to
       # check expected_shapeenv.
       arg_dtypes = (_f32,) * len(arg_shapes)
-      def f_tf(*tf_args):
-        avals = shape_poly.args_avals(
-            arg_shapes, arg_dtypes, polymorphic_shapes)  # The function under test
-        dim_vars, get_dim_values = shape_poly.prepare_dim_var_env(avals)
-        dim_values, _ = util.unzip2(jax2tf.jax2tf._interpret_fun(lu.wrap_init(get_dim_values),
-                                                                 tf_args, avals, ""))
+      def f_tf(*args_tf):
+        avals = tuple(map(shape_poly.arg_aval, arg_shapes, arg_dtypes, polymorphic_shapes))
+        dim_vars, get_dim_values_jax = shape_poly.prepare_dim_var_env(avals)
+        dim_values, _ = jax2tf.jax2tf._interpret_fun_jax(get_dim_values_jax,
+                                                         args_tf, avals, "")
         if expected_avals is not None:
           self.assertEqual(expected_avals, avals)
         return dict(zip(dim_vars, dim_values))
@@ -1672,6 +1671,31 @@ _POLY_SHAPE_TEST_HARNESSES = [
                       poly_axes=[0])
         for reduce_op in [jnp.all, jnp.any, jnp.max, jnp.min, jnp.prod, jnp.sum]
     ],
+    # Repeat f32[b, 2] * 3
+    _make_harness("repeat", "repeats=int_axis=0",
+                  lambda x: jnp.repeat(x, repeats=3, axis=0),
+                  [RandArg((3, 2), _f32)],
+                  poly_axes=[0]),
+    # Repeat f32[b, 2] * b
+    _make_harness("repeat", "repeats=poly_axis=0",
+                  lambda x: jnp.repeat(x, repeats=x.shape[0], axis=0),
+                  [RandArg((3, 2), _f32)],
+                  poly_axes=[0]),
+    # Repeat f32[b, 2] * b
+    _make_harness("repeat", "repeats=poly_axis=None",
+                  lambda x: jnp.repeat(x, repeats=x.shape[0], axis=None),
+                  [RandArg((3, 2), _f32)],
+                  poly_axes=[0]),
+    # Repeat f32 * b
+    _make_harness("repeat", "repeats=poly_axis=None_scalar",
+                  lambda x, y: jnp.repeat(x, repeats=y.shape[0], axis=None),
+                  [RandArg((), _f32), RandArg((3, 2), _f32)],
+                  poly_axes=[None, 0]),
+    _make_harness("repeat", "repeats=poly_axis=None_total_repeat_length1",
+                  lambda x: jnp.repeat(x, repeats=x.shape[0], axis=None, total_repeat_length=8),
+                  [RandArg((3, 2), _f32)],
+                  poly_axes=[0],
+                  expect_error=(ValueError, "jnp.repeat with a DimPolynomial `repeats` is supported only .*")),
     _make_harness("reshape", "0",
                   lambda x: x.reshape([x.shape[0], -1]),
                   [RandArg((3, 2, 3), _f32)],
@@ -1912,7 +1936,7 @@ class ShapePolyPrimitivesTest(tf_test_util.JaxToTfTestCase):
   # to parameterized below.
   @primitive_harness.parameterized(
       _flatten_harnesses(_POLY_SHAPE_TEST_HARNESSES),
-      #one_containing="reduce_window_add_noxla_poly_axes=[1]",
+      #one_containing="repeat_repeats=poly_axis=None_scalar_poly_axes=[None, 0]",
   )
   def test_prim(self, harness: Harness):
     _test_one_harness(self, harness)

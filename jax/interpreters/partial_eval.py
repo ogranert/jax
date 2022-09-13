@@ -961,6 +961,17 @@ def convert_constvars_jaxpr(jaxpr: Jaxpr) -> Jaxpr:
   config.jax_enable_checks and core.check_jaxpr(lifted_jaxpr)
   return lifted_jaxpr
 
+@weakref_lru_cache
+def convert_invars_to_constvars(jaxpr: Jaxpr, n: int) -> Jaxpr:
+  """Move n invars to constvars. Like an inverse of convert_constvars_Jaxpr."""
+  config.jax_enable_checks and core.check_jaxpr(jaxpr)
+  constvars, invars = split_list(jaxpr.invars, [n])
+  lifted_jaxpr = Jaxpr(constvars=tuple(constvars), invars=invars,
+                       outvars=jaxpr.outvars, eqns=jaxpr.eqns,
+                       effects=jaxpr.effects)
+  config.jax_enable_checks and core.check_jaxpr(lifted_jaxpr)
+  return lifted_jaxpr
+
 def convert_envvars_to_constvars(jaxpr: Jaxpr, num_env_vars: int) -> Jaxpr:
   config.jax_enable_checks and core.check_jaxpr(jaxpr)
   env_vars, invars = split_list(jaxpr.invars, [num_env_vars])
@@ -1240,9 +1251,45 @@ def call_partial_eval_custom_rule(
   new_inst = [x for x, inst in zip(eqn.invars, inst_in)
               if type(x) is Var and not inst]
   return eqn_known, eqn_staged, unks_out, inst_out, new_inst + residuals
+
+def closed_call_partial_eval_custom_rule(
+    jaxpr_param_name: str,
+    saveable: Callable[..., bool], unks_in: List[bool], inst_in: List[bool],
+    eqn: JaxprEqn, *, res_aval: ResAvalUpdater = _default_res_aval_updater,
+  ) -> Tuple[JaxprEqn, JaxprEqn, Sequence[bool], Sequence[bool], List[Var]]:
+  # TODO(sharadmv,mattjj): dedup this rule with call_partial_eval_custom_rule.
+  closed_jaxpr = eqn.params[jaxpr_param_name]
+  jaxpr = convert_constvars_jaxpr(closed_jaxpr.jaxpr)
+  unks_in = [False] * len(closed_jaxpr.consts) + list(unks_in)
+  inst_in = [False] * len(closed_jaxpr.consts) + list(inst_in)
+  jaxpr_known, jaxpr_staged, unks_out, inst_out, num_res = \
+      partial_eval_jaxpr_custom(jaxpr, unks_in, inst_in, False, False, saveable)
+  ins_known, _ = partition_list(unks_in, eqn.invars)
+  out_binders_known, _ = partition_list(unks_out, eqn.outvars)
+  _, ins_staged = partition_list(inst_in, eqn.invars)
+  _, out_binders_staged = partition_list(inst_out, eqn.outvars)
+  newvar = core.gensym([jaxpr_known, jaxpr_staged])
+  params_known = {**eqn.params, jaxpr_param_name: core.ClosedJaxpr(jaxpr_known,
+    ())}
+  params_staged = {**eqn.params, jaxpr_param_name:
+      core.ClosedJaxpr(jaxpr_staged, ())}
+  residuals = [newvar(res_aval(params_known, var.aval))
+               for var in jaxpr_staged.invars[:num_res]]
+  eqn_known = new_jaxpr_eqn(ins_known, [*out_binders_known, *residuals],
+                            eqn.primitive, params_known, jaxpr_known.effects, eqn.source_info)
+  eqn_staged = new_jaxpr_eqn([*residuals, *ins_staged], out_binders_staged,
+                             eqn.primitive, params_staged,
+                             jaxpr_staged.effects, eqn.source_info)
+  assert len(eqn_staged.invars) == len(jaxpr_staged.invars)
+  new_inst = [x for x, inst in zip(eqn.invars, inst_in)
+              if type(x) is Var and not inst]
+  return eqn_known, eqn_staged, unks_out, inst_out, new_inst + residuals
+
 partial_eval_jaxpr_custom_rules[core.call_p] = \
     partial(call_partial_eval_custom_rule, 'call_jaxpr',
             lambda _, __, ___, ____, _____, x, y: (x, y))
+partial_eval_jaxpr_custom_rules[core.closed_call_p] = \
+    partial(closed_call_partial_eval_custom_rule, 'call_jaxpr')
 partial_eval_jaxpr_custom_rules[core.named_call_p] = \
     partial(call_partial_eval_custom_rule, 'call_jaxpr',
             lambda _, __, ___, ____, _____, x, y: (x, y))
@@ -1269,6 +1316,17 @@ def dce_jaxpr(jaxpr: Jaxpr, used_outputs: Sequence[bool],
   if type(instantiate) is bool:
     instantiate = (instantiate,) * len(jaxpr.invars)
   return _dce_jaxpr(jaxpr, tuple(used_outputs), tuple(instantiate))
+
+
+def dce_jaxpr_consts(jaxpr: Jaxpr, used_outputs: Sequence[bool],
+                     instantiate: Union[bool, Sequence[bool]] = False,
+                     ) -> Tuple[Jaxpr, List[bool], List[bool]]:
+  jaxpr_ = convert_constvars_jaxpr(jaxpr)
+  new_jaxpr_, used_inputs_ = dce_jaxpr(jaxpr_, used_outputs)
+  used_consts, used_inputs = split_list(used_inputs_, [len(jaxpr.constvars)])
+  new_jaxpr = convert_invars_to_constvars(new_jaxpr_, sum(used_consts))
+  return new_jaxpr, used_consts, used_inputs
+
 
 @weakref_lru_cache
 def _dce_jaxpr(jaxpr: Jaxpr, used_outputs: Tuple[bool, ...],

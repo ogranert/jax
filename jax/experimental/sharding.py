@@ -197,8 +197,7 @@ class MeshPspecSharding(XLACompatibleSharding):
 
   @classmethod
   def _from_parsed_pspec(cls, mesh, parsed_pspec):
-    from jax.experimental import pjit
-    return cls(mesh, pjit._get_single_pspec(parsed_pspec), parsed_pspec)
+    return cls(mesh, parsed_pspec.get_partition_spec(), parsed_pspec)
 
   @pxla.maybe_cached_property
   def device_set(self) -> Set[Device]:
@@ -285,6 +284,17 @@ class PmapSharding(XLACompatibleSharding):
     self.devices = devices
     # The sharding spec should be pmap's sharding spec.
     self.sharding_spec = sharding_spec
+
+  def __eq__(self, other):
+    if not isinstance(other, PmapSharding):
+      return False
+    return (self.sharding_spec == other.sharding_spec and
+            np.array_equal(self.devices, other.devices))
+
+  def __hash__(self):
+    if not hasattr(self, '_hash'):
+      self._hash = hash((tuple(self.devices.flat), self.sharding_spec))
+    return self._hash
 
   @pxla.maybe_cached_property
   def device_set(self) -> Set[Device]:

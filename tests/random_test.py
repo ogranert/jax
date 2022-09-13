@@ -1496,7 +1496,7 @@ class LaxRandomTest(jtu.JaxTestCase):
 class KeyArrayTest(jtu.JaxTestCase):
   # Key arrays involve:
   # * a Python key array type, backed by an underlying uint32 "base" array,
-  # * an abstract shaped array with key eltype,
+  # * an abstract shaped array with key element type,
   # * primitives that return or operate on such shaped arrays,
   # * compiler lowerings,
   # * a device-side data representation...
@@ -1504,8 +1504,8 @@ class KeyArrayTest(jtu.JaxTestCase):
   #
   # A handful of these tests follow CustomElementTypesTest in
   # lax_tests.py as an example. If you add a test here (e.g. testing
-  # lowering of an key-eltyped shaped array), consider whether it
-  # might also be a more general test of extended/custom eltypes. If
+  # lowering of an key-dtyped shaped array), consider whether it
+  # might also be a more general test of opaque element types. If
   # so, add a corresponding test to to CustomElementTypesTest as well.
 
   def make_keys(self, *shape, seed=None):
@@ -1543,6 +1543,42 @@ class KeyArrayTest(jtu.JaxTestCase):
     keys = jax.vmap(f, in_axes=1)(base_arr.T)
     self.assertIsInstance(keys, random.KeyArray)
     self.assertEqual(keys.shape, (3,))
+
+  @parameterized.named_parameters(jtu.cases_from_list(
+      {"testcase_name": "_internal" if use_internal else "",
+       "use_internal": use_internal}
+      for use_internal in [False, True]))
+  def test_random_unwrap(self, use_internal):
+    unwrap = prng_internal.random_unwrap if use_internal else random.key_data
+    def f(k): return unwrap(k)
+    k = self.make_keys(3, 4)
+    out = f(k)
+    self.assertEqual(out.dtype, np.dtype('uint32'))
+    self.assertEqual(out.shape[:2], (3, 4))
+    out = jax.jit(f)(k)
+    self.assertEqual(out.dtype, np.dtype('uint32'))
+    self.assertEqual(out.shape[:2], (3, 4))
+    out = jax.vmap(f)(k)
+    self.assertEqual(out.dtype, np.dtype('uint32'))
+    self.assertEqual(out.shape[:2], (3, 4))
+    out = jax.vmap(jax.jit(f))(k)
+    self.assertEqual(out.dtype, np.dtype('uint32'))
+    self.assertEqual(out.shape[:2], (3, 4))
+
+    # TODO(frostig): simplify when we always enable_custom_prng
+    if not (config.jax_enable_custom_prng and use_internal):
+      return
+
+    x = jnp.arange(12, dtype=np.dtype('uint32')).reshape(3, 4)
+    self.assertRaisesRegex(
+        TypeError, 'random_unwrap takes key array operand, got .*',
+        lambda: f(x))
+    self.assertRaisesRegex(
+        TypeError, 'random_unwrap takes key array operand, got .*',
+        lambda: jax.jit(f)(x))
+    self.assertRaisesRegex(
+        TypeError, 'random_unwrap takes key array operand, got .*',
+        lambda: jax.vmap(f)(x))
 
   def test_eval_shape_keys_in(self):
     def f(key):

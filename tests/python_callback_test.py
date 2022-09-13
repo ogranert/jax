@@ -11,14 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import contextlib
 import functools
-import io
 import textwrap
 import unittest
-from unittest import mock
 
-from typing import Any, Callable, Generator, Sequence
+from typing import Any, Callable, Sequence
 
 from absl.testing import absltest
 import jax
@@ -40,16 +37,6 @@ import numpy as np
 config.parse_flags_with_absl()
 
 debug_print = debugging.debug_print
-
-
-@contextlib.contextmanager
-def capture_stdout() -> Generator[Callable[[], str], None, None]:
-  with mock.patch("sys.stdout", new_callable=io.StringIO) as fp:
-
-    def _read() -> str:
-      return fp.getvalue()
-
-    yield _read
 
 
 def _format_multiline(text):
@@ -470,6 +457,17 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
     dispatch.runtime_tokens.clear()
 
   @jtu.skip_on_devices(*disabled_backends)
+  def test_pure_callback_passes_ndarrays_without_jit(self):
+
+    def cb(x):
+      self.assertIs(type(x), np.ndarray)
+      return x
+
+    def f(x):
+      return jax.pure_callback(cb, x, x)
+    f(jnp.array(2.))
+
+  @jtu.skip_on_devices(*disabled_backends)
   def test_simple_pure_callback(self):
 
     @jax.jit
@@ -555,6 +553,20 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
       return callback(_cb, core.ShapedArray((1,), np.float32))
 
     with self.assertRaises(RuntimeError):
+      f()
+      jax.effects_barrier()
+
+  @jtu.skip_on_devices(*disabled_backends)
+  def test_callback_with_wrongly_specified_64_bit_dtype(self):
+    if config.jax_enable_x64:
+      raise unittest.SkipTest("Test only needed when 64-bit mode disabled.")
+
+    @jax.jit
+    def f():
+      return jax.pure_callback(lambda: np.float64(1.),
+                               core.ShapedArray((), np.float64))
+
+    with self.assertRaises(ValueError):
       f()
       jax.effects_barrier()
 

@@ -78,10 +78,6 @@ class MultiDeviceTest(jtu.JaxTestCase):
       self.assertEqual(data.device_buffer.device(), device)
 
   def test_computation_follows_data(self):
-    # TODO(https://github.com/google/jax/issues/12016): Figure out why this test
-    # does not work with Array.
-    if config.jax_array:
-      self.skipTest("Does not work with Array. Needs more investigation.")
     if jax.device_count() < 5:
       self.skipTest("test requires 5 devices")
     devices = self.get_devices()
@@ -129,7 +125,7 @@ class MultiDeviceTest(jtu.JaxTestCase):
     z1, z2 = jax.jit(lambda x: (x, x))(x_uncommitted)
     self.assert_uncommitted_to_device(z1, devices[0])
     self.assert_uncommitted_to_device(z2, devices[0])
-    self.assertIs(z1, z2)
+    self.assertEqual(z1.unsafe_buffer_pointer(), z2.unsafe_buffer_pointer())
 
     x2_uncommitted = jnp.array([2, 3])
     z1, z2, z3 = jax.jit(lambda x, y: (y, 1, x))(x_uncommitted, x2_uncommitted)
@@ -149,6 +145,12 @@ class MultiDeviceTest(jtu.JaxTestCase):
     self.assert_committed_to_device(jit_add_on4(jax.device_put(x_uncommitted, devices[2]),
                                                 jax.device_put(x_uncommitted, devices[3])),
                                     devices[4])
+
+  def test_computation_follows_data_prng(self):
+    _, device, *_ = self.get_devices()
+    rng = jax.device_put(jax.random.PRNGKey(0), device)
+    val = jax.random.normal(rng, ())
+    self.assert_committed_to_device(val, device)
 
   def test_primitive_compilation_cache(self):
     devices = self.get_devices()

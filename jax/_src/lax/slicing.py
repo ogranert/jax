@@ -14,7 +14,7 @@
 
 import enum
 from functools import partial
-from typing import Any, Callable, NamedTuple, Optional, Sequence, Union
+from typing import Any, Callable, NamedTuple, Optional, Sequence, Tuple, Union
 import weakref
 
 import numpy as np
@@ -173,9 +173,9 @@ class GatherDimensionNumbers(NamedTuple):
   implicit; there is always an index vector dimension and it must always be the
   last dimension. To gather scalar indices, add a trailing dimension of size 1.
   """
-  offset_dims: Sequence[int]
-  collapsed_slice_dims: Sequence[int]
-  start_index_map: Sequence[int]
+  offset_dims: Tuple[int, ...]
+  collapsed_slice_dims: Tuple[int, ...]
+  start_index_map: Tuple[int, ...]
 
 
 class GatherScatterMode(enum.Enum):
@@ -285,7 +285,6 @@ def gather(operand: Array, start_indices: Array,
       indices_are_sorted=bool(indices_are_sorted),
       mode=parsed_mode,
       fill_value=fill_value)
-
 
 
 class ScatterDimensionNumbers(NamedTuple):
@@ -613,15 +612,17 @@ def scatter(
 
 def index_take(src: Array, idxs: Array, axes: Sequence[int]) -> Array:
   indices = lax.concatenate([lax.expand_dims(i, (1,)) for i in idxs], 1)
-  indices = indices % np.array([src.shape[ax] for ax in axes])
+  max_idx = lax.expand_dims(np.array([src.shape[ax] for ax in axes]),
+                            tuple(range(indices.ndim - 1)))
+  indices = indices % max_idx
   slice_sizes = list(src.shape)
   for ax in axes:
     slice_sizes[ax] = 1
   offset_dims = tuple(range(1, src.ndim - indices.shape[1] + 1))
   dnums = GatherDimensionNumbers(
       offset_dims=offset_dims,
-      collapsed_slice_dims=axes,
-      start_index_map=axes)
+      collapsed_slice_dims=tuple(axes),
+      start_index_map=tuple(axes))
   return gather(src, indices, dimension_numbers=dnums,
                 slice_sizes=tuple(slice_sizes))
 
@@ -803,7 +804,7 @@ batching.primitive_batchers[slice_p] = _slice_batching_rule
 def _slice_lower(ctx, x, *, start_indices, limit_indices, strides):
   strides = strides or [1] * len(start_indices)
   aval_out, = ctx.avals_out
-  if type(aval_out.dtype) in core.custom_eltypes:
+  if core.is_opaque_dtype(aval_out.dtype):
     return aval_out.dtype._rules.slice_mlir(
         ctx, x, start_indices, limit_indices, strides)
   return mhlo.SliceOp(x,
@@ -904,7 +905,7 @@ batching.primitive_batchers[dynamic_slice_p] = _dynamic_slice_batching_rule
 
 def _dynamic_slice_lower(ctx, x, *start_indices, slice_sizes):
   aval_out, = ctx.avals_out
-  if type(aval_out.dtype) in core.custom_eltypes:
+  if core.is_opaque_dtype(aval_out.dtype):
     return aval_out.dtype._rules.dynamic_slice_mlir(
         ctx, x, start_indices, slice_sizes)
   return mhlo.DynamicSliceOp(x, start_indices,
@@ -1003,7 +1004,7 @@ batching.primitive_batchers[dynamic_update_slice_p] = \
 
 def _dynamic_update_slice_lower(ctx, x, update, *start_indices):
   aval_out, = ctx.avals_out
-  if type(aval_out.dtype) in core.custom_eltypes:
+  if core.is_opaque_dtype(aval_out.dtype):
     return aval_out.dtype._rules.dynamic_update_slice_mlir(
         ctx, x, update, *start_indices)
   return mhlo.DynamicUpdateSliceOp(mlir.aval_to_ir_type(aval_out), x, update,
@@ -1161,7 +1162,8 @@ def _gather_shape_rule(operand, indices, *, dimension_numbers,
   expanded_indices_shape.pop(index_vector_dim)
   indices_shape = iter(expanded_indices_shape)
 
-  slice_sizes = iter(np.delete(slice_sizes, collapsed_slice_dims))
+  slice_sizes = (s for i, s in enumerate(slice_sizes)
+                 if i not in collapsed_slice_dims)
   return tuple(next(slice_sizes) if i in offset_dims
                else next(indices_shape) for i in range(output_shape_rank))
 
@@ -1250,7 +1252,7 @@ def _gather_batching_rule(batched_args, batch_dims, *, dimension_numbers,
 
   elif operand_bdim is None and indices_bdim is not None:
     indices = batching.moveaxis(indices, indices_bdim, 0)
-    offset_dims = tuple(np.add(1, dimension_numbers.offset_dims))
+    offset_dims = tuple(1 + d for d in dimension_numbers.offset_dims)
     dnums = GatherDimensionNumbers(
         offset_dims=offset_dims,
         collapsed_slice_dims=dimension_numbers.collapsed_slice_dims,
@@ -1308,17 +1310,15 @@ gather_p = standard_primitive(
     _gather_shape_rule, _gather_dtype_rule, 'gather',
     weak_type_rule=_argnum_weak_type(0))
 ad.defjvp(gather_p, _gather_jvp_rule, None)
-
 ad.primitive_transposes[gather_p] = _gather_transpose_rule
 batching.primitive_batchers[gather_p] = _gather_batching_rule
-
 
 
 def _gather_lower(ctx, operand, indices, *,
                   dimension_numbers, slice_sizes, unique_indices,
                   indices_are_sorted, mode, fill_value):
   aval_out, = ctx.avals_out
-  if type(aval_out.dtype) in core.custom_eltypes:
+  if core.is_opaque_dtype(aval_out.dtype):
     return aval_out.dtype._rules.gather_mlir(
         ctx, operand, indices, dimension_numbers=dimension_numbers,
         slice_sizes=slice_sizes, unique_indices=unique_indices,
@@ -2054,39 +2054,3 @@ def _dynamic_slice_indices(operand, start_indices: Any):
       d = lax.convert_element_type(core.dimension_as_value(d), _dtype(i))
       result.append(lax.select(i < 0, i + d, i))
   return result
-
-
-# TODO(mattjj): getslice is a prototype for dynamic shapes, revise or remove it
-def _getslice(x, lo, hi):
-  return getslice_p.bind(x, lo, hi)
-
-getslice_p = core.Primitive('getslice')
-
-@getslice_p.def_impl
-def getslice_impl(x, lo, hi):
-  return x[lo:hi]
-
-def _getslice_staging_rule(trace, x, lo, hi):
-  size = lax.make_bint(lax.clamp(0, hi - lo, x.shape[0]), x.shape[0])
-  aval = core.DShapedArray((size,), x.dtype, x.weak_type)
-  source_info = source_info_util.current()
-  out_tracer = pe.DynamicJaxprTracer(trace, aval, source_info)
-  invars = map(trace.getvar, [x, lo, hi])
-  eqn = pe.new_jaxpr_eqn(invars, [trace.makevar(out_tracer)],
-                         getslice_p, {}, source_info)
-  trace.frame.eqns.append(eqn)
-  return out_tracer
-pe.custom_staging_rules[getslice_p] = _getslice_staging_rule
-
-def _getslice_padding_rule(in_avals, out_avals, x, lo, hi):
-  xx = lax.concatenate([x, x], 0)
-  return [dynamic_slice_in_dim(xx, lo, x.shape[0])]
-pe.padding_rules[getslice_p] = _getslice_padding_rule
-
-def _getslice_lower(ctx, x, lo, hi):
-  aval_out, = ctx.avals_out
-  return mhlo.RealDynamicSliceOp(
-      mlir.aval_to_ir_type(aval_out), x,
-      mlir.shape_tensor([lo]), mlir.shape_tensor([hi]), mlir.shape_tensor([1])
-  ).results
-mlir.register_lowering(getslice_p, _getslice_lower)

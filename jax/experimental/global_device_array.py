@@ -23,7 +23,7 @@ from jax._src import api_util
 from jax._src.lib import xla_bridge as xb
 from jax._src.lib import xla_client as xc
 from jax._src.config import config
-from jax.interpreters import pxla, xla
+from jax.interpreters import pxla, xla, mlir
 from jax._src.util import prod, safe_zip
 from jax._src.api import device_put
 from jax.interpreters.pxla import PartitionSpec
@@ -415,6 +415,9 @@ class GlobalDeviceArray:
 
   @property
   def _value(self):
+    if self.is_fully_replicated:
+      return np.asarray(self._device_buffers[0])
+
     if self.mesh.is_multi_process:
       raise RuntimeError("Fetching value for GDA that spans non-addressable "
                          "devices is not possible. You can use "
@@ -607,6 +610,14 @@ xla.canonicalize_dtype_handlers[GlobalDeviceArray] = pxla.identity
 api_util._shaped_abstractify_handlers[GlobalDeviceArray] = \
     lambda x: core.ShapedArray(x.shape, x.dtype)
 
+# This will only work when GDA is fully addressable i.e. on a single host or
+# fully replicated.
+def _gda_mlir_constant_handler(val, canonicalize_types=True):
+  return mlir.ir_constants(val._value,
+                           canonicalize_types=canonicalize_types)
+mlir.register_constant_handler(GlobalDeviceArray, _gda_mlir_constant_handler)
+
+
 def _gda_shard_arg(x, devices, indices, mode):
   if mode == pxla.InputsHandlerMode.pmap:
     raise RuntimeError('GDA is not supported with pmap.')
@@ -618,10 +629,11 @@ def _gda_shard_arg(x, devices, indices, mode):
 pxla.shard_arg_handlers[GlobalDeviceArray] = _gda_shard_arg
 
 
-def _gda_array_result_handler(global_aval, out_sharding, committed):
-  if core.aval_has_custom_eltype(global_aval):
+def _gda_array_result_handler(global_aval, out_sharding, committed,
+                              is_out_sharding_from_xla):
+  if core.is_opaque_dtype(global_aval.dtype):
     return global_aval.dtype._rules.global_sharded_result_handler(
-        global_aval, out_sharding, committed)
+        global_aval, out_sharding, committed, is_out_sharding_from_xla)
   global_mesh, out_axis_resources = out_sharding.mesh, out_sharding.spec
   global_idx_rid = get_shard_indices_replica_ids(global_aval.shape, global_mesh,
                                                  out_axis_resources)

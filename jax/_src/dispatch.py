@@ -277,6 +277,38 @@ def _xla_call_impl(fun: lu.WrappedFun, *args, device, backend, name,
 xla.xla_call_p.def_impl(_xla_call_impl)
 
 
+# TODO(yashkatariya,mattjj): Try to handle this in api.py via a device_put and
+# don't pass the device and backend argument to `_xla_callable_uncached`.
+def not_none_device_or_backend_on_jit(backend, device, num_ins):
+  """This is to support the backend and device argument on jit. It's a feature
+  that's deprecated but needs to be supported for feature parity and so that we
+  can delete the non-Array paths when Array is switched on.
+  """
+  # TODO(yashkatariya): Remove this entire function when backend and device are
+  # removed as arguments on jit.
+
+  from jax.experimental import sharding
+
+  if device is not None and backend is not None:
+    raise ValueError("can't specify both a device and a backend for jit, "
+                     "got device={} and backend={}".format(device, backend))
+
+  if backend is not None:
+    da = [xb.get_backend(backend).get_default_device_assignment(1)[0]]
+  else:
+    assert device is not None
+    da = [device]
+
+  assert len(da) == 1
+  # Set committed to True for this path because it simulates a device_put on
+  # behalf of a user.
+  committed = True
+  # in_shardings will be marked as replicated regardless of whatever the input
+  # had. Given that only a single device is allowed above, this is correct.
+  in_shardings = [sharding.OpShardingSharding.get_replicated(da)] * num_ins
+  return committed, da, in_shardings
+
+
 def sharded_lowering(fun, device, backend, name, donated_invars, keep_unused,
                      *arg_specs):
   # TODO(yashkatariya): Remove the local imports from here when the functions
@@ -286,22 +318,34 @@ def sharded_lowering(fun, device, backend, name, donated_invars, keep_unused,
 
   in_avals, in_shardings = util.unzip2(arg_specs)
 
-  # Specifying backend on `jit` is not supported when Array is enabled. So take
-  # the `lower_xla_callable` path which can handle it.
-  # TODO(yashkatariya): Figure out what to do with the backend argument in `jit`
-  if backend is not None:
-    arg_specs = tuple(
-        (a, s._device) if isinstance(s, sharding.SingleDeviceSharding) else (a, None)
-        for a, s in zip(in_avals, in_shardings))
-    return lower_xla_callable(
-        fun, None, backend, name, donated_invars, False, keep_unused,
-        *arg_specs).compile().unsafe_call
+  if backend is not None or device is not None:
+    committed, da, in_shardings = not_none_device_or_backend_on_jit(
+        backend, device, len(in_shardings))
+  else:
+    committed = any(i is not None for i in in_shardings)
+    da = pjit._get_and_check_device_assignment(
+        (i for i in in_shardings if i is not None), pxla.EMPTY_ENV.physical_mesh)
+    in_shardings = [sharding.OpShardingSharding.get_replicated(da) if i is None else i
+                    for i in in_shardings]
 
-  committed = any(i is not None for i in in_shardings)
-  da = pjit._get_and_check_device_assignment(
-      (i for i in in_shardings if i is not None), pxla.EMPTY_ENV.physical_mesh)
-  in_shardings = [sharding.OpShardingSharding.get_replicated(da) if i is None else i
-                  for i in in_shardings]
+  process_index = xb.process_index()
+  local_da = [d for d in da if d.process_index == process_index]
+  if len(local_da) != len(da):
+    warnings.warn(
+        "Running operations on `Array`s that are not fully addressable by this "
+        "process (i.e. `Array`s with data sharded across multiple devices and "
+        "processes.) is dangerous. It’s very important that all processes run "
+        "the same cross-process computations in the same order otherwise it "
+        "can lead to hangs.\n"
+        "If you’re not already familiar with JAX’s multi-process "
+        "programming model, please read "
+        "https://jax.readthedocs.io/en/latest/multi_process.html.")
+
+  if not in_shardings:
+    inp_device_assignment = da
+  else:
+    inp_device_assignment = None
+
   # Pass in a singleton `_UNSPECIFIED` for out_shardings because we don't know
   # the number of output avals at this stage. lower_sharding_computation will
   # apply it to all out_avals.
@@ -309,15 +353,13 @@ def sharded_lowering(fun, device, backend, name, donated_invars, keep_unused,
       fun, 'jit', name, in_shardings, pjit._UNSPECIFIED,
       donated_invars, in_avals,
       in_is_global=(True,) * len(arg_specs), keep_unused=keep_unused,
-      committed=committed).compile(
+      committed=committed, inp_device_assignment=inp_device_assignment).compile(
           _allow_propagation_to_outputs=True).unsafe_call
 
 
 def _xla_callable_uncached(fun: lu.WrappedFun, device, backend, name,
                            donated_invars, keep_unused, *arg_specs):
-  # TODO(yashkatariya): Remove the `and arg_specs` from here once
-  # lower_sharding_computation supports no avals as input.
-  if config.jax_array and arg_specs:
+  if config.jax_array:
     return sharded_lowering(fun, device, backend, name,
                             donated_invars, keep_unused, *arg_specs)
   else:
@@ -325,6 +367,13 @@ def _xla_callable_uncached(fun: lu.WrappedFun, device, backend, name,
                               keep_unused, *arg_specs).compile().unsafe_call
 
 xla_callable = lu.cache(_xla_callable_uncached)
+
+
+def is_single_device_sharding(sharding) -> bool:
+  from jax.experimental.sharding import PmapSharding
+  # Special case PmapSharding here because PmapSharding maps away an axis
+  # and needs to be handled separately.
+  return len(sharding.device_set) == 1 and not isinstance(sharding, PmapSharding)
 
 
 @contextlib.contextmanager
@@ -517,19 +566,11 @@ def jaxpr_has_bints(jaxpr: core.Jaxpr) -> bool:
 
 def _prune_unused_inputs(
     jaxpr: core.Jaxpr) -> Tuple[core.Jaxpr, Set[int], Set[int]]:
-  used = {v for v in jaxpr.outvars if isinstance(v, core.Var)}
-  # TODO(zhangqiaorjc): Improve the DCE algorithm by also pruning primitive
-  # applications that do not produce used outputs. Must handle side-effecting
-  # primitives and nested jaxpr.
-  used.update(
-      v for eqn in jaxpr.eqns for v in eqn.invars if isinstance(v, core.Var))
-  kept_const_idx, new_constvars = util.unzip2(
-      (i, v) for i, v in enumerate(jaxpr.constvars) if v in used)
-  kept_var_idx, new_invars = util.unzip2(
-      (i, v) for i, v in enumerate(jaxpr.invars) if v in used)
-  new_jaxpr = core.Jaxpr(new_constvars, new_invars, jaxpr.outvars, jaxpr.eqns,
-                         jaxpr.effects)
-  return new_jaxpr, set(kept_const_idx), set(kept_var_idx)
+  used_outputs = [True] * len(jaxpr.outvars)
+  new_jaxpr, used_consts, used_inputs = pe.dce_jaxpr_consts(jaxpr, used_outputs)
+  kept_const_idx = {i for i, b in enumerate(used_consts) if b}
+  kept_var_idx = {i for i, b in enumerate(used_inputs) if b}
+  return new_jaxpr, kept_const_idx, kept_var_idx
 
 
 # We can optionally set a Jaxpr rewriter that can be applied just before
@@ -732,7 +773,7 @@ def array_result_handler(sticky_device: Optional[Device],
   if aval.dtype == dtypes.float0:
     return lambda _, __: np.zeros(aval.shape, dtypes.float0)
   aval = core.raise_to_shaped(aval)
-  if type(aval.dtype) in core.custom_eltypes:
+  if core.is_opaque_dtype(aval.dtype):
     return aval.dtype._rules.result_handler(sticky_device, aval)
   handler = lambda _, b: maybe_create_array_from_da(b, aval, sticky_device)
   handler.args = aval, sticky_device  # for C++ dispatch path in api.py
@@ -964,46 +1005,49 @@ def _dump_ir_to_file(name: str, ir: str):
   name.write_text(ir)
 
 
-def compile_or_get_cached(backend, computation, compile_options,
+def compile_or_get_cached(backend, computation: ir.Module, compile_options,
                           host_callbacks):
   # Avoid import cycle between jax and jax.experimental
   from jax.experimental.compilation_cache import compilation_cache as cc
 
-  if isinstance(computation, ir.Module):
-    sym_name = computation.operation.attributes['sym_name']
-    module_name = ir.StringAttr(sym_name).value
-    # Convert ir.Module to str representation (the default), unless the
-    # back-end expliclity flags the ability to handle a module directly
-    # (avoiding the overhead of back and forth conversions)
-    if getattr(backend, "needs_str_ir", True):
-      computation = mlir.module_to_string(computation)
+  sym_name = computation.operation.attributes['sym_name']
+  module_name = ir.StringAttr(sym_name).value
+  # Convert ir.Module to a string representation, unless the
+  # back-end expliclity flags the ability to handle a module directly
+  # (avoiding the overhead of back and forth conversions)
+  serialized_computation: Union[str, bytes, ir.Module]
+  if getattr(backend, "needs_str_ir", True):
+    if xc.mlir_api_version >= 34:
+      serialized_computation = mlir.module_to_bytecode(computation)
+    else:
+      serialized_computation = mlir.module_to_string(computation)
   else:
-    module_name = computation.name()
+    serialized_computation = computation
 
   # Persistent compilation cache only implemented on TPU.
   # TODO(skye): add warning when initializing cache on unsupported default platform
-  if cc.is_initialized() and backend.platform == 'tpu':
-    cached_executable = cc.get_executable(computation, compile_options, backend)
+  supported_platforms = ["tpu"]
+  # GPU caching can be enabled if JitRt is enabled.
+  # TODO(b/232263664): Remove check when JitRt is enabled by default.
+  if "--xla_gpu_enable_xla_runtime_executable=true" in os.environ.get("XLA_FLAGS", ""):
+    supported_platforms.append("gpu")
+  if cc.is_initialized() and backend.platform in supported_platforms:
+    cached_executable = cc.get_executable(serialized_computation,
+                                          compile_options, backend)
     if cached_executable is not None:
       logging.info('Persistent compilation cache hit for %s.', module_name)
       return cached_executable
     else:
-      compiled = backend_compile(backend, computation, compile_options,
-                                 host_callbacks)
-      cc.put_executable(module_name, computation, compile_options, compiled,
-                        backend)
+      compiled = backend_compile(backend, serialized_computation,
+                                 compile_options, host_callbacks)
+      cc.put_executable(module_name, serialized_computation, compile_options,
+                        compiled, backend)
       return compiled
 
   if FLAGS.jax_dump_ir_to:
-    if isinstance(computation, xc.XlaComputation):
-      ir_str = computation.as_hlo_text()
-    elif isinstance(computation, ir.Module):
-      ir_str = mlir.module_to_string(computation)
-    else:
-      assert isinstance(computation, str)
-      ir_str = computation
-    _dump_ir_to_file(module_name, ir_str)
-  return backend_compile(backend, computation, compile_options, host_callbacks)
+    _dump_ir_to_file(module_name, mlir.module_to_string(computation))
+  return backend_compile(backend, serialized_computation, compile_options,
+                         host_callbacks)
 
 
 def get_buffer_counts(out_avals, ordered_effects, has_unordered_effects):

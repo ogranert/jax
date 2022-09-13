@@ -2697,11 +2697,6 @@ class ShardedDeviceArrayTest(jtu.JaxTestCase):
     self.assertAllClose(actual, expected, check_dtypes=False)
 
   def testNoCopyIndexing1D(self):
-    # TODO(https://github.com/google/jax/issues/12016): Implement no copy
-    # indexing similar to SDA.
-    if config.jax_array:
-      self.skipTest('No copy indexing is not implemented for Array yet.')
-
     shape = (8, 4)
 
     if jax.device_count() < shape[0]:
@@ -2710,8 +2705,14 @@ class ShardedDeviceArrayTest(jtu.JaxTestCase):
     x = jnp.arange(prod(shape)).reshape(shape)
     sharded_x = pmap(lambda x: x)(x)
     self.assertIsNone(sharded_x._npy_value)
+
+    if config.jax_array:
+      arr_type = array.Array
+    else:
+      arr_type = device_array.DeviceArray
+
     for i in range(8):
-      self.assertIsInstance(sharded_x[i], device_array.DeviceArray)
+      self.assertIsInstance(sharded_x[i], arr_type)
     self.assertIsNone(sharded_x._npy_value)
 
   @parameterized.named_parameters(
@@ -3104,6 +3105,34 @@ class ArrayPmapTest(jtu.JaxTestCase):
     self.assertEqual(out_array.sharding.sharding_spec, out_sda.sharding_spec)
     self.assertArraysEqual(out_array.sharding.devices,
                            [d.device() for d in out_sda.device_buffers])
+
+  def test_amap(self):
+    # Copied from an example mattjj@ posted in a chat thread.
+
+    if jax.device_count() < 2:
+      self.skipTest('Test requires >= 2 devices.')
+
+    def amap(f, xs):
+      ys = [f(jax.device_put(x, x.device())) for x in xs]
+      return jax.device_put_sharded(ys, [y.device() for y in ys])
+
+    # leading axis is batch dim (i.e. mapped/parallel dim), of size 2
+    x = jnp.array([[1., 0., 0.],
+                   [0., 2., 3.]])
+
+    # first pmapped computation
+    y = jax.pmap(jnp.sin)(x)
+
+    def dynamic_shape_function(y):
+      nonzero_idx = y != 0
+      results = y[nonzero_idx] ** 2
+      return y.at[nonzero_idx].set(results)
+    z = amap(dynamic_shape_function, y)
+
+    # second pmapped computation
+    w = jax.pmap(jnp.cos)(z)
+
+    self.assertArraysEqual(w, jnp.cos(jnp.sin(x) ** 2))
 
 
 class EagerPmapMixin:

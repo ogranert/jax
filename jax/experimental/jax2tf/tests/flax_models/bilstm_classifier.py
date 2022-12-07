@@ -1,4 +1,4 @@
-# Copyright 2022 Google LLC
+# Copyright 2022 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,13 +18,11 @@ https://github.com/google/flax/tree/main/examples/sst2
 
 import functools
 from typing import Any, Callable, Optional
-from typing_extensions import TypeAlias
 
 from flax import linen as nn
 import jax
 from jax import numpy as jnp
-
-Array: TypeAlias = jnp.ndarray
+from jax._src.typing import Array
 
 
 def sequence_mask(lengths: Array, max_length: int) -> Array:
@@ -124,7 +122,7 @@ class Embedder(nn.Module):
   word_dropout_rate: float = 0.
   unk_idx: Optional[int] = None
   deterministic: Optional[bool] = None
-  dtype: jnp.dtype = jnp.float32
+  dtype: jnp.dtype = jnp.dtype('float32')
 
   def setup(self):
     self.embedding = self.param(

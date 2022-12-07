@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,21 +34,21 @@ For example:
 ...   return -(jnp.sin(mat) @ vec)
 ...
 >>> f(mat, vec)
-DeviceArray([-1.2655463 , -0.52060574, -0.14522289, -0.10817424,
-             -0.15574613], dtype=float32)
+Array([-1.2655463 , -0.52060574, -0.14522289, -0.10817424,
+       -0.15574613], dtype=float32)
 
 >>> mat_sparse = BCOO.fromdense(mat)
 >>> mat_sparse
 BCOO(float32[5, 5], nse=8)
 
 >>> sparsify(f)(mat_sparse, vec)
-DeviceArray([-1.2655463 , -0.52060574, -0.14522289, -0.10817424,
-             -0.15574613], dtype=float32)
+Array([-1.2655463 , -0.52060574, -0.14522289, -0.10817424,
+       -0.15574613], dtype=float32)
 """
 
 import functools
 from typing import (
-  Any, Callable, Dict, NamedTuple, List, Optional, Sequence, Tuple, Union)
+  Any, Callable, Dict, NamedTuple, List, Optional, Sequence, Tuple)
 
 import numpy as np
 
@@ -65,11 +65,17 @@ from jax.util import safe_map, safe_zip, split_list
 from jax._src.config import config
 from jax._src.lax.control_flow import _check_tree_and_avals
 from jax._src.numpy import lax_numpy
-from jax._src.util import canonicalize_axis
 from jax.experimental import sparse
 from jax.experimental.sparse import BCOO
 
 sparse_rules : Dict[core.Primitive, Callable] = {}
+
+_zero_preserving_linear_unary_primitives = [
+  lax.copy_p,
+  lax.imag_p,
+  lax.neg_p,
+  lax.real_p,
+]
 
 _zero_preserving_unary_primitives = [
   lax.abs_p,
@@ -78,19 +84,15 @@ _zero_preserving_unary_primitives = [
   lax.atan_p,
   lax.atanh_p,
   lax.bessel_i1e_p,
-  lax.copy_p,
   lax.expm1_p,
   lax.log1p_p,
-  lax.neg_p,
-  lax.real_p,
-  lax.imag_p,
   lax.sign_p,
   lax.sin_p,
   lax.sinh_p,
   lax.sqrt_p,
   lax.tan_p,
   lax.tanh_p,
-  lax.convert_element_type_p
+  lax.convert_element_type_p,
 ]
 
 _densifying_primitives : List[core.Primitive] = [
@@ -241,13 +243,13 @@ def spvalues_to_avals(
 #------------------------------------------------------------------------------
 # Implementation of sparsify() using tracers.
 
-def popattr(obj, name):
+def popattr(obj: Any, name: str) -> Any:
   assert hasattr(obj, name)
   val = getattr(obj, name)
   delattr(obj, name)
   return val
 
-def setnewattr(obj, name, val):
+def setnewattr(obj: Any, name: str, val: Any):
   assert not hasattr(obj, name)
   setattr(obj, name, val)
 
@@ -353,11 +355,12 @@ def eval_sparse(
 ) -> Sequence[SparsifyValue]:
   env : Dict[core.Var, SparsifyValue] = {}
 
-  def read(var: core.Var) -> Union[Array, SparsifyValue]:
+  def read(var: core.Atom) -> SparsifyValue:
     # all literals are dense
     if isinstance(var, core.Literal):
       return spenv.dense(var.val)
     else:
+      assert isinstance(var, core.Var)
       return env[var]
 
   def write_buffer(var: core.Var, a: Array) -> None:
@@ -446,7 +449,7 @@ def sparsify(f, use_tracer=False):
     >>> v = jnp.array([3, 4, 2])
 
     >>> f(M, v)
-    DeviceArray([ 64,  82, 100, 118], dtype=int32)
+    Array([ 64,  82, 100, 118], dtype=int32)
   """
   if use_tracer:
     return _sparsify_with_tracer(f)
@@ -462,15 +465,17 @@ def _ensure_unique_indices(spenv, spvalue):
   if spvalue.is_dense() or spvalue.unique_indices:
     return spvalue
   arr = spvalues_to_arrays(spenv, spvalue)
-  arr = arr.sum_duplicates(nse=arr.nse)
+  arr = arr.sum_duplicates(nse=arr.nse, remove_zeros=False)
   return arrays_to_spvalues(spenv, arr)
 
-def _zero_preserving_unary_op(prim):
+def _zero_preserving_unary_op(prim, linear):
   def func(spenv, *spvalues, **kwargs):
     assert len(spvalues) == 1
-    # Since unary operations don't commute with addition, we need to ensure
-    # that indices are unique before applying the operator elementwise.
-    spvalue = _ensure_unique_indices(spenv, spvalues[0])
+    spvalue = spvalues[0]
+    if not linear:
+      # For non-linear unary operations, we need to ensure that
+      # indices are unique before applying the operator elementwise.
+      spvalue = _ensure_unique_indices(spenv, spvalue)
     buf = spenv.data(spvalue)
     buf_out = prim.bind(buf, **kwargs)
     if spvalues[0].is_sparse():
@@ -484,16 +489,29 @@ def _zero_preserving_unary_op(prim):
   return func
 
 for _prim in _zero_preserving_unary_primitives:
-  sparse_rules[_prim] = _zero_preserving_unary_op(_prim)
+  sparse_rules[_prim] = _zero_preserving_unary_op(_prim, linear=False)
+for _prim in _zero_preserving_linear_unary_primitives:
+  sparse_rules[_prim] = _zero_preserving_unary_op(_prim, linear=True)
 
-def _dot_general_sparse(spenv, *spvalues, dimension_numbers, precision, preferred_element_type):
-  # TODO(jakevdp): pass along these unused configurations?
-  del precision, preferred_element_type  # unused
-  result = sparse.bcoo_dot_general(*spvalues_to_arrays(spenv, spvalues),
-                                   dimension_numbers=dimension_numbers)
-  return arrays_to_spvalues(spenv, [result])
+def _standard_sparse_rule(prim, sparse_op):
+  def _sparse_rule(spenv, *spvalues, **kwds):
+    result = sparse_op(*spvalues_to_arrays(spenv, spvalues), **kwds)
+    return arrays_to_spvalues(spenv, result if prim.multiple_results else [result])
+  return _sparse_rule
 
-sparse_rules[lax.dot_general_p] = _dot_general_sparse
+_BCOO_STANDARD_PRIMITIVES = {
+  lax.broadcast_in_dim_p: sparse.bcoo_broadcast_in_dim,
+  lax.concatenate_p: lambda *a, **k: sparse.bcoo_concatenate(a, **k),
+  lax.dot_general_p: sparse.bcoo_dot_general,
+  lax.dynamic_slice_p: lambda *a, **k: sparse.bcoo_dynamic_slice(a[0], a[1:], **k),
+  lax.reshape_p: sparse.bcoo_reshape,
+  lax.slice_p: sparse.bcoo_slice,
+  lax.squeeze_p: sparse.bcoo_squeeze,
+}
+
+for prim, bcoo_impl in _BCOO_STANDARD_PRIMITIVES.items():
+  sparse_rules[prim] = _standard_sparse_rule(prim, bcoo_impl)
+
 
 def _transpose_sparse(spenv, *spvalues, permutation):
   permutation = tuple(permutation)
@@ -604,48 +622,18 @@ def _reduce_sum_sparse(spenv, *spvalues, axes):
 
 sparse_rules[lax.reduce_sum_p] = _reduce_sum_sparse
 
-def _broadcast_in_dim_sparse(spenv, *spvalues, shape, broadcast_dimensions):
-  operand, = spvalues
-  operand_promoted = spvalues_to_arrays(spenv, operand)
-  mat = sparse.bcoo_broadcast_in_dim(operand_promoted, shape=shape,
-                                     broadcast_dimensions=broadcast_dimensions)
-  return (spenv.sparse(shape, mat.data, mat.indices),)
 
-sparse_rules[lax.broadcast_in_dim_p] = _broadcast_in_dim_sparse
 
-def _concatenate_sparse(spenv, *spvalues, dimension):
-  operands = spvalues_to_arrays(spenv, spvalues)
-  result = sparse.bcoo_concatenate(operands, dimension=dimension)
+def _gather_sparse_rule(spenv, *args, dimension_numbers, slice_sizes, unique_indices,
+                        indices_are_sorted, mode, fill_value):
+  operand, start_indices = spvalues_to_arrays(spenv, args)
+  result = sparse.bcoo_gather(operand, start_indices, dimension_numbers=dimension_numbers,
+                              slice_sizes=slice_sizes, unique_indices=unique_indices,
+                              indices_are_sorted=indices_are_sorted,
+                              mode=mode, fill_value=fill_value)
   return arrays_to_spvalues(spenv, (result,))
 
-sparse_rules[lax.concatenate_p] = _concatenate_sparse
-
-def _squeeze_sparse(spenv, *spvalues, dimensions):
-  arr, = spvalues
-  dimensions = tuple(canonicalize_axis(dim, arr.ndim) for dim in dimensions)
-  if any(arr.shape[dim] != 1 for dim in dimensions):
-    raise ValueError("cannot select an axis to squeeze out which has size not equal to one, "
-                     f"got shape={arr.shape} and dimensions={dimensions}")
-  data = spenv.data(arr)
-  indices = spenv.indices(arr)
-  n_sparse = indices.shape[-1]
-  n_batch = indices.ndim - 2
-  batch_dims = tuple(d for d in dimensions if d < n_batch)
-  sparse_dims = np.array([i for i in range(n_sparse) if i + n_batch not in dimensions], dtype=int)
-  dense_dims = tuple(d - n_sparse + 1 for d in dimensions if d >= n_batch + n_sparse)
-  data_out = lax.squeeze(data, batch_dims + dense_dims)
-  indices_out = lax.squeeze(indices[..., sparse_dims], batch_dims)
-  out_shape = tuple(s for i, s in enumerate(arr.shape) if i not in dimensions)
-  return (spenv.sparse(out_shape, data_out, indices_out),)
-
-sparse_rules[lax.squeeze_p] = _squeeze_sparse
-
-def _reshape_sparse(spenv, *spvalues, new_sizes, dimensions):
-  operand, = spvalues_to_arrays(spenv, spvalues)
-  result = sparse.bcoo_reshape(operand, new_sizes=new_sizes, dimensions=dimensions)
-  return arrays_to_spvalues(spenv, (result,))
-
-sparse_rules[lax.reshape_p] = _reshape_sparse
+sparse_rules[lax.gather_p] = _gather_sparse_rule
 
 def _sparsify_jaxpr(spenv, jaxpr, *spvalues):
   # TODO(jakevdp): currently this approach discards all information about
@@ -759,20 +747,6 @@ def _todense_sparse_rule(spenv, spvalue, *, tree):
 
 sparse_rules[sparse.todense_p] = _todense_sparse_rule
 
-def _slice_sparse_rule(spenv, *operands, **params):
-  args = spvalues_to_arrays(spenv, operands)
-  out = sparse.bcoo_slice(*args, **params)
-  return arrays_to_spvalues(spenv, [out])
-
-sparse_rules[lax.slice_p] = _slice_sparse_rule
-
-def _dynamic_slice_sparse_rule(spenv, *operands, **params):
-  args = spvalues_to_arrays(spenv, operands)
-  out = sparse.bcoo_dynamic_slice(args[0], args[1:], **params)
-  return arrays_to_spvalues(spenv, [out])
-
-sparse_rules[lax.dynamic_slice_p] = _dynamic_slice_sparse_rule
-
 
 #------------------------------------------------------------------------------
 # BCOO methods derived from sparsify
@@ -786,42 +760,30 @@ def _reshape(self, *args, **kwargs):
   """Sum array along axis."""
   return sparsify(lambda x: x.reshape(*args, **kwargs))(self)
 
+def _astype(self, *args, **kwargs):
+  """Copy the array and cast to a specified dtype."""
+  return sparsify(lambda x: x.astype(*args, **kwargs))(self)
+
 def _sparse_rewriting_take(arr, idx, indices_are_sorted=False, unique_indices=False,
                            mode=None, fill_value=None):
-  # mirrors lax_numpy._rewriting_take.
-
-  # Handle some special cases, falling back if error messages might differ.
-  if (arr.ndim > 0 and isinstance(idx, (int, np.integer)) and
-      not isinstance(idx, (bool, np.bool_)) and isinstance(arr.shape[0], int)):
-    if 0 <= idx < arr.shape[0]:
-      return sparsify(lambda arr: lax.index_in_dim(arr, idx, keepdims=False))(arr)
-  if (arr.ndim > 0 and isinstance(arr.shape[0], int) and
-      isinstance(idx, slice) and
-      (type(idx.start) is int or idx.start is None) and
-      (type(idx.stop)  is int or idx.stop is  None) and
-      (type(idx.step)  is int or idx.step is  None)):
-    n = arr.shape[0]
-    start = idx.start if idx.start is not None else 0
-    stop  = idx.stop  if idx.stop  is not None else n
-    step  = idx.step  if idx.step  is not None else 1
-    if (0 <= start < n and 0 <= stop <= n and 0 < step and
-        (start, stop, step) != (0, n, 1)):
-      return sparsify(lambda arr: lax.slice_in_dim(arr, start, stop, step))(arr)
-
-  treedef, static_idx, dynamic_idx = lax_numpy._split_index_for_jit(idx, arr.shape)
-  result = sparsify(
-      lambda arr, idx: lax_numpy._gather(arr, treedef, static_idx, idx, indices_are_sorted,
-                                         unique_indices, mode, fill_value))(arr, dynamic_idx)
+  # Only sparsify the array argument; sparse indices not yet supported
+  result = sparsify(functools.partial(
+    lax_numpy._rewriting_take, idx=idx, indices_are_sorted=indices_are_sorted,
+    mode=mode, unique_indices=unique_indices, fill_value=fill_value))(arr)
   # Account for a corner case in the rewriting_take implementation.
   if not isinstance(result, BCOO) and np.size(result) == 0:
     result = BCOO.fromdense(result)
   return result
 
+def _sparse_iter(arr):
+  return iter(arr[i] for i in range(arr.shape[0]))
+
 _swap_args = lambda f: lambda a, b: f(b, a)
 
 _bcoo_methods = {
-  'reshape': _reshape,
-  'sum': _sum,
+  "astype": _astype,
+  "reshape": _reshape,
+  "sum": _sum,
   "__neg__": sparsify(jnp.negative),
   "__pos__": sparsify(jnp.positive),
   "__matmul__": sparsify(jnp.matmul),
@@ -833,6 +795,7 @@ _bcoo_methods = {
   "__sub__": sparsify(jnp.subtract),
   "__rsub__": sparsify(_swap_args(jnp.subtract)),
   "__getitem__": _sparse_rewriting_take,
+  "__iter__": _sparse_iter,
 }
 
 for method, impl in _bcoo_methods.items():

@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,6 +35,8 @@ del _cloud_tpu_init
 from jax import config as _config_module
 del _config_module
 
+from jax._src.basearray import Array as Array
+
 from jax._src.config import (
   config as config,
   enable_checks as enable_checks,
@@ -55,13 +57,14 @@ from jax._src.config import (
   transfer_guard_host_to_device as transfer_guard_host_to_device,
   transfer_guard_device_to_device as transfer_guard_device_to_device,
   transfer_guard_device_to_host as transfer_guard_device_to_host,
+  spmd_mode as spmd_mode,
 )
 from .core import eval_context as ensure_compile_time_eval
 from jax._src.environment_info import print_environment_info as print_environment_info
 from jax._src.api import (
   ad,  # TODO(phawkins): update users to avoid this.
   effects_barrier,
-  block_until_ready,
+  block_until_ready as block_until_ready,
   checkpoint as checkpoint,
   checkpoint_policies as checkpoint_policies,
   clear_backends as clear_backends,
@@ -95,6 +98,7 @@ from jax._src.api import (
   local_devices as local_devices,
   linearize as linearize,
   linear_transpose as linear_transpose,
+  live_arrays as live_arrays,
   make_jaxpr as make_jaxpr,
   named_call as named_call,
   named_scope as named_scope,
@@ -112,7 +116,12 @@ from jax._src.api import (
   xla,  # TODO(phawkins): update users to avoid this.
   xla_computation as xla_computation,
 )
-from jax.experimental.maps import soft_pmap as soft_pmap
+
+from jax._src.array import (
+    make_array_from_single_device_arrays as make_array_from_single_device_arrays,
+    make_array_from_callback as make_array_from_callback,
+)
+
 from jax.version import __version__ as __version__
 from jax.version import __version_info__ as __version_info__
 
@@ -142,6 +151,8 @@ from jax import numpy as numpy
 from jax import ops as ops
 from jax import profiler as profiler
 from jax import random as random
+from jax import scipy as scipy
+from jax import sharding as sharding
 from jax import stages as stages
 from jax import tree_util as tree_util
 from jax import util as util

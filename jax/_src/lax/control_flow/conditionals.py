@@ -1,4 +1,4 @@
-# Copyright 2022 Google LLC
+# Copyright 2022 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@ from jax._src import ad_util
 from jax._src import dtypes
 from jax._src import source_info_util
 from jax._src import util
+from jax._src import state
 from jax._src.lax import lax
 from jax._src.traceback_util import api_boundary
 from jax._src.util import (safe_map, extend_name_stack, split_list,
@@ -89,7 +90,7 @@ def switch(index, branches: Sequence[Callable], *operands,
   if operand is not _no_operand_sentinel:
     if operands:
       raise TypeError("if 'operand' keyword is passed then no positional "
-                      f"operands can be passed, got operand={operand} "
+                      f"operands can be passed, got {operand=} "
                       f"and positional operands {operands}")
     operands = (operand,)
   del operand
@@ -139,6 +140,10 @@ def switch(index, branches: Sequence[Callable], *operands,
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `switch`: {disallowed_effects}')
+  if joined_effects:
+    # Raise index in case of effects to allow data-dependence-based discharging
+    # of those effects (even if they don't have an explicit data dependence).
+    index = core.raise_as_much_as_possible(index)
 
   linear = (False,) * (len(consts) + len(ops))
   out = cond_p.bind(
@@ -179,7 +184,7 @@ def _cond(pred, true_fun: Callable, false_fun: Callable, *operands,
   if operand is not _no_operand_sentinel:
     if operands:
       raise TypeError("if 'operand' keyword is passed then no positional "
-                      f"operands can be passed, got operand={operand} "
+                      f"operands can be passed, got {operand=} "
                       f"and positional operands {operands}")
     operands = (operand,)
   del operand
@@ -222,6 +227,8 @@ def _cond(pred, true_fun: Callable, false_fun: Callable, *operands,
 
   jaxprs, consts, out_trees = _initial_style_jaxprs_with_common_consts(
       (true_fun, false_fun), ops_tree, ops_avals, 'cond')
+  if any(isinstance(op_aval, state.ShapedArrayRef) for op_aval in ops_avals):
+    raise ValueError("Cannot pass `Ref`s into `cond`.")
   true_jaxpr, false_jaxpr = jaxprs
   out_tree, false_out_tree = out_trees
 
@@ -235,6 +242,14 @@ def _cond(pred, true_fun: Callable, false_fun: Callable, *operands,
         f'Effects not supported in `cond`: {disallowed_effects}')
 
   index = lax.convert_element_type(pred, np.int32)
+  if joined_effects:
+    # Raise index in case of effects to allow data-dependence-based discharging
+    # of those effects (even if they don't have an explicit data dependence).
+    index = core.raise_as_much_as_possible(index)
+  false_jaxpr = false_jaxpr.replace(
+      jaxpr=false_jaxpr.jaxpr.replace(effects=joined_effects))
+  true_jaxpr = true_jaxpr.replace(
+      jaxpr=true_jaxpr.jaxpr.replace(effects=joined_effects))
 
   linear = [False] * len(consts) + linear_ops
   out = cond_p.bind(
@@ -280,14 +295,23 @@ def _cond_with_per_branch_args(pred,
                lambda op: false_fun(op[1]),
                (true_operand, false_operand))
 
-def _cond_abstract_eval(*args, branches, **kwargs):
+def _cond_abstract_eval(*avals, branches, **_):
   joined_effects = core.join_effects(*(b.effects for b in branches))
   disallowed_effects = joined_effects - allowed_effects
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `cond`: {disallowed_effects}')
   joined_effects = core.join_effects(*(b.effects for b in branches))
-  return map(raise_to_shaped, branches[0].out_avals), joined_effects
+  state_effects = {eff for eff in joined_effects if isinstance(eff,
+    state.RefEffect)}
+  jaxpr_aval_effects = state.get_ref_state_effects(
+      [v.aval for v in branches[0].jaxpr.invars], joined_effects)
+  aval_effects = [set(eff.replace(ref_aval=aval) for eff in effs) for aval, effs
+      in zip(avals[1:], jaxpr_aval_effects)
+      if isinstance(aval, state.ShapedArrayRef)]
+  nonlocal_state_effects = core.join_effects(*aval_effects)
+  all_effects = (joined_effects - state_effects) | nonlocal_state_effects
+  return map(raise_to_shaped, branches[0].out_avals), all_effects
 
 def _bcast_select(pred, on_true, on_false):
   if np.ndim(pred) != np.ndim(on_true):
@@ -304,6 +328,10 @@ def _bcast_select_n(pred, *cases):
 def _cond_batching_rule(axis_size, axis_name, main_type, args, dims, branches, linear):
   index, *ops = args
   index_dim, *op_dims = dims
+  if any(isinstance(eff, state.RefEffect) for branch in branches for eff in
+      branch.jaxpr.effects):
+    raise NotImplementedError(
+        "State effect not supported in cond vmap.")
 
   if index_dim is not batching.not_mapped:
     # Convert to a lax.select. While we could get away with not broadcasting
@@ -379,6 +407,10 @@ def _cond_jvp(primals, tangents, branches, linear):
 def _cond_partial_eval(trace, *tracers, branches, linear):
   in_unknowns = [t.pval[0] is not None for t in tracers]
   index_uk, *ops_uk = in_unknowns
+  if any(isinstance(eff, state.RefEffect) for branch in branches for eff in
+      branch.jaxpr.effects):
+    raise NotImplementedError(
+        "State effect not supported in cond partial-eval.")
 
   if index_uk:
     # When the branch index is unknown, we stage out the whole cond.
@@ -649,6 +681,9 @@ def _cond_transpose(reduce_axes, cts, *args, branches, linear):
   index, *ops = args
   in_avals = map(raise_to_shaped, branches[0].in_avals)
   num_res = len(ops) - sum(linear)
+  if any(isinstance(eff, state.RefEffect) for branch in branches for eff in
+      branch.jaxpr.effects):
+    raise NotImplementedError("State effect not supported in cond transpose.")
 
   branches_trans = tuple(
       _transpose_cond_jaxpr(jaxpr, num_res, reduce_axes) for jaxpr in branches)
@@ -732,10 +767,6 @@ def _cond_typecheck(*in_atoms, branches, linear):
     raise core.JaxprTypeError(
       f'cond branches take input types {jaxpr0_in_avals_str}, '
       f'called with operands of type {_avals_short(op_avals)}')
-  if any(b.effects != branches[0].effects for b in branches[1:]):
-    raise core.JaxprTypeError(
-      f'cond branches must have matching effect types: '
-      f'{[b.effects for b in branches]}')
   joined_effects = core.join_effects(*(b.effects for b in branches))
   return jaxpr0.out_avals, joined_effects
 
@@ -800,3 +831,18 @@ def _cond_lowering(ctx, index, *args, branches, linear):
   return outputs
 
 mlir.register_lowering(cond_p, _cond_lowering)
+
+@state.register_discharge_rule(cond_p)
+def _cond_state_discharge_rule(in_avals, out_avals, *args, branches, linear):
+  discharged_branches = tuple(
+      core.ClosedJaxpr(state.discharge_state(branch.jaxpr, ())[0], ())
+      for branch in branches)
+  out_vals = cond_p.bind(*args, branches=discharged_branches, linear=linear)
+  out_ref_vals, out_vals = util.split_list(
+      out_vals, [len(out_vals) - len(out_avals)])
+  ref_val_iter = iter(out_ref_vals)
+  new_invals = []
+  for aval in in_avals:
+    new_invals.append(
+        next(ref_val_iter) if isinstance(aval, state.ShapedArrayRef) else None)
+  return new_invals, out_vals

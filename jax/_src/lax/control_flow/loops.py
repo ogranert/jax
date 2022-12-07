@@ -1,4 +1,4 @@
-# Copyright 2022 Google LLC
+# Copyright 2022 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,7 +35,6 @@ from jax.tree_util import (tree_flatten, tree_unflatten, treedef_is_leaf,
 from jax._src import ad_checkpoint
 from jax._src import ad_util
 from jax._src import api
-from jax._src import api_util
 from jax._src import dtypes
 from jax._src import source_info_util
 from jax._src import util
@@ -44,9 +43,9 @@ from jax._src.lax import slicing
 from jax._src.lax import windowed_reductions
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import mhlo
+from jax._src.numpy.ufuncs import logaddexp
 from jax._src.traceback_util import api_boundary
 from jax._src.util import (
-    cache,
     extend_name_stack,
     partition_list,
     safe_map,
@@ -129,7 +128,7 @@ def scan(f: Callable[[Carry, X], Tuple[Carry, Y]],
   each with an additional leading axis.
 
   When ``a`` is an array type or None, and ``b`` is an array type, the semantics
-  of ``scan`` are given roughly by this Python implementation::
+  of :func:`~scan` are given roughly by this Python implementation::
 
     def scan(f, init, xs, length=None):
       if xs is None:
@@ -145,10 +144,11 @@ def scan(f: Callable[[Carry, X], Tuple[Carry, Y]],
   types, and so multiple arrays can be scanned over at once and produce multiple
   output arrays. (None is actually an empty pytree.)
 
-  Also unlike that Python version, ``scan`` is a JAX primitive and is lowered to
-  a single XLA While HLO. That makes it useful for reducing compilation times
-  for jit-compiled functions, since native Python loop constructs in an ``@jit``
-  function are unrolled, leading to large XLA computations.
+  Also unlike that Python version, :func:`~scan` is a JAX primitive and is
+  lowered to a single XLA While HLO. That makes it useful for reducing
+  compilation times for JIT-compiled functions, since native Python
+  loop constructs in an :func:`~jax.jit` function are unrolled, leading to large
+  XLA computations.
 
   Finally, the loop-carried value ``carry`` must hold a fixed shape and dtype
   across all iterations (and not just be consistent up to NumPy rank/shape
@@ -1439,7 +1439,11 @@ def _while_lowering(ctx, *args, cond_jaxpr, body_jaxpr, cond_nconsts,
                           core.ordered_effects]
   if cond_ordered_effects:
     def cond(args):
-      return core.eval_jaxpr(cond_jaxpr.jaxpr, cond_jaxpr.consts, *args)[0]
+      # Pred can be batched
+      pred = core.eval_jaxpr(cond_jaxpr.jaxpr, cond_jaxpr.consts, *args)[0]
+      if batched:
+        pred = lax._reduce_or(pred, tuple(range(len(pred_aval.shape))))
+      return pred
     def body(args):
       return tuple(core.eval_jaxpr(body_jaxpr.jaxpr, body_jaxpr.consts, *args))
     def new_cond(pred_args):
@@ -1622,11 +1626,14 @@ def fori_loop(lower, upper, body_fun, init_val):
         val = body_fun(i, val)
       return val
 
+  As the Python version suggests, setting ``upper <= lower`` will produce no
+  iterations. Negative or custom increments are not supported.
+
   Unlike that Python version, ``fori_loop`` is implemented in terms of either a
   call to :func:`jax.lax.while_loop` or a call to :func:`jax.lax.scan`. If the
   trip count is static (meaning known at tracing time, perhaps because ``lower``
   and ``upper`` are Python integer literals) then the ``fori_loop`` is
-  implemented in terms of ``scan`` and reverse-mode autodiff is supported;
+  implemented in terms of :func:`~scan` and reverse-mode autodiff is supported;
   otherwise, a ``while_loop`` is used and reverse-mode autodiff is not
   supported.  See those functions' docstrings for more information.
 
@@ -1696,19 +1703,20 @@ def map(f, xs):
   """Map a function over leading array axes.
 
   Like Python's builtin map, except inputs and outputs are in the form of
-  stacked arrays. Consider using the ``jax.vmap`` transform instead, unless you
+  stacked arrays. Consider using the :func:`~jax.vmap` transform instead, unless you
   need to apply a function element by element for reduced memory usage or
   heterogeneous computation with other control flow primitives.
 
-  When ``xs`` is an array type, the semantics of ``map`` are given by this
+  When ``xs`` is an array type, the semantics of :func:`~map` are given by this
   Python implementation::
 
     def map(f, xs):
       return np.stack([f(x) for x in xs])
 
-  Like ``scan``, ``map`` is implemented in terms of JAX primitives so many of
-  the same advantages over a Python loop apply: ``xs`` may be an arbitrary
-  nested pytree type, and the mapped computation is compiled only once.
+  Like :func:`~scan`, :func:`~map` is implemented in terms of JAX primitives so
+  many of the same advantages over a Python loop apply: ``xs`` may be an
+  arbitrary nested pytree type, and the mapped computation is compiled only
+  once.
 
   Args:
     f: a Python function to apply element-wise over the first axis or axes of
@@ -1774,7 +1782,7 @@ def associative_scan(fn: Callable, elems, reverse: bool = False, axis: int = 0):
   Example 1: partial sums of an array of numbers:
 
   >>> lax.associative_scan(jnp.add, jnp.arange(0, 4))
-  DeviceArray([0, 1, 3, 6], dtype=int32)
+  Array([0, 1, 3, 6], dtype=int32)
 
   Example 2: partial products of an array of matrices
 
@@ -1786,7 +1794,7 @@ def associative_scan(fn: Callable, elems, reverse: bool = False, axis: int = 0):
   Example 3: reversed partial sums of an array of numbers
 
   >>> lax.associative_scan(jnp.add, jnp.arange(0, 4), reverse=True)
-  DeviceArray([6, 6, 5, 3], dtype=int32)
+  Array([6, 6, 5, 3], dtype=int32)
 
   .. [BLE1990] Blelloch, Guy E. 1990. "Prefix Sums and Their Applications.",
     Technical Report CMU-CS-90-190, School of Computer Science, Carnegie Mellon
@@ -1901,6 +1909,10 @@ def cummin(operand: Array, axis: int = 0, reverse: bool = False) -> Array:
   """Computes a cumulative minimum along `axis`."""
   return cummin_p.bind(operand, axis=int(axis), reverse=bool(reverse))
 
+def cumlogsumexp(operand: Array, axis: int = 0, reverse: bool = False) -> Array:
+  """Computes a cumulative logsumexp along `axis`."""
+  return cumlogsumexp_p.bind(operand, axis=int(axis), reverse=bool(reverse))
+
 def _cumred_shape_rule(x, *, axis: int, reverse: bool):
   if axis < 0 or axis >= x.ndim:
     raise ValueError(
@@ -1978,6 +1990,9 @@ def _cumulative_reduction_primitive(name, reduce_fn, reduce_window_fn):
 
 cumsum_p = _cumulative_reduction_primitive("cumsum", lax.add, windowed_reductions._reduce_window_sum)
 ad.deflinear2(cumsum_p, _cumsum_transpose_rule)
+
+cumlogsumexp_p = _cumulative_reduction_primitive(
+    "cumlogsumexp", logaddexp, windowed_reductions._reduce_window_logaddexp)
 cumprod_p = _cumulative_reduction_primitive("cumprod", lax.mul, windowed_reductions._reduce_window_prod)
 cummax_p = _cumulative_reduction_primitive("cummax", lax.max, windowed_reductions._reduce_window_max)
 cummin_p = _cumulative_reduction_primitive("cummin", lax.min, windowed_reductions._reduce_window_min)
@@ -1992,6 +2007,7 @@ def _cumulative_jvp_rule(primals, tangents, *, axis: int, reverse: bool,
                          reverse=reverse),
                  primals, tangents)
 
+ad.primitive_jvps[cumlogsumexp_p] = partial(_cumulative_jvp_rule, combine_fn=logaddexp)
 ad.primitive_jvps[cumprod_p] = partial(_cumulative_jvp_rule, combine_fn=lax.mul)
 ad.primitive_jvps[cummin_p] = partial(_cumulative_jvp_rule, combine_fn=lax.min)
 ad.primitive_jvps[cummax_p] = partial(_cumulative_jvp_rule, combine_fn=lax.max)

@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -45,21 +45,22 @@ setup(
     author='JAX team',
     author_email='jax-dev@google.com',
     packages=['jaxlib', 'jaxlib.xla_extension'],
-    python_requires='>=3.7',
-    install_requires=['scipy>=1.5', 'numpy>=1.20', 'absl-py'],
+    python_requires='>=3.8',
+    install_requires=['scipy>=1.5', 'numpy>=1.20'],
     url='https://github.com/google/jax',
     license='Apache-2.0',
     classifiers=[
-        "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
     ],
     package_data={
         'jaxlib': [
             '*.so',
             '*.pyd*',
             'py.typed',
+            'cpu/*',
             'cuda/*',
             'cuda/nvvm/libdevice/libdevice*',
             'mlir/*.py',

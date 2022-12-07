@@ -1,4 +1,4 @@
-# Copyright 2022 Google LLC
+# Copyright 2022 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,12 +28,12 @@ Finally, this module defines a couple more classes to commonly adapt our
 various internal XLA-backed lowerings and executables into the lowering and
 executable protocols described above.
 """
+from __future__ import annotations
 
 import warnings
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-from typing_extensions import Protocol
+from typing import Any, Dict, List, NamedTuple, Optional, Protocol, Sequence, Tuple
 
 import jax
 from jax import core
@@ -43,7 +43,9 @@ from jax.lib import xla_client as xc
 from jax._src import source_info_util
 from jax._src import traceback_util
 from jax._src import util
-from jax._src.lib import mlir
+from jax._src.lib.mlir import ir
+from jax.interpreters import mlir
+from jax.interpreters import xla
 
 
 source_info_util.register_exclusion(__file__)
@@ -63,6 +65,22 @@ class Executable(Protocol):
   def call(self, *args_flat) -> Sequence[Any]:
     """Execute on the flat list of arguments, returning flat outputs."""
     # TODO(frostig): improve annotation (sequences of arrays/buffers)
+    raise NotImplementedError
+
+  def input_shardings(self) -> Sequence[jax.sharding.XLACompatibleSharding]:
+    """Flat sequence of input shardings.
+
+    May raise ``NotImplementedError`` if unavailable, e.g. based on backend,
+    compiler, or runtime.
+    """
+    raise NotImplementedError
+
+  def output_shardings(self) -> Sequence[jax.sharding.XLACompatibleSharding]:
+    """Flat sequence of output shardings.
+
+    May raise ``NotImplementedError`` if unavailable, e.g. based on backend,
+    compiler, or runtime.
+    """
     raise NotImplementedError
 
   def as_text(self) -> str:
@@ -120,6 +138,10 @@ class Executable(Protocol):
     """
     raise NotImplementedError
 
+  def create_cpp_call(self, no_kwargs, in_tree, out_tree) -> Any:
+    """Optionally constructs a fast c++ dispatcher."""
+    return None
+
 
 class Lowering(Protocol):
   """Protocol for lowerings, which a user-facing ``Lowered`` encapsulates."""
@@ -156,11 +178,19 @@ class Lowering(Protocol):
 
 class XlaExecutable(Executable):
 
-  def xla_extension_executable(self) -> xla_extension.Executable:
+  def xla_extension_executable(self) -> xla.XlaLoadedExecutable:
     raise NotImplementedError("must override")
 
   def call(self, *args_flat) -> Sequence[Any]:
     raise NotImplementedError("must override")
+
+  def input_shardings(self) -> Sequence[jax.sharding.XLACompatibleSharding]:
+    raise NotImplementedError(
+        "compiled executable carries no input sharding information")
+
+  def output_shardings(self) -> Sequence[jax.sharding.XLACompatibleSharding]:
+    raise NotImplementedError(
+        "compiled executable carries no output sharding information")
 
   def as_text(self) -> str:
     xla_ext_exe = self.xla_extension_executable()
@@ -181,17 +211,30 @@ class XlaExecutable(Executable):
     xla_ext_exe = self.xla_extension_executable()
     err_msg = ("cost analysis unsupported on current XLA backend: "
                f"{type(xla_ext_exe)}")
-    if not hasattr(xla_ext_exe, "client"):
+    # TODO(b/259255524): Unify/merge the two cost_analysis calls below.
+    if hasattr(xla_ext_exe, "client"):
+      try:
+        return [
+            xla_extension.hlo_module_cost_analysis(xla_ext_exe.client, m)
+            for m in xla_ext_exe.hlo_modules()
+        ]
+      except xla_extension.XlaRuntimeError as e:
+        msg, *_ = e.args
+        if type(msg) is str and msg.startswith("UNIMPLEMENTED"):
+          raise NotImplementedError(err_msg) from e
+        else:
+          raise
+    elif hasattr(xla_ext_exe, "cost_analysis"):
+      try:
+        return xla_ext_exe.cost_analysis()
+      except xla_extension.XlaRuntimeError as e:
+        msg, *_ = e.args
+        if type(msg) is str and msg.startswith("UNIMPLEMENTED"):
+          raise NotImplementedError(err_msg) from e
+        else:
+          raise
+    else:
       raise NotImplementedError(err_msg)
-    try:
-      return [xla_extension.hlo_module_cost_analysis(xla_ext_exe.client, m)
-              for m in xla_ext_exe.hlo_modules()]
-    except xla_extension.XlaRuntimeError as e:
-      msg, *_ = e.args
-      if type(msg) is str and msg.startswith("UNIMPLEMENTED"):
-        raise NotImplementedError(err_msg) from e
-      else:
-        raise
 
   def memory_analysis(self) -> Any:
     xla_ext_exe = self.xla_extension_executable()
@@ -219,9 +262,18 @@ class XlaLowering(Lowering):
     """Return an HLO representation of this computation."""
     raise NotImplementedError("must override")
 
-  def mhlo(self) -> mlir.ir.Module:
+  def mhlo(self) -> ir.Module:
     """Return an MHLO representation of this computation."""
     raise NotImplementedError("must override")
+
+  def stablehlo(self) -> ir.Module:
+    """Return a StableHLO representation of this computation."""
+    if xc.mlir_api_version < 37:
+      raise NotImplementedError("unsupported in older versions of jaxlib")
+    module_str = xla_extension.mlir.mhlo_to_stablehlo(
+        mlir.module_to_string(self.mhlo()))
+    with mlir.make_ir_context():
+      return ir.Module.parse(module_str)
 
   def compile(self) -> Executable:
     raise NotImplementedError("must override")
@@ -229,6 +281,8 @@ class XlaLowering(Lowering):
   def as_text(self, dialect: Optional[str] = None) -> str:
     if dialect is None or dialect == "mhlo":
       return str(self.mhlo())
+    elif dialect == "stablehlo":
+      return str(self.stablehlo())
     elif dialect == "hlo":
       return self.hlo().as_hlo_text()
     else:
@@ -237,6 +291,8 @@ class XlaLowering(Lowering):
   def compiler_ir(self, dialect: Optional[str] = None) -> Any:
     if dialect is None or dialect == "mhlo":
       return self.mhlo()
+    elif dialect == "stablehlo":
+      return self.stablehlo()
     elif dialect == "hlo":
       return self.hlo()
     else:
@@ -253,7 +309,7 @@ class ArgInfo:
 
 
 class Stage:
-  args_info: Any                # PyTree of ArgInfo
+  args_info: Any  # PyTree of ArgInfo
 
   @property
   def in_tree(self) -> tree_util.PyTreeDef:
@@ -280,6 +336,12 @@ def make_args_info(in_tree, in_avals, donate_argnums):
       ArgInfo(aval, i in donate_argnums)
       for i, aval in enumerate(flat_avals)])
 
+class CompiledCallParams(NamedTuple):
+  executable: Executable
+  no_kwargs: bool
+  in_tree: tree_util.PyTreeDef
+  out_tree: tree_util.PyTreeDef
+
 
 class Compiled(Stage):
   """Compiled representation of a function specialized to types/values.
@@ -301,6 +363,11 @@ class Compiled(Stage):
     self._no_kwargs = no_kwargs
     self.args_info = args_info
     self.out_tree = out_tree
+    self._params = CompiledCallParams(self._executable, self._no_kwargs,
+                                      self.in_tree, self.out_tree)
+    self._cpp_call = self._executable.create_cpp_call(self._no_kwargs,
+                                                      self.in_tree,
+                                                      self.out_tree)
 
   def compiler_ir(self):
     """Post-compilation IR.
@@ -379,22 +446,39 @@ class Compiled(Stage):
     """
     return self._executable.runtime_executable()
 
-  def __call__(self, *args, **kwargs):
+  @property
+  def input_shardings(self):  # PyTree[sharding.XLACompatibleSharding]
+    shardings_flat = self._executable.input_shardings()
+    return tree_util.tree_unflatten(self.in_tree, shardings_flat)  # pytype: disable=attribute-error
+
+  @property
+  def output_shardings(self):  # PyTree[sharding.XLACompatibleSharding]
+    shardings_flat = self._executable.output_shardings()
+    return tree_util.tree_unflatten(self.out_tree, shardings_flat)  # pytype: disable=attribute-error
+
+  @staticmethod
+  def call(*args, **kwargs):
+    # This is because `__call__` passes in `self._params` as the first argument.
+    # Instead of making the call signature `call(params, *args, **kwargs)`
+    # extract it from args because `params` can be passed as a kwarg by users
+    # which might confict here.
+    params = args[0]
+    args = args[1:]
     if jax.config.jax_dynamic_shapes:
       raise NotImplementedError
-    if self._no_kwargs and kwargs:
+    if params.no_kwargs and kwargs:
       kws = ', '.join(kwargs.keys())
       raise NotImplementedError(
           "function was compiled by a transformation that does not support "
           f"keyword arguments, but called with keyword arguments: {kws}")
     args_flat, in_tree = tree_util.tree_flatten((args, kwargs))
-    if in_tree != self.in_tree:
+    if in_tree != params.in_tree:
       # TODO(frostig): provide more info about the source function
       # and transformation
       raise TypeError(
-          f"function compiled for {self.in_tree}, called with {in_tree}")
+          f"function compiled for {params.in_tree}, called with {in_tree}")
     try:
-      out_flat = self._executable.call(*args_flat)
+      out_flat = params.executable.call(*args_flat)
     except TypeError as e:
       # We can't transform ahead-of-time compiled calls, since we've
       # lowered and compiled for a fixed function signature, and JAX
@@ -412,7 +496,15 @@ class Compiled(Stage):
               f"Tracer type {type(arg)}.") from e
       else:
         raise
-    return tree_util.tree_unflatten(self.out_tree, out_flat)
+    outs = tree_util.tree_unflatten(params.out_tree, out_flat)
+    return outs, out_flat
+
+  def __call__(self, *args, **kwargs):
+    if self._cpp_call is not None:
+      return self._cpp_call(*args, **kwargs)
+
+    outs, _ = Compiled.call(self._params, *args, **kwargs)
+    return outs
 
 
 class Lowered(Stage):
@@ -422,7 +514,7 @@ class Lowered(Stage):
   carries a lowering together with the remaining information needed to
   later compile and execute it. It also provides a common API for
   querying properties of lowered computations across JAX's various
-  lowering paths (``jit``, ``pmap``, etc.).
+  lowering paths (:func:`~jax.jit`, :func:`~jax.pmap`, etc.).
   """
   __slots__ = ["args_info", "out_tree", "_lowering", "_no_kwargs"]
 
@@ -431,11 +523,12 @@ class Lowered(Stage):
   _lowering: XlaLowering
   _no_kwargs: bool
 
-  def __init__(self,
-               lowering: XlaLowering,
-               args_info,       # PyTreee of ArgInfo
-               out_tree: tree_util.PyTreeDef,
-               no_kwargs: bool = False):
+  def __init__(
+      self,
+      lowering: XlaLowering,
+      args_info,  # PyTreee of ArgInfo
+      out_tree: tree_util.PyTreeDef,
+      no_kwargs: bool = False):
     self._lowering = lowering
     self._no_kwargs = no_kwargs
     self.args_info = args_info
@@ -458,13 +551,28 @@ class Lowered(Stage):
         ``Compiled`` returned from this object will not support keyword
         arguments (an error will be raised if some are provided).
     """
-    return cls(lowering, make_args_info(in_tree, in_avals, donate_argnums),
-               out_tree, no_kwargs=no_kwargs)
+    return cls(
+        lowering,
+        make_args_info(in_tree, in_avals, donate_argnums),
+        out_tree,
+        no_kwargs=no_kwargs)
 
   def compile(self) -> Compiled:
     """Compile, returning a corresponding ``Compiled`` instance."""
-    return Compiled(self._lowering.compile(), self.args_info,
-                    self.out_tree, no_kwargs=self._no_kwargs)
+    from jax.interpreters import pxla
+
+    if (jax.config.jax_array and
+        isinstance(self._lowering, pxla.MeshComputation) and
+        all(pxla._is_unspecified(o) for o in self._lowering.compile_args['out_shardings'])):
+      kw = dict(_allow_propagation_to_outputs=True)
+    else:
+      kw = {}
+
+    return Compiled(
+        self._lowering.compile(**kw),
+        self.args_info,
+        self.out_tree,
+        no_kwargs=self._no_kwargs)
 
   def as_text(self, dialect: Optional[str] = None) -> str:
     """A human-readable text representation of this lowering.

@@ -5,6 +5,11 @@ JAX is Autograd_ and XLA_, brought together for high-performance numerical compu
 It provides composable transformations of Python+NumPy programs: differentiate, vectorize,
 parallelize, Just-In-Time compile to GPU/TPU, and more.
 
+.. note::
+   JAX 0.4.0 introduces new parallelism APIs, including breaking changes to :func:`jax.experimental.pjit` and a new unified ``jax.Array`` type.
+   Please see `Parallelism with JAX <https://jax.readthedocs.io/en/latest/notebooks/Parallelism_with_JAX.html>`_ tutorial and the :ref:`jax-array-migration`
+   guide for more information.
+
 .. toctree::
    :maxdepth: 1
    :caption: Getting Started
@@ -15,7 +20,7 @@ parallelize, Just-In-Time compile to GPU/TPU, and more.
    notebooks/Common_Gotchas_in_JAX
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 1
 
    jax-101/index
 
@@ -34,6 +39,7 @@ parallelize, Just-In-Time compile to GPU/TPU, and more.
    jaxpr
    notebooks/convolutions
    pytrees
+   jax_array_migration
    type_promotion
    errors
    transfer_guard
@@ -45,6 +51,8 @@ parallelize, Just-In-Time compile to GPU/TPU, and more.
    :caption: Advanced JAX Tutorials
 
    notebooks/autodiff_cookbook
+   multi_process
+   notebooks/Parallelism_with_JAX
    notebooks/vmapped_log_probs
    notebooks/neural_network_with_tfds_data
    notebooks/Custom_derivative_rules_for_Python_code
@@ -52,7 +60,23 @@ parallelize, Just-In-Time compile to GPU/TPU, and more.
    notebooks/Writing_custom_interpreters_in_Jax
    notebooks/Neural_Network_and_Data_Loading
    notebooks/xmap_tutorial
-   multi_process
+
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Developer documentation
+
+   contributing
+   developer
+   jax_internal_api
+   autodidax
+   jep/index
+
+.. toctree::
+   :maxdepth: 1
+   :caption: API documentation
+
+   jax
 
 .. toctree::
    :maxdepth: 1
@@ -65,22 +89,6 @@ parallelize, Just-In-Time compile to GPU/TPU, and more.
    profiling
    device_memory_profiling
    rank_promotion_warning
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Developer documentation
-
-   contributing
-   developer
-   jax_internal_api
-   autodidax
-   jep/index
-
-.. toctree::
-   :maxdepth: 3
-   :caption: API documentation
-
-   jax
 
 
 Indices and tables

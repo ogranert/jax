@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ from functools import partial
 import re
 import os
 import textwrap
-from typing import Callable, Dict, List, Generator, Sequence, Tuple, Union
+from typing import Callable, List, Generator, Sequence, Tuple, Union
 import unittest
 import warnings
 import zlib
@@ -37,15 +37,15 @@ from jax import core
 from jax._src import dtypes as _dtypes
 from jax import lax
 from jax._src.config import flags, bool_env, config
+from jax._src.numpy.lax_numpy import _promote_dtypes, _promote_dtypes_inexact
 from jax._src.util import prod, unzip2
-from jax.tree_util import tree_map, tree_all
+from jax.tree_util import tree_map, tree_all, tree_flatten, tree_unflatten
 from jax._src.lib import xla_bridge
 from jax._src import dispatch
 from jax._src.public_test_util import (  # noqa: F401
     _assert_numpy_allclose, _check_dtypes_match, _default_tolerance, _dtype, check_close, check_grads,
     check_jvp, check_vjp, default_gradient_tolerance, default_tolerance, device_under_test, tolerance)
 from jax.interpreters import mlir
-from jax.experimental.maps import Mesh
 
 # This submodule includes private test utilities that are not exported to
 # jax.test_util. Functionality appearing here is for internal use only, and
@@ -59,7 +59,7 @@ flags.DEFINE_string(
 )
 
 flags.DEFINE_integer(
-  'num_generated_cases',
+  'jax_num_generated_cases',
   int(os.getenv('JAX_NUM_GENERATED_CASES', '10')),
   help='Number of generated cases to test')
 
@@ -254,6 +254,9 @@ def is_device_rocm():
 def is_device_cuda():
   return xla_bridge.get_backend().platform_version.startswith('cuda')
 
+def is_cloud_tpu():
+  return 'libtpu' in xla_bridge.get_backend().platform_version
+
 def is_device_tpu_v4():
   return jax.devices()[0].device_kind == "TPU v4"
 
@@ -299,6 +302,20 @@ def set_host_platform_device_count(nr_devices: int):
     xla_bridge.get_backend.cache_clear()
   return undo
 
+
+def skip_on_xla_cpu_mlir(test_method):
+  """A decorator to skip tests when MLIR lowering is enabled."""
+  @functools.wraps(test_method)
+  def test_method_wrapper(self, *args, **kwargs):
+    xla_flags = os.getenv('XLA_FLAGS') or ''
+    if '--xla_cpu_use_xla_runtime' in xla_flags or '--xla_cpu_enable_mlir_lowering' in xla_flags:
+      test_name = getattr(test_method, '__name__', '[unknown test]')
+      raise unittest.SkipTest(
+          f'{test_name} not supported on XLA:CPU MLIR')
+    return test_method(self, *args, **kwargs)
+  return test_method_wrapper
+
+
 def skip_on_flag(flag_name, skip_value):
   """A decorator for test methods to skip the test when flags are set."""
   def skip(test_method):        # pylint: disable=missing-docstring
@@ -335,6 +352,7 @@ PYTHON_SCALAR_SHAPE = _PythonScalar()
 def is_valid_shape(shape, dtype):
   if shape == PYTHON_SCALAR_SHAPE:
     return dtype == np.dtype(type(np.array(0, dtype=dtype).item()))
+  return True
 
 
 def _dims_of_shape(shape):
@@ -598,13 +616,15 @@ def rand_some_zero(rng):
 def rand_int(rng, low=0, high=None):
   def fn(shape, dtype):
     nonlocal high
+    gen_dtype = dtype if np.issubdtype(dtype, np.integer) else np.int64
     if low == 0 and high is None:
       if np.issubdtype(dtype, np.integer):
         high = np.iinfo(dtype).max
       else:
         raise ValueError("rand_int requires an explicit `high` value for "
                          "non-integer types.")
-    return rng.randint(low, high=high, size=shape, dtype=dtype)
+    return rng.randint(low, high=high, size=shape,
+                       dtype=gen_dtype).astype(dtype)
   return fn
 
 def rand_unique_int(rng, high=None):
@@ -615,7 +635,9 @@ def rand_unique_int(rng, high=None):
 
 def rand_bool(rng):
   def generator(shape, dtype):
-    return _cast_to_shape(rng.rand(*_dims_of_shape(shape)) < 0.5, shape, dtype)
+    return _cast_to_shape(
+      np.asarray(rng.rand(*_dims_of_shape(shape)) < 0.5, dtype=dtype),
+      shape, dtype)
   return generator
 
 def check_raises(thunk, err_type, msg):
@@ -652,23 +674,9 @@ def assert_dot_precision(expected_precision, fun, *args):
       assert precision == expected_precision, msg
 
 
-_CACHED_INDICES: Dict[int, Sequence[int]] = {}
-
-def cases_from_list(xs):
-  xs = list(xs)
-  n = len(xs)
-  k = min(n, FLAGS.num_generated_cases)
-  # Random sampling for every parameterized test is expensive. Do it once and
-  # cache the result.
-  indices = _CACHED_INDICES.get(n)
-  if indices is None:
-    rng = npr.RandomState(42)
-    _CACHED_INDICES[n] = indices = rng.permutation(n)
-  return [xs[i] for i in indices[:k]]
-
 def cases_from_gens(*gens):
   sizes = [1, 3, 10]
-  cases_per_size = int(FLAGS.num_generated_cases / len(sizes)) + 1
+  cases_per_size = int(FLAGS.jax_num_generated_cases / len(sizes)) + 1
   for size in sizes:
     for i in range(cases_per_size):
       yield (f'_{size}_{i}',) + tuple(gen(size) for gen in gens)
@@ -681,7 +689,7 @@ def named_cases_from_sampler(gen):
     if not isinstance(x, (list, tuple)):
       x = list(x)
     return [x[rng.randint(len(x))]]
-  while (len(seen) < FLAGS.num_generated_cases and
+  while (len(seen) < FLAGS.jax_num_generated_cases and
          retries < FLAGS.max_cases_sampling_retries):
     retries += 1
     cases = list(gen(choose_one))
@@ -695,6 +703,47 @@ def named_cases_from_sampler(gen):
     retries = 0
     seen.add(case["testcase_name"])
     yield case
+
+
+# Random sampling for every parameterized test is expensive. Do it once and
+# cache the result.
+@functools.lru_cache(maxsize=None)
+def _choice(n, m):
+  rng = np.random.RandomState(42)
+  return rng.choice(n, size=m, replace=False)
+
+def sample_product_testcases(*args, **kw):
+  """Non-decorator form of sample_product."""
+  args = [list(arg) for arg in args]
+  kw = [(k, list(v)) for k, v in kw.items()]
+  n = prod(len(a) for a in args) * prod(len(v) for _, v in kw)
+  testcases = []
+  for i in _choice(n, min(n, FLAGS.jax_num_generated_cases)):
+    testcase = {}
+    for a in args:
+      testcase.update(a[i % len(a)])
+      i //= len(a)
+    for k, v in kw:
+      testcase[k] = v[i % len(v)]
+      i //= len(v)
+    testcases.append(testcase)
+  return testcases
+
+def sample_product(*args, **kw):
+  """Decorator that samples from a cartesian product of test cases.
+
+  Similar to absltest.parameterized.product(), except that it samples from the
+  cartesian product rather than returning the whole thing.
+
+  Arguments:
+    *args: each positional argument is a list of dictionaries. The entries
+      in a dictionary correspond to name=value argument pairs; one dictionary
+      will be chosen for each test case. This allows multiple parameters to be
+      correlated.
+    **kw: each keyword argument is a list of values. One value will be chosen
+      for each test case.
+  """
+  return parameterized.parameters(*sample_product_testcases(*args, **kw))
 
 
 class JaxTestLoader(absltest.TestLoader):
@@ -718,6 +767,21 @@ def with_config(**kwds):
     cls._default_config = {**JaxTestCase._default_config, **kwds}
     return cls
   return decorator
+
+
+def promote_like_jnp(fun, inexact=False):
+  """Decorator that promotes the arguments of `fun` to `jnp.result_type(*args)`.
+
+  jnp and np have different type promotion semantics; this decorator allows
+  tests make an np reference implementation act more like an jnp
+  implementation.
+  """
+  _promote = _promote_dtypes_inexact if inexact else _promote_dtypes
+  def wrapper(*args, **kw):
+    flat_args, tree = tree_flatten(args)
+    args = tree_unflatten(tree, _promote(*flat_args))
+    return fun(*args, **kw)
+  return wrapper
 
 
 class JaxTestCase(parameterized.TestCase):
@@ -824,6 +888,12 @@ class JaxTestCase(parameterized.TestCase):
     self.assertMultiLineEqual(expected_clean, what_clean,
                               msg=f"Found\n{what}\nExpecting\n{expected}")
 
+  @contextmanager
+  def assertNoWarnings(self):
+    with warnings.catch_warnings(record=True) as caught_warnings:
+      yield
+    self.assertEmpty(caught_warnings)
+
   def _CompileAndCheck(self, fun, args_maker, *, check_dtypes=True,
                        rtol=None, atol=None, check_cache_misses=True):
     """Helper method for running JAX compilation and allclose assertions."""
@@ -899,11 +969,11 @@ class BufferDonationTestCase(JaxTestCase):
   assertNotDeleted = lambda self, x: self._assertDeleted(x, False)
 
   def _assertDeleted(self, x, deleted):
-    if hasattr(x, "device_buffer"):
-      self.assertEqual(x.device_buffer.is_deleted(), deleted)
-    elif hasattr(x, "_arrays"):
+    if hasattr(x, "_arrays"):
       for buffer in x._arrays:
         self.assertEqual(buffer.is_deleted(), deleted)
+    elif hasattr(x, "device_buffer"):
+      self.assertEqual(x.device_buffer.is_deleted(), deleted)
     else:
       for buffer in x.device_buffers:
         self.assertEqual(buffer.is_deleted(), deleted)
@@ -929,7 +999,7 @@ def with_mesh(named_shape: MeshSpec) -> Generator[None, None, None]:
   if len(local_devices) < size:
     raise unittest.SkipTest(f"Test requires {size} local devices")
   mesh_devices = np.array(local_devices[:size]).reshape(shape)  # type: ignore
-  with Mesh(mesh_devices, axis_names):
+  with jax.sharding.Mesh(mesh_devices, axis_names):
     yield
 
 def with_mesh_from_kwargs(f):
@@ -969,7 +1039,7 @@ def create_global_mesh(mesh_shape, axis_names):
     raise unittest.SkipTest(f"Test requires {size} global devices.")
   devices = sorted(api.devices(), key=lambda d: d.id)
   mesh_devices = np.array(devices[:size]).reshape(mesh_shape)
-  global_mesh = Mesh(mesh_devices, axis_names)
+  global_mesh = jax.sharding.Mesh(mesh_devices, axis_names)
   return global_mesh
 
 

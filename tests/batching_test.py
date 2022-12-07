@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -567,7 +567,7 @@ class BatchingTest(jtu.JaxTestCase):
   def testCumProd(self):
    x = jnp.arange(9).reshape(3, 3) + 1
    y = vmap(lambda x: jnp.cumprod(x, axis=-1))(x)
-   self.assertAllClose(np.cumprod(x, axis=1, dtype=int), y)
+   self.assertAllClose(jnp.cumprod(x, axis=1), y)
 
   def testSelect(self):
     pred = np.array([True, False])
@@ -1256,6 +1256,11 @@ class BatchingTest(jtu.JaxTestCase):
                axis_name='i')(x)
     expected = bulk_op(x, axis=axis)
     self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def testReduceScatterAutodiff(self):
+    f = vmap(partial(lax.psum_scatter, axis_name='i'), axis_name='i')
+    x = self.rng().randn(3, 3, 4)
+    jtu.check_grads(f, (x,), 2, ["fwd", "rev"], 1e-2, 1e-2, eps=1.)
 
   def testNonJaxTypedOutput(self):
     with self.assertRaisesRegex(

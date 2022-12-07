@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -77,9 +77,7 @@ def main(_):
 
   # CHECK-LABEL: TEST: select bool[2,7] int32[2,7] int32[2,7]
   # CHECK: mhlo.select
-  # CHECK-SAME: tensor<2x7xi1>
-  # CHECK-SAME: tensor<2x7xi32>
-  # CHECK-SAME: tensor<2x7xi32>
+  # CHECK-SAME: tensor<2x7xi1>, tensor<2x7xi32>
   print_ir(np.empty([2, 7], np.bool_), np.empty([2, 7], np.int32),
            np.empty([2, 7], np.int32))(lax.select)
 

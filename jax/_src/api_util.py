@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,8 +15,8 @@
 import inspect
 import operator
 from functools import partial
-from typing import (Any, Dict, Iterable, Sequence, Set, Tuple, Union, Optional,
-                    Callable)
+from typing import (Any, Callable, Dict, Iterable, List, Optional, Sequence,
+                    Set, Tuple, Union)
 import warnings
 
 import numpy as np
@@ -37,6 +37,7 @@ map = safe_map
 
 def _ensure_index(x: Any) -> Union[int, Tuple[int, ...]]:
   """Ensure x is either an index or a tuple of indices."""
+  x = core.concrete_or_error(None, x, "expected a static index or sequence of indices.")
   try:
     return operator.index(x)
   except TypeError:
@@ -44,6 +45,7 @@ def _ensure_index(x: Any) -> Union[int, Tuple[int, ...]]:
 
 def _ensure_index_tuple(x: Any) -> Tuple[int, ...]:
   """Convert x to a tuple of indices."""
+  x = core.concrete_or_error(None, x, "expected a static index or sequence of indices.")
   try:
     return (operator.index(x),)
   except TypeError:
@@ -330,7 +332,7 @@ def _argnames_partial(fixed_kwargs: WrapKwArgs, *args, **dyn_kwargs):
 
 def donation_vector(donate_argnums, args, kwargs) -> Tuple[bool, ...]:
   """Returns a tuple with a boolean value for each leaf in args."""
-  res = []
+  res: List[bool] = []
   for i, arg in enumerate(args):
     donate = bool(i in donate_argnums)
     res.extend((donate,) * tree_structure(arg).num_leaves)
@@ -436,7 +438,7 @@ def _shaped_abstractify_slow(x):
   weak_type = getattr(x, 'weak_type', False)
   named_shape = getattr(x, 'named_shape', {})
   if hasattr(x, 'dtype'):
-    dtype = dtypes.canonicalize_dtype(x.dtype)
+    dtype = dtypes.canonicalize_dtype(x.dtype, allow_opaque_dtype=True)
   else:
     dtype = dtypes.result_type(x)  # TODO(frostig,mattjj): why this case?
   return core.ShapedArray(np.shape(x), dtype, weak_type=weak_type,

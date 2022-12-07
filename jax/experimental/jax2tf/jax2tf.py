@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Experimental module transforms JAX functions to be executed by TensorFlow."""
-from functools import partial
+from functools import partial, reduce
 import contextlib
 import os
 import re
@@ -30,10 +30,9 @@ from jax import random, tree_util
 from jax import numpy as jnp
 from jax.experimental import maps
 from jax.experimental import pjit
-from jax.experimental import sharding
+from jax._src import sharding
 from jax.interpreters import ad
 from jax.interpreters import mlir
-from jax.interpreters import partial_eval
 from jax.interpreters import pxla
 from jax.interpreters import xla
 
@@ -52,8 +51,8 @@ from jax._src.lax import lax as lax_internal
 from jax._src.lax import linalg as lax_linalg
 from jax._src.lax import slicing as lax_slicing
 from jax._src.lax import windowed_reductions as lax_windowed_reductions
-from jax._src import lib as jaxlib
 from jax._src.lib import xla_client
+from jax._src.numpy.ufuncs import logaddexp
 
 from jax.experimental.global_device_array import GlobalDeviceArray
 from jax.experimental.jax2tf import shape_poly
@@ -68,8 +67,13 @@ import tensorflow as tf  # type: ignore[import]
 from tensorflow.compiler.tf2xla.python import xla as tfxla  # type: ignore[import]
 from tensorflow.compiler.xla import xla_data_pb2  # type: ignore[import]
 from tensorflow.core.framework import attr_value_pb2  # type: ignore[import]
-from tensorflow.compiler.xla.experimental.xla_sharding import xla_sharding  # type: ignore[import]
+try:
+  from tensorflow.python.compiler.xla.experimental import xla_sharding  # type: ignore[import]
+except ModuleNotFoundError:
+  # This can be removed when TF 2.10 support is no longer needed.
+  from tensorflow.compiler.xla.experimental.xla_sharding import xla_sharding  # type: ignore[import]
 from tensorflow.python.framework import ops as tf_ops  # type: ignore[import]
+from tensorflow.python.eager import context as tf_context  # type: ignore[import]
 # pylint: enable=g-direct-tensorflow-import
 
 NameStack = source_info_util.NameStack
@@ -156,7 +160,6 @@ _has_registered_tf_source_path = False
 
 class _ThreadLocalState(threading.local):
   def __init__(self):
-    self.name_stack = ""
     # XLA is not linked in all environments; when converting a primitive, if this
     # variable is disabled, we try harder to use only standard TF ops if they are
     # applicable to the concrete use case; if the resulting conversion path ends up
@@ -180,12 +183,16 @@ class _ThreadLocalState(threading.local):
     self.constant_cache = None  # None means that we don't use a cache. We
     # may be outside a conversion scope.
 
+    # A cache for the outside tf name_scope when the converted
+    # function is running. We will add this as the prefix to the generated tf op
+    # name. For example, the tf op name will be like
+    # "{tf_outer_name_scope}/JAX_NAME_STACKS"
+    self.tf_outer_name_scope = ""
+
 _thread_local_state = _ThreadLocalState()
 
 def _get_current_name_stack() -> Union[NameStack, str]:
-  if config.jax_experimental_name_stack:
-    return source_info_util.current_name_stack()
-  return _thread_local_state.name_stack
+  return source_info_util.current_name_stack()
 
 @contextlib.contextmanager
 def inside_call_tf():
@@ -279,47 +286,62 @@ def convert(fun_jax: Callable,
   fun_name = getattr(fun_jax, "__name__", "unknown")
   name_stack = util.wrap_name(fun_name, "jax2tf")
   def converted_fun_tf(*args_tf: TfVal, **kwargs_tf: TfVal) -> TfVal:
-    # TODO: is there a better way to check if we are inside a transformation?
-    if not core.trace_state_clean() and not _thread_local_state.inside_call_tf:
-      # It is Ok to nest convert when we are inside a call_tf
-      raise ValueError("convert must be used outside all JAX transformations." +
-                       f"Trace state: {core.thread_local_state.trace_state.trace_stack}")
-
-    fun_flat_jax, args_flat_tf, in_tree, out_tree_thunk = flatten_fun_jax(fun_jax, args_tf, kwargs_tf)
-    # out_tree_thunk will be ready after we call fun_flat_jax below.
-
-    # Expand the polymorphic_shapes to match the args_flat_tf. The polymorphic_shapes
-    # argument refers to positional arguments only.
-    if polymorphic_shapes is None or isinstance(polymorphic_shapes, (PolyShape, str)):
-      polymorphic_shapes_ = (polymorphic_shapes,) * len(args_tf)
-    else:
-      if not (isinstance(polymorphic_shapes, Sequence) and len(polymorphic_shapes) == len(args_tf)):
-        msg = ("polymorphic_shapes must be a sequence with the same length as the positional argument list "
-               f"({len(args_tf)}). Got polymorphic_shapes={repr(polymorphic_shapes)}.")
-        raise TypeError(msg)
-      polymorphic_shapes_ = tuple(polymorphic_shapes)
-
-    polymorphic_shapes_flat = tuple(
-        api_util.flatten_axes("jax2tf.convert polymorphic_shapes",
-                              in_tree,
-                              (polymorphic_shapes_, {k: None for k in kwargs_tf.keys()})))
-
-    args_and_avals = tuple(map(preprocess_arg_tf,
-                               range(len(args_flat_tf)), args_flat_tf, polymorphic_shapes_flat))
-    args_flat_tf, args_avals_flat = util.unzip2(args_and_avals)
-
-    dim_vars, get_dim_values_jax = shape_poly.prepare_dim_var_env(args_avals_flat)
-    dim_values, _ = _interpret_fun_jax(get_dim_values_jax,
-                                       args_flat_tf, args_avals_flat, "")
-    shape_env = zip(dim_vars, dim_values)
 
     try:
+      prev_enable_xla = _thread_local_state.enable_xla
+      prev_include_xla_op_metadata = _thread_local_state.include_xla_op_metadata
+      prev_tf_outer_name_scope = _thread_local_state.tf_outer_name_scope
+
+      _thread_local_state.tf_outer_name_scope = tf.get_current_name_scope()
+
+      # TODO: is there a better way to check if we are inside a transformation?
+      if not core.trace_state_clean(
+      ) and not _thread_local_state.inside_call_tf:
+        # It is Ok to nest convert when we are inside a call_tf
+        raise ValueError(
+            "convert must be used outside all JAX transformations." +
+            f"Trace state: {core.thread_local_state.trace_state.trace_stack}")
+
+      fun_flat_jax, args_flat_tf, in_tree, out_tree_thunk = flatten_fun_jax(
+          fun_jax, args_tf, kwargs_tf)
+      # out_tree_thunk will be ready after we call fun_flat_jax below.
+
+      # Expand the polymorphic_shapes to match the args_flat_tf. The polymorphic_shapes
+      # argument refers to positional arguments only.
+      if polymorphic_shapes is None or isinstance(polymorphic_shapes,
+                                                  (PolyShape, str)):
+        polymorphic_shapes_ = (polymorphic_shapes,) * len(args_tf)
+      else:
+        if not (isinstance(polymorphic_shapes, Sequence) and
+                len(polymorphic_shapes) == len(args_tf)):
+          msg = (
+              "polymorphic_shapes must be a sequence with the same length as "
+              "the positional argument list "
+              f"({len(args_tf)}). Got polymorphic_shapes={repr(polymorphic_shapes)}."
+          )
+          raise TypeError(msg)
+        polymorphic_shapes_ = tuple(polymorphic_shapes)
+
+      polymorphic_shapes_flat = tuple(
+          api_util.flatten_axes(
+              "jax2tf.convert polymorphic_shapes", in_tree,
+              (polymorphic_shapes_, {k: None for k in kwargs_tf.keys()})))
+
+      args_and_avals = tuple(
+          map(preprocess_arg_tf, range(len(args_flat_tf)), args_flat_tf,
+              polymorphic_shapes_flat))
+      args_flat_tf, args_avals_flat = util.unzip2(args_and_avals)
+
+      dim_vars, get_dim_values_jax = shape_poly.prepare_dim_var_env(
+          args_avals_flat)
+      dim_values, _ = _interpret_fun_jax(get_dim_values_jax, args_flat_tf,
+                                         args_avals_flat, name_stack)
+      shape_env = zip(dim_vars, dim_values)
+
       assert not _thread_local_state.shape_env, f"Unexpected shape environment {_thread_local_state.shape_env}"
 
-      prev_enable_xla = _thread_local_state.enable_xla
       _thread_local_state.enable_xla = enable_xla
 
-      prev_include_xla_op_metadata = _thread_local_state.include_xla_op_metadata
       # TODO(b/189306134): implement support for XLA metadata
       _thread_local_state.include_xla_op_metadata = False
 
@@ -364,6 +386,7 @@ def convert(fun_jax: Callable,
       _thread_local_state.shape_env = ()
       _thread_local_state.enable_xla = prev_enable_xla
       _thread_local_state.include_xla_op_metadata = prev_include_xla_op_metadata
+      _thread_local_state.tf_outer_name_scope = prev_tf_outer_name_scope
 
     out_flat_tf = [tf.identity(x, "jax2tf_out") for x in out_flat_tf]
     out_tf = tree_util.tree_unflatten(out_tree_thunk(), out_flat_tf)
@@ -418,6 +441,21 @@ def flatten_fun_jax(fun_jax: Callable, args_tf: Sequence[TfVal],
     out_tree_ref = out_tree
     return res_flat_jax
 
+  if hasattr(fun_jax, "lower"):
+    # If the fun_jax is already a jit(f) or pjit(f), we must
+    # preserve the lowering function. This will be used in the _lower_native_and_run.
+    # We rely on the fact that the lowering is the same for the function
+    # taking pytrees, and the one taking flat args.
+    def fun_flat_jax_lower(*args_flat_jax):
+      tree_args, tree_kwargs = tree_util.tree_unflatten(in_tree, args_flat_jax)
+      lowered = fun_jax.lower(*tree_args, **tree_kwargs)
+      out_tree = lowered.out_tree
+      nonlocal out_tree_ref
+      assert out_tree_ref is None or out_tree_ref == out_tree
+      out_tree_ref = out_tree
+      return lowered
+    setattr(fun_flat_jax, "lower", fun_flat_jax_lower)
+
   return fun_flat_jax, args_flat_tf, in_tree, lambda: out_tree_ref
 
 def preprocess_arg_tf(arg_idx: int,
@@ -457,7 +495,7 @@ def make_custom_gradient_fn_tf(
       raise ValueError(
           "Unexpected variables used in forward pass. "
           "This should not happen for first-order differentiation. "
-          f"variables={variables}")
+          f"{variables=}")
 
     out_cts_flat_polymorphic_shapes = tuple(str(out_aval.shape)  # Note: may be polynomials, not just DimVar
                                             for out_aval in out_avals)  # type: ignore
@@ -480,7 +518,7 @@ def make_custom_gradient_fn_tf(
         # else JAX gets unhappy. See issue #6975.
         if out_ct_jax is not None:
           return out_ct_jax
-        assert core.primal_dtype_to_tangent_dtype(out_ct_aval.dtype) == dtypes.float0, f"out_ct_jax={out_ct_jax}"
+        assert core.primal_dtype_to_tangent_dtype(out_ct_aval.dtype) == dtypes.float0, f"{out_ct_jax=}"
         # Note that out_ct_aval.shape contains dimension variable from the
         # primal function scope. It is Ok to use them here because we
         # use the same shape variables for the VJP function.
@@ -511,24 +549,12 @@ def make_custom_gradient_fn_tf(
 
 @contextlib.contextmanager
 def _extended_name_stack(extra_name_stack: Optional[str]):
-  if config.jax_experimental_name_stack:
-    name_ctx = (source_info_util.extend_name_stack(extra_name_stack)
-        if extra_name_stack
-        else contextlib.nullcontext())
-    with name_ctx:
-      yield
-    return
-  prev_name_stack = _thread_local_state.name_stack
-  if extra_name_stack:
-    if not prev_name_stack:
-      _thread_local_state.name_stack = extra_name_stack
-    else:
-      _thread_local_state.name_stack = util.extend_name_stack(
-          _thread_local_state.name_stack, extra_name_stack)
-  try:
+  name_ctx = (source_info_util.extend_name_stack(extra_name_stack)
+      if extra_name_stack
+      else contextlib.nullcontext())
+  with name_ctx:
     yield
-  finally:
-    _thread_local_state.name_stack = prev_name_stack
+  return
 
 
 def _interpret_fun_jax(
@@ -538,7 +564,7 @@ def _interpret_fun_jax(
     extra_name_stack: Optional[str],
     fresh_constant_cache: bool = False,
     experimental_native_lowering: bool = False
-) -> Tuple[Sequence[TfVal], Tuple[core.ShapedArray]]:
+) -> Tuple[Tuple[TfVal, ...], Tuple[core.ShapedArray, ...]]:
   if experimental_native_lowering:
     del extra_name_stack
     return _lower_native_and_run(fun_jax, args_avals, args_tf)
@@ -558,7 +584,7 @@ def _interpret_fun_jax(
 def _lower_native_and_run(fun_jax: Callable,
                           args_avals: Sequence[core.ShapedArray],
                           args_tf: Sequence[TfVal],
-                          ) -> Tuple[Sequence[TfVal], Tuple[core.ShapedArray]]:
+                          ) -> Tuple[Tuple[TfVal, ...], Tuple[core.ShapedArray, ...]]:
   """Lowers the function using native lowering and then invokes it.
 
   Work-in-progress.
@@ -600,39 +626,42 @@ def _lower_native_and_run(fun_jax: Callable,
     abstracted_axes = None  # type: ignore
 
   arg_specs_jax = [
-    jax.ShapeDtypeStruct(aval.shape, aval.dtype)
+    jax.ShapeDtypeStruct(aval.shape, aval.dtype, named_shape=aval.named_shape)
     for aval in args_avals
   ]
   # TODO: specify the backend for experimental_native_lowering
   backend = jax.default_backend()
-  lowered = jax.jit(fun_jax, backend=backend,
-                    keep_unused=True,  # TODO: allow dropping unused
-                    abstracted_axes=abstracted_axes).lower(*arg_specs_jax)._lowering
+  if not hasattr(fun_jax, "lower") or abstracted_axes:
+    # We support convert(pjit(f_jax, ...)) and convert(jit(f_jax)) but also
+    # convert(f_jax), in which case a "jit" is implied. We also add a jit when
+    # we need to pass the abstracted axes.
+    fun_jax_lower = jax.jit(fun_jax, backend=backend,
+                            keep_unused=True,  # TODO: allow dropping unused
+                            abstracted_axes=abstracted_axes).lower
+  else:
+    fun_jax_lower = fun_jax.lower
+  lowered = fun_jax_lower(*arg_specs_jax)._lowering
+  if config.jax2tf_use_stablehlo:
+    mhlo_module = lowered.stablehlo()
+    xla_call_module_version = 2
+  else:
+    mhlo_module = lowered.mhlo()
+    xla_call_module_version = 1
+  if logging.vlog_is_on(3):
+    mhlo_module_text = mlir.module_to_string(mhlo_module)
+    logging.vlog(3, "XlaCallModule (version=%d)\n%s", xla_call_module_version,
+                 mhlo_module_text)
 
-  mhlo_module = lowered.mhlo()
-  mhlo_module_text = mlir.module_to_string(mhlo_module)
-  if jaxlib.version <= (0, 3, 14):
-    mhlo_module_text = _fixup_mhlo_module_text(mhlo_module_text)
-  # We do not support custom_call, try to give an error for now
-  if "mhlo.custom_call" in mhlo_module_text:
-    # Try to give a nice error message. We could just dump the module...
-    msg = ("experimental_native_lowering does not work with custom calls. "
-           "Most likely you are running this on CPU or GPU for JAX programs that "
-           "use custom calls on those platforms. The serialization should "
-           "work on TPU.")
-    custom_calls = re.findall(r'mhlo.custom_call.*call_target_name\s+=\s+"([^"]+)".*loc\(([^\)]+)\)',
-                              mhlo_module_text)
-    for cc in custom_calls:
-      msg += f"\n{cc[0]}"
-      # Get the line number
-      m = re.search('^' + cc[1] + ' =.*', mhlo_module_text, re.MULTILINE)
-      if m:
-        msg += f"\n  from line {m.group(0)}"
-    raise NotImplementedError(msg)
-  logging.vlog(2, f"XlaCallModule {mhlo_module_text}")
-
+  mhlo_serialized_module = mlir.module_to_bytecode(mhlo_module)
   # Figure out the result types and shapes
-  out_avals = lowered.compile_args["out_avals"]
+  if "global_out_avals" in lowered.compile_args:
+    # This is currently the case for pjit
+    out_avals = lowered.compile_args["global_out_avals"]
+  else:
+    out_avals = lowered.compile_args["out_avals"]
+  if lowered.compile_args["host_callbacks"]:
+    raise NotImplementedError("host_callbacks are not yet implemented for the jax2tf native lowering")
+
   # TODO(necula): handle d being InDBIdx
   out_shapes = tuple(
       tuple(d if type(d) is int else None
@@ -645,12 +674,23 @@ def _lower_native_and_run(fun_jax: Callable,
     return jax_type
   out_types = tuple(_out_type(out_aval.dtype) for out_aval in out_avals)
 
+  # Apply the shardings on arguments and results for pjit. This is redundant
+  # because the mhlo_module_text will already contain the shardings, but it
+  # makes it easier for tools like the TPU inference converter to see the
+  # sharding without digging into the `module` attribute of the `XlaCallModule`
+  # op, in the same way as it is done for the legacy jax2tf conversion.
+  if "in_shardings" in lowered.compile_args:
+    args_tf = tuple(
+      map(_shard_value, args_tf, args_avals, lowered.compile_args["in_shardings"]))
   res = tfxla.call_module(
       args_tf,
-      module=mhlo_module_text,
+      version=xla_call_module_version,
+      module=mhlo_serialized_module,
       Tout=out_types,
       Sout=out_shapes,
       dim_args_spec=dim_args_spec)
+  if "out_shardings" in lowered.compile_args:
+    res = list(map(_shard_value, res, out_avals, lowered.compile_args["out_shardings"]))
 
   # Convert the results to the needed TF types
   def _convert_res(res_val, res_jax_type):
@@ -664,15 +704,6 @@ def _lower_native_and_run(fun_jax: Callable,
       _convert_res(res_val, out_aval.dtype)
       for res_val, out_aval in zip(res, out_avals))
   return res, out_avals
-
-def _fixup_mhlo_module_text(mhlo_module_text: str) -> str:
-  # A workaround for MHLO not (yet) having backwards compatibility. With
-  # jaxlib 0.3.14 we have an old serialization method that puts "..." around
-  # MHLO attributes. The parser is new and does not accept those attributes.
-  # We try to fix it up here, temporarily.
-  import re
-  return re.sub(r'#mhlo<"([^"]+)">', "#mhlo<\\1>", mhlo_module_text)
-
 
 def _call_wrapped_with_new_constant_cache(fun: lu.WrappedFun,
                                           in_vals: Sequence[TfVal],
@@ -933,7 +964,7 @@ class TensorFlowTracer(core.Tracer):
       val_shape = val.shape
 
       if config.jax_enable_checks:
-        assert len(phys_aval.shape) == len(val_shape), f"_aval.shape={phys_aval.shape} different rank than val_shape={val_shape}"
+        assert len(phys_aval.shape) == len(val_shape), f"_aval.shape={phys_aval.shape} different rank than {val_shape=}"
         # To compare types, we must handle float0 in JAX and x64 in TF
         if phys_aval.dtype == dtypes.float0:
           assert _to_tf_dtype(phys_aval.dtype) == val.dtype, f"expected {phys_aval.dtype} == {val.dtype}"
@@ -990,6 +1021,10 @@ class TensorFlowTrace(core.Trace):
 
     This function may be called by way of trace.full_raise.
     """
+    if hasattr(val, "__jax_array__"):
+      val = val.__jax_array__()
+      if isinstance(val, TensorFlowTracer):
+        return val
     tf_val, jax_dtype = _tfval_to_tensor_jax_dtype(val, memoize_constants=True)
     return TensorFlowTracer(
         self, val, core.ShapedArray(tf_val.shape, jax_dtype,
@@ -1029,20 +1064,21 @@ class TensorFlowTrace(core.Trace):
         return impl(*args_tf, **params)
 
     current_name_stack = _get_current_name_stack()
-    if config.jax_experimental_name_stack:
-      # We don't use `str(name_stack)` because it uses parentheses for
-      # transformations, which aren't allowed in `name_scope`.
-      scope = '/'.join([s.name for s in current_name_stack.stack])  # type: ignore[union-attr]
-    else:
-      scope = str(current_name_stack)
+    # We don't use `str(name_stack)` because it uses parentheses for
+    # transformations, which aren't allowed in `name_scope`.
+    scope = '/'.join([s.name for s in current_name_stack.stack])  # type: ignore[union-attr]
+
+    # Here we reset the name scope to the memorized TF name scope
+    # + JAX name stack by using absolute scope.
     # We need to add a '/' to the name stack string to force `tf.name_scope`
     # to interpret it as an absolute scope, not a relative scope.
-    scope = scope + '/'
-    name_scope = (
-        tf.name_scope(_sanitize_scope_name(scope)) if
-        config.jax_experimental_name_stack else contextlib.nullcontext())
+    if _thread_local_state.tf_outer_name_scope:
+      scope = f"{_thread_local_state.tf_outer_name_scope}/{scope}"
 
-    with name_scope:
+    if not scope.endswith("/"):
+      scope = scope + "/"
+
+    with tf.name_scope(_sanitize_scope_name(scope)):
       if _thread_local_state.include_xla_op_metadata:
         op_metadata = xla.make_op_metadata(primitive, params,
                                            name_stack=current_name_stack,
@@ -1088,20 +1124,14 @@ class TensorFlowTrace(core.Trace):
     avals: Sequence[core.ShapedArray] = tuple(t.aval for t in tracers)
     interpreted_fun = _interpret_subtrace(fun, self.main, avals)
     extra_name_stack = None
-    if call_primitive == core.named_call_p:
-      extra_name_stack = util.wrap_name(params["name"], "named")
-    elif call_primitive == xla.xla_call_p:
+    if call_primitive == xla.xla_call_p:
       extra_name_stack = util.wrap_name(params["name"], "jit")
     with _extended_name_stack(extra_name_stack):
       with core.new_sublevel():
-        if call_primitive == core.named_call_p:
-          with tf.name_scope(_sanitize_scope_name(params["name"])):
-            vals_out: Sequence[Tuple[TfVal, core.ShapedArray]] = \
-                interpreted_fun.call_wrapped(*vals)
-        elif call_primitive == xla.xla_call_p:
+        if call_primitive == xla.xla_call_p:
           if _WRAP_JAX_JIT_WITH_TF_FUNCTION:
             # Make a nested tf.function(jit_compile=True)
-            store_tf_res_avals = None
+            store_tf_res_avals: Sequence[core.ShapedArray] = []
             def f_tf(*tf_args):
               nonlocal store_tf_res_avals
               tf_res_out: Sequence[Tuple[TfVal, core.ShapedArray]] = \
@@ -1187,7 +1217,7 @@ def _unexpected_primitive(p: core.Primitive, *args, **kwargs):
 
 
 # Call primitives are inlined
-for unexpected in [core.call_p, core.named_call_p, xla.xla_call_p, maps.xmap_p]:
+for unexpected in [core.call_p, xla.xla_call_p, maps.xmap_p]:
   tf_impl[unexpected] = partial(_unexpected_primitive, unexpected)
 
 # Primitives that are not yet implemented must be explicitly declared here.
@@ -1205,11 +1235,13 @@ tf_not_yet_impl = [
     "full_to_shard",
     "shard_to_full",
     "pure_callback",
+    "for",
+    "inspect_sharding",
 
     # Not high priority?
     "after_all",
     "all_to_all",
-    "assert",
+    "check",
     "create_token",
     "custom_transpose_call",
     "custom_vmap_call",
@@ -1229,7 +1261,9 @@ tf_not_yet_impl = [
     "lu_pivots_to_permutation",
     "xla_pmap",
     "geqrf",
-    "orgqr",
+    "householder_product",
+    "hessenberg",
+    "tridiagonal",
     "eigh_jacobi",
 ]
 
@@ -2259,6 +2293,10 @@ tf_impl_with_avals[lax.cummin_p] = _cumred(
     lax_reduce_window_fn=lax_windowed_reductions._reduce_window_min,
     lax_reduce_fn=lax.min,
     extra_name_stack="cummin")
+tf_impl_with_avals[lax.cumlogsumexp_p] = _cumred(
+    lax_reduce_window_fn=lax_windowed_reductions._reduce_window_logaddexp,
+    lax_reduce_fn=logaddexp,
+    extra_name_stack="cumlogsumexp")
 tf_impl_with_avals[lax.cumsum_p] = _cumred(
     lax_reduce_window_fn=lax_windowed_reductions._reduce_window_sum,
     lax_reduce_fn=lax.add,
@@ -2428,6 +2466,20 @@ def _rng_uniform(minval: TfVal, maxval: TfVal, *, shape) -> TfVal:
 tf_impl[lax.rng_uniform_p] = _rng_uniform
 
 
+def _iota_2x32_shape(*, shape):
+  def _add(x, y): return x + y
+  def _mul(x, y): return x * y
+  def _cast32(xs): return tf.dtypes.cast(xs, _to_tf_dtype(jnp.uint32))
+  iotas = [_iota(dtype=jnp.uint64, shape=shape, dimension=dimension)
+           for dimension in range(len(shape))]
+  counts = prng.bcast_iotas_to_reshaped_iota(_add, _mul, shape, iotas)
+  counts_lo = _cast32(counts)
+  counts_hi = _cast32(tf.bitwise.right_shift(counts, 32))
+  return counts_hi, counts_lo
+
+tf_impl[prng.iota_2x32_shape_p] = _iota_2x32_shape
+
+
 def _gather_dimensions_proto(indices_shape, dimension_numbers):
   proto = xla_data_pb2.GatherDimensionNumbers()
   proto.offset_dims.extend(dimension_numbers.offset_dims)
@@ -2585,10 +2637,10 @@ def _cond(index: TfVal, *operands: TfVal, branches: Sequence[core.ClosedJaxpr],
       for jaxpr in branches
       for i, jaxpr in enumerate(branches)
   ]
-  if config.jax_experimental_name_stack:
-    # Same name stack as XLA translation of cond_p
-    branches_tf = list(map(source_info_util.extend_name_stack("cond"),
-        branches_tf))
+  # Same name stack as XLA translation of cond_p
+  # Note: extend_name_stack is a contextmanager, which is callable as a decorator.
+  branches_tf = list(map(source_info_util.extend_name_stack("cond"),  # type: ignore[arg-type]
+      branches_tf))
   return tf.switch_case(index, branches_tf)
 
 
@@ -2783,7 +2835,7 @@ def _fft(x, fft_type, fft_lengths):
     expected_lengths = x.shape[-len(fft_lengths):]
   if expected_lengths != fft_lengths:
     raise NotImplementedError(
-        f"Unsupported fft_lengths={fft_lengths} for fft_type={fft_type} of "
+        f"Unsupported {fft_lengths=} for {fft_type=} of "
         f"array with shape={x.shape}.")
   tf_funcs = {
       FFT: [tf.signal.fft, tf.signal.fft2d, tf.signal.fft3d],
@@ -2980,8 +3032,15 @@ def _shard_value(val: TfVal,
                  aval: core.ShapedArray,
                  sd: sharding.XLACompatibleSharding) -> TfVal:
   """Apply sharding to a TfVal."""
+  if pxla._is_unspecified(sd):
+    return val
+
   sharding_proto: xla_client.OpSharding = cast(
       xla_client.OpSharding, sd._to_xla_op_sharding(aval.ndim))
+  # Do not apply XlaSharding for REPLICATED. This is an agreed convention, and
+  # also improves usability under TF eager. See b/255511660.
+  if pxla.is_op_sharding_replicated(sharding_proto):
+    return val
 
   # To use xla_sharding.py, we must have a xla_data_pb2.OpSharding.
   xla_sharding_proto: xla_data_pb2.OpSharding = (
@@ -2991,6 +3050,11 @@ def _shard_value(val: TfVal,
           tile_assignment_devices=sharding_proto.tile_assignment_devices,
           replicate_on_last_tile_dim=sharding_proto.replicate_on_last_tile_dim,
           last_tile_dims=sharding_proto.last_tile_dims))
+  if tf_context.executing_eagerly():
+    raise ValueError(
+        "A jit function with sharded (not replicated) arguments or results must be used under a `tf.function` context. "
+        "See https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#support-for-partitioning for a discussion")
+
   return xla_sharding.Sharding(proto=xla_sharding_proto).apply_to_tensor(
       val, use_sharding_op=True)
 
@@ -3005,7 +3069,7 @@ def _pjit(*args: TfVal,
           in_positional_semantics,
           out_positional_semantics,
           _in_avals: Sequence[core.ShapedArray],
-          _out_aval: core.ShapedArray) -> TfVal:
+          _out_aval: Sequence[core.ShapedArray]) -> TfVal:
   del donated_invars
   if resource_env.physical_mesh.is_multi_process:
     raise NotImplementedError("jax2tf translation for pjit over multi-process "
@@ -3024,7 +3088,7 @@ tf_impl_with_avals[pjit.pjit_p] = _pjit
 
 
 def _pjit_sharding_constraint(arg: TfVal, *,
-                              sharding: sharding.MeshPspecSharding,
+                              sharding: sharding.NamedSharding,
                               resource_env: maps.ResourceEnv,
                               _in_avals: Sequence[core.ShapedArray],
                               _out_aval: core.ShapedArray,

@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -166,7 +166,7 @@ class CallToTFTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
       dict(
-          testcase_name=f"_ad={ad}",
+          testcase_name=f"_{ad=}",
           ad=ad)
       for ad in CALL_TF_IMPLEMENTATIONS.keys())
   def test_impl(self, ad="simple"):
@@ -185,7 +185,7 @@ class CallToTFTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
       dict(
-          testcase_name=f"_ad={ad}",
+          testcase_name=f"_{ad=}",
           ad=ad)
       for ad in CALL_TF_IMPLEMENTATIONS.keys()
       if ad != "none")

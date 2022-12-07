@@ -1,4 +1,4 @@
-# Copyright 2019 Google LLC
+# Copyright 2019 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -82,7 +82,7 @@ def _scatter_impl(x, y, scatter_op, treedef, static_idx, dynamic_idx,
   dtype = lax.dtype(x)
   weak_type = dtypes.is_weakly_typed(x)
 
-  if dtype != dtypes.result_type(x, y):
+  if dtype != lax.dtype(y) and dtype != dtypes.result_type(x, y):
     # TODO(jakevdp): change this to an error after the deprecation period.
     warnings.warn("scatter inputs have incompatible types: cannot safely cast "
                   f"value from dtype={lax.dtype(y)} to dtype={lax.dtype(x)}. "
@@ -161,15 +161,12 @@ def _segment_update(name: str,
   segment_ids = jnp.asarray(segment_ids)
   dtype = data.dtype
   if num_segments is None:
-    num_segments = jnp.max(segment_ids) + 1
+    num_segments = np.max(segment_ids) + 1
   num_segments = core.concrete_or_error(int, num_segments, "segment_sum() `num_segments` argument.")
   if num_segments is not None and num_segments < 0:
     raise ValueError("num_segments must be non-negative.")
 
-
-  num_buckets = 1 if bucket_size is None \
-                  else util.ceil_of_ratio(segment_ids.size, bucket_size)
-  if num_buckets == 1:
+  if bucket_size is None:
     out = jnp.full((num_segments,) + data.shape[1:],
                    _get_identity(scatter_op, dtype), dtype=dtype)
     return _scatter_update(
@@ -179,10 +176,11 @@ def _segment_update(name: str,
   # Bucketize indices and perform segment_update on each bucket to improve
   # numerical stability for operations like product and sum.
   assert reducer is not None
+  num_buckets = util.ceil_of_ratio(segment_ids.size, bucket_size)
   out = jnp.full((num_buckets, num_segments) + data.shape[1:],
                  _get_identity(scatter_op, dtype), dtype=dtype)
   out = _scatter_update(
-    out, np.index_exp[lax.div(jnp.arange(segment_ids.shape[0]), bucket_size),
+    out, np.index_exp[jnp.arange(segment_ids.shape[0]) // bucket_size,
                       segment_ids[None, :]],
     data, scatter_op, indices_are_sorted,
     unique_indices, normalize_indices=False, mode=mode)
@@ -211,7 +209,7 @@ def segment_sum(data: Array,
       would support all indices in ``segment_ids``, calculated as
       ``max(segment_ids) + 1``.
       Since `num_segments` determines the size of the output, a static value
-      must be provided to use ``segment_sum`` in a ``jit``-compiled function.
+      must be provided to use ``segment_sum`` in a JIT-compiled function.
     indices_are_sorted: whether ``segment_ids`` is known to be sorted.
     unique_indices: whether `segment_ids` is known to be free of duplicates.
     bucket_size: size of bucket to group indices into. ``segment_sum`` is
@@ -231,13 +229,13 @@ def segment_sum(data: Array,
     >>> data = jnp.arange(5)
     >>> segment_ids = jnp.array([0, 0, 1, 1, 2])
     >>> segment_sum(data, segment_ids)
-    DeviceArray([1, 5, 4], dtype=int32)
+    Array([1, 5, 4], dtype=int32)
 
     Using JIT requires static `num_segments`:
 
     >>> from jax import jit
     >>> jit(segment_sum, static_argnums=2)(data, segment_ids, 3)
-    DeviceArray([1, 5, 4], dtype=int32)
+    Array([1, 5, 4], dtype=int32)
   """
   return _segment_update(
       "segment_sum", data, segment_ids, lax.scatter_add, num_segments,
@@ -267,7 +265,7 @@ def segment_prod(data: Array,
       would support all indices in ``segment_ids``, calculated as
       ``max(segment_ids) + 1``.
       Since `num_segments` determines the size of the output, a static value
-      must be provided to use ``segment_prod`` in a ``jit``-compiled function.
+      must be provided to use ``segment_prod`` in a JIT-compiled function.
     indices_are_sorted: whether ``segment_ids`` is known to be sorted.
     unique_indices: whether `segment_ids` is known to be free of duplicates.
     bucket_size: size of bucket to group indices into. ``segment_prod`` is
@@ -287,13 +285,13 @@ def segment_prod(data: Array,
     >>> data = jnp.arange(6)
     >>> segment_ids = jnp.array([0, 0, 1, 1, 2, 2])
     >>> segment_prod(data, segment_ids)
-    DeviceArray([ 0,  6, 20], dtype=int32)
+    Array([ 0,  6, 20], dtype=int32)
 
     Using JIT requires static `num_segments`:
 
     >>> from jax import jit
     >>> jit(segment_prod, static_argnums=2)(data, segment_ids, 3)
-    DeviceArray([ 0,  6, 20], dtype=int32)
+    Array([ 0,  6, 20], dtype=int32)
   """
   return _segment_update(
       "segment_prod", data, segment_ids, lax.scatter_mul, num_segments,
@@ -323,7 +321,7 @@ def segment_max(data: Array,
       would support all indices in ``segment_ids``, calculated as
       ``max(segment_ids) + 1``.
       Since `num_segments` determines the size of the output, a static value
-      must be provided to use ``segment_max`` in a ``jit``-compiled function.
+      must be provided to use ``segment_max`` in a JIT-compiled function.
     indices_are_sorted: whether ``segment_ids`` is known to be sorted.
     unique_indices: whether `segment_ids` is known to be free of duplicates.
     bucket_size: size of bucket to group indices into. ``segment_max`` is
@@ -342,13 +340,13 @@ def segment_max(data: Array,
     >>> data = jnp.arange(6)
     >>> segment_ids = jnp.array([0, 0, 1, 1, 2, 2])
     >>> segment_max(data, segment_ids)
-    DeviceArray([1, 3, 5], dtype=int32)
+    Array([1, 3, 5], dtype=int32)
 
     Using JIT requires static `num_segments`:
 
     >>> from jax import jit
     >>> jit(segment_max, static_argnums=2)(data, segment_ids, 3)
-    DeviceArray([1, 3, 5], dtype=int32)
+    Array([1, 3, 5], dtype=int32)
   """
   return _segment_update(
       "segment_max", data, segment_ids, lax.scatter_max, num_segments,
@@ -378,7 +376,7 @@ def segment_min(data: Array,
       would support all indices in ``segment_ids``, calculated as
       ``max(segment_ids) + 1``.
       Since `num_segments` determines the size of the output, a static value
-      must be provided to use ``segment_min`` in a ``jit``-compiled function.
+      must be provided to use ``segment_min`` in a JIT-compiled function.
     indices_are_sorted: whether ``segment_ids`` is known to be sorted.
     unique_indices: whether `segment_ids` is known to be free of duplicates.
     bucket_size: size of bucket to group indices into. ``segment_min`` is
@@ -397,13 +395,13 @@ def segment_min(data: Array,
     >>> data = jnp.arange(6)
     >>> segment_ids = jnp.array([0, 0, 1, 1, 2, 2])
     >>> segment_min(data, segment_ids)
-    DeviceArray([0, 2, 4], dtype=int32)
+    Array([0, 2, 4], dtype=int32)
 
     Using JIT requires static `num_segments`:
 
     >>> from jax import jit
     >>> jit(segment_min, static_argnums=2)(data, segment_ids, 3)
-    DeviceArray([0, 2, 4], dtype=int32)
+    Array([0, 2, 4], dtype=int32)
   """
   return _segment_update(
       "segment_min", data, segment_ids, lax.scatter_min, num_segments,

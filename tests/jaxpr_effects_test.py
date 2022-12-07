@@ -1,4 +1,4 @@
-# Copyright 2022 Google LLC
+# Copyright 2022 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@ import unittest
 import warnings
 
 from absl.testing import absltest
-from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 from jax import core
@@ -27,15 +26,15 @@ from jax.config import config
 from jax.interpreters import ad
 from jax.experimental import maps
 from jax.experimental import pjit
-from jax.experimental import sharding
+from jax._src import sharding
 from jax.interpreters import mlir
 from jax._src import ad_checkpoint
-from jax._src import lib as jaxlib
 from jax._src import dispatch
 from jax._src import test_util as jtu
 from jax._src import util
 from jax._src.lax import control_flow as lcf
 from jax._src.lib import can_execute_with_token
+from jax._src.lib import xla_bridge
 import numpy as np
 
 config.parse_flags_with_absl()
@@ -67,12 +66,6 @@ lcf.allowed_effects.add('while1')
 lcf.allowed_effects.add('while2')
 
 ad_checkpoint.remat_allowed_effects.add('remat')
-
-# TODO(sharadmv): remove jaxlib guards for TPU tests when jaxlib minimum
-#                 version is >= 0.3.15
-disabled_backends = []
-if jaxlib.version < (0, 3, 15):
-  disabled_backends.append('tpu')
 
 
 def trivial_effect_lowering(ctx, *, effect):
@@ -209,9 +202,7 @@ class HigherOrderPrimitiveTest(jtu.JaxTestCase):
       return x
     jax.make_jaxpr(f)(2.)
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-    dict(testcase_name=f"_{flavor}", flavor=flavor)
-    for flavor in ["old", "new"]))
+  @jtu.sample_product(flavor=["old", "new"])
   def test_remat_call_primitive_inherits_effects(self, flavor):
     remat = jax.remat if flavor == "old" else ad_checkpoint.checkpoint
 
@@ -269,10 +260,6 @@ class HigherOrderPrimitiveTest(jtu.JaxTestCase):
       jax.make_jaxpr(f)(jnp.arange(jax.local_device_count()))
 
   def test_xmap_inherits_effects(self):
-    if config.jax_array:
-      raise unittest.SkipTest('Xmap does not work properly with Arrays '
-                              'containing SingleDeviceSharding.')
-
     def f(x):
       effect_p.bind(effect='foo')
       effect_p.bind(effect='bar')
@@ -288,7 +275,7 @@ class HigherOrderPrimitiveTest(jtu.JaxTestCase):
       return x
     mesh = maps.Mesh(np.array(jax.devices()), ['x'])
     if config.jax_array:
-      spec = sharding.MeshPspecSharding(mesh, pjit.PartitionSpec('x'))
+      spec = sharding.NamedSharding(mesh, pjit.PartitionSpec('x'))
     else:
       spec = pjit.PartitionSpec('x')
     f = pjit.pjit(f, in_axis_resources=spec, out_axis_resources=spec)
@@ -597,10 +584,12 @@ class EffectfulJaxprLoweringTest(jtu.JaxTestCase):
 
 class EffectOrderingTest(jtu.JaxTestCase):
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_can_execute_python_callback(self):
     # TODO(sharadmv): enable this test on GPU and TPU when backends are
     # supported
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
+
     log = []
     def log_value(x):
       log.append(x)
@@ -617,12 +606,15 @@ class EffectOrderingTest(jtu.JaxTestCase):
     jax.effects_barrier()
     self.assertListEqual(log, [2., 3.])
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_ordered_effect_remains_ordered_across_multiple_devices(self):
     # TODO(sharadmv): enable this test on GPU and TPU when backends are
     # supported
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
+
     if jax.device_count() < 2:
       raise unittest.SkipTest("Test requires >= 2 devices.")
+
     log = []
     def log_value(x):
       log.append(x)
@@ -651,7 +643,6 @@ class EffectOrderingTest(jtu.JaxTestCase):
     self.assertListEqual(log, expected_log)
 
   @jtu.skip_on_devices("tpu")
-  @jtu.skip_on_devices(*disabled_backends)
   def test_different_threads_get_different_tokens(self):
     if jax.device_count() < 2:
       raise unittest.SkipTest("Test requires >= 2 devices.")
@@ -703,12 +694,15 @@ class ParallelEffectsTest(jtu.JaxTestCase):
       return x
     jax.pmap(f)(jnp.arange(jax.local_device_count()))
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_can_pmap_unordered_callback(self):
     # TODO(sharadmv): enable this test on GPU and TPU when backends are
     # supported
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
+
     if jax.device_count() < 2:
       raise unittest.SkipTest("Test requires >= 2 devices.")
+
     log = set()
     def log_value(x):
       log.add(int(x))

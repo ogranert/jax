@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,15 +19,21 @@ from jax._src.lax.linalg import (
   eig_p,
   eigh,
   eigh_p,
+  hessenberg,
+  hessenberg_p,
   lu,
   lu_p,
   lu_pivots_to_permutation,
+  householder_product,
+  householder_product_p,
   qr,
   qr_p,
   svd,
   svd_p,
   triangular_solve,
   triangular_solve_p,
+  tridiagonal,
+  tridiagonal_p,
   tridiagonal_solve,
   tridiagonal_solve_p,
   schur,

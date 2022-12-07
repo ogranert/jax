@@ -1,4 +1,4 @@
-# Copyright 2022 Google LLC
+# Copyright 2022 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +21,6 @@ from typing import Any, Callable, Sequence
 from jax import core
 from jax import tree_util
 from jax._src import dtypes
-from jax._src import lib as jaxlib
 from jax._src import util
 from jax._src import dispatch
 from jax.interpreters import ad
@@ -86,13 +85,13 @@ def pure_callback_batching_rule(args, dims, *, callback, vectorized: bool,
   else:
     is_batched = [d is not batching.not_mapped for d in dims]
     unbatched_args, batched_args = util.partition_list(is_batched, new_args)
-    def _batch_fun(*batched_args):
+    def _batch_fun(batched_args):
       merged_args = util.merge_lists(is_batched, unbatched_args, batched_args)
       return pure_callback_p.bind(
           *merged_args, callback=callback, result_avals=result_avals,
           vectorized=vectorized)
     from jax._src.lax.control_flow import map as lax_map
-    outvals = lax_map(_batch_fun, *batched_args)
+    outvals = lax_map(_batch_fun, batched_args)
   return tuple(outvals), (0,) * len(outvals)
 
 
@@ -100,10 +99,6 @@ batching.primitive_batchers[pure_callback_p] = pure_callback_batching_rule
 
 
 def pure_callback_lowering(ctx, *args, callback, **params):
-
-  if ctx.module_context.platform == "TPU" and jaxlib.version < (0, 3, 15):
-    raise NotImplementedError("Pure callbacks on TPU not supported. "
-                              "Please upgrade to a jaxlib >= 0.3.15.")
 
   def _callback(*flat_args):
     return tuple(pure_callback_impl(*flat_args, callback=callback, **params))

@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,14 +18,13 @@ import glob
 import gzip
 import http.server
 import json
+import logging
 import os
 import socketserver
 import threading
-import warnings
 
 from typing import Callable, Optional
 
-from absl import logging
 from jax._src import traceback_util
 traceback_util.register_exclusion(__file__)
 
@@ -33,6 +32,8 @@ from jax._src.lib import xla_bridge
 from jax._src.lib import xla_client
 
 _profiler_server: Optional[xla_client.profiler.ProfilerServer] = None
+
+logger = logging.getLogger(__name__)
 
 
 def start_server(port: int):
@@ -83,14 +84,14 @@ def start_trace(log_dir, create_perfetto_link: bool = False,
   """Starts a profiler trace.
 
   The trace will capture CPU, GPU, and/or TPU activity, including Python
-  functions and JAX on-device operations. Use ``stop_trace()`` to end the trace
+  functions and JAX on-device operations. Use :func:`stop_trace` to end the trace
   and save the results to ``log_dir``.
 
   The resulting trace can be viewed with TensorBoard. Note that TensorBoard
   doesn't need to be running when collecting the trace.
 
   Only once trace may be collected a time. A RuntimeError will be raised if
-  ``start_trace()`` is called while another trace is running.
+  :func:`start_trace` is called while another trace is running.
 
   Args:
     log_dir: The directory to save the profiler trace to (usually the
@@ -134,7 +135,7 @@ def _write_perfetto_trace_file(log_dir):
     raise ValueError(f"Invalid trace folder: {latest_folder}")
   trace_json, = trace_jsons
 
-  logging.info("Loading trace.json.gz and removing its metadata...")
+  logger.info("Loading trace.json.gz and removing its metadata...")
   # Perfetto doesn't like the `metadata` field in `trace.json` so we remove
   # it.
   # TODO(sharadmv): speed this up by updating the generated `trace.json`
@@ -144,7 +145,7 @@ def _write_perfetto_trace_file(log_dir):
     del trace["metadata"]
   filename = "perfetto_trace.json.gz"
   perfetto_trace = os.path.join(latest_folder, filename)
-  logging.info("Writing perfetto_trace.json.gz...")
+  logger.info("Writing perfetto_trace.json.gz...")
   with gzip.open(perfetto_trace, "w") as fp:
     fp.write(json.dumps(trace).encode("utf-8"))
   return perfetto_trace
@@ -187,7 +188,7 @@ def stop_trace():
   """Stops the currently-running profiler trace.
 
   The trace will be saved to the ``log_dir`` passed to the corresponding
-  ``start_trace()`` call. Raises a RuntimeError if a trace hasn't been started.
+  :func:`start_trace` call. Raises a RuntimeError if a trace hasn't been started.
   """
   with _profile_state.lock:
     if _profile_state.profile_session is None:

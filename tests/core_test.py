@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,7 +37,6 @@ from jax.interpreters import partial_eval as pe
 
 from jax._src import util
 from jax._src import test_util as jtu
-from jax._src.abstract_arrays import make_shaped_array
 from jax._src.lax import lax as lax_internal
 from jax._src.lax import control_flow as lax_control_flow
 
@@ -478,7 +477,7 @@ class JaxprTypeChecks(jtu.JaxTestCase):
 
     jaxpr = new_jaxpr()
     # int, not float!
-    jaxpr.eqns[0].outvars[0].aval = make_shaped_array(jnp.int32(2))
+    jaxpr.eqns[0].outvars[0].aval = core.ShapedArray((), jnp.dtype(jnp.int32))
     self.assertRaisesRegex(
         core.JaxprTypeError,
         r"Value for variable 'b' inconsistently typed as f32\[\] "
@@ -486,8 +485,8 @@ class JaxprTypeChecks(jtu.JaxTestCase):
         lambda: core.check_jaxpr(jaxpr))
 
     jaxpr = new_jaxpr()
-    jaxpr.eqns[0].outvars[0].aval = make_shaped_array(
-      np.ones((2, 3), dtype=jnp.float32))
+    jaxpr.eqns[0].outvars[0].aval = core.ShapedArray((2, 3),
+                                                     jnp.dtype(jnp.float32))
     self.assertRaisesRegex(
         core.JaxprTypeError,
         r"Value for variable 'b' inconsistently typed as f32\[\] "

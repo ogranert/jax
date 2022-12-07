@@ -1,4 +1,4 @@
-# Copyright 2022 Google LLC
+# Copyright 2022 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,8 +13,9 @@
 # limitations under the License.
 """Module for state."""
 from jax._src.state.types import (ShapedArrayRef, ReadEffect, WriteEffect,
-                                  AccumEffect, StateEffect)
+                                  AccumEffect, StateEffect, RefEffect,
+                                  get_ref_state_effects)
 from jax._src.state.primitives import (ref_get, ref_set, ref_swap,
                                        ref_addupdate, get_p, swap_p,
                                        addupdate_p)
-from jax._src.state.discharge import discharge_state
+from jax._src.state.discharge import discharge_state, register_discharge_rule

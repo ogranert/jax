@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ from jax.config import config
 TPU_DRIVER_MODE = 0
 
 
-def setup_tpu(tpu_driver_version='tpu_driver_nightly'):
+def setup_tpu(tpu_driver_version='tpu_driver_20221109'):
   """Sets up Colab to run on TPU.
 
   Note: make sure the Colab Runtime is set to Accelerator: TPU.
@@ -30,9 +30,7 @@ def setup_tpu(tpu_driver_version='tpu_driver_nightly'):
   Args
   ----
   tpu_driver_version : (str) specify the version identifier for the tpu driver.
-    Defaults to "tpu_driver_nightly". Occasionally the nightly release contains bugs,
-    in which case a workaround is to use a known working version from a previous date,
-    for example "tpu_driver-0.1dev20211031".
+    Set to "tpu_driver_nightly" to use the nightly tpu driver build.
   """
   global TPU_DRIVER_MODE
 
@@ -45,3 +43,5 @@ def setup_tpu(tpu_driver_version='tpu_driver_nightly'):
   # The following is required to use TPU Driver as JAX's backend.
   config.FLAGS.jax_xla_backend = "tpu_driver"
   config.FLAGS.jax_backend_target = "grpc://" + os.environ['COLAB_TPU_ADDR']
+  # TODO(skyewm): Remove this after SPMD is supported for colab tpu.
+  config.update('jax_array', False)

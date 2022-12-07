@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
+import collections
+import dataclasses
 from functools import partial
 from typing import (Any, Callable, Dict, Hashable, Iterable, Optional, Sequence,
                     Set, Tuple, Type, Union)
@@ -23,31 +26,139 @@ from jax.config import config
 from jax import core
 from jax.core import raise_to_shaped, Trace, Tracer
 from jax._src import source_info_util
-from jax._src.tree_util import tree_unflatten, tree_flatten
+from jax._src.tree_util import (tree_unflatten, tree_flatten,
+                                register_pytree_node)
 from jax._src.ad_util import (add_jaxvals, add_jaxvals_p, zeros_like_jaxval,
                               zeros_like_p, Zero)
 from jax import linear_util as lu
-from jax._src.util import (unzip2, unzip3, safe_map, safe_zip, wrap_name,
-                           split_list, canonicalize_axis, moveaxis,
-                           as_hashable_function, curry, memoize,
-                           weakref_lru_cache)
+from jax._src.util import (unzip2, unzip3, safe_map, safe_zip, split_list,
+                           canonicalize_axis, moveaxis, as_hashable_function,
+                           curry, memoize, weakref_lru_cache)
 from jax.interpreters import partial_eval as pe
 
-map = safe_map
+Array = Any
+map, unsafe_map = safe_map, map
+zip, unsafe_zip = safe_zip, zip
+
+
+# Piles
+
+# i:(Fin 3) => f32[[3, 1, 4].i]
+@dataclasses.dataclass(frozen=True)
+class PileTy:
+  binder: core.Var
+  length: Union[int, Tracer, core.Var]
+  elt_ty: core.DShapedArray
+  def __repr__(self) -> str:
+    return f'Var{id(self.binder)}:{self.length} => {self.elt_ty}'
+  replace = dataclasses.replace
+
+# [3, 1, 4].i
+@dataclasses.dataclass(frozen=True)
+class IndexedAxisSize:
+  idx: core.Var
+  lengths: Union[Array, core.Var, Tracer]
+  def __repr__(self) -> str:
+    return f'{str(self.lengths)}.Var{id(self.idx)}'
+  replace = dataclasses.replace
+
+# Pile(aval=a:3 => f32[[3 1 4].a],
+#      data=DeviceArray([0., 1., 2., 0., 0., 1., 2., 3.], dtype=float32))
+@dataclasses.dataclass(frozen=True)
+class Pile:
+  aval: PileTy
+  data: Array
+
+# To vmap over a pile, one must specify the axis as PileAxis.
+class PileAxis: pass
+pile_axis = PileAxis()
+
+# As a temporary measure before we have more general JITable / ADable interfaces
+# (analogues to vmappable), to enable Piles to be used with other
+# transformations and higher-order primitives (primarily jit, though also grad
+# with allow_int=True) we register them as pytrees.
+# TODO(mattjj): add JITable / ADable interfaces, remove this pytree registration
+def _pile_flatten(pile):
+  lengths = []
+  new_shape = [lengths.append(d.lengths) or d.replace(lengths=len(lengths))
+               if type(d) is IndexedAxisSize else d
+               for d in pile.aval.elt_ty.shape]
+  elt_ty = pile.aval.elt_ty.update(shape=tuple(new_shape))
+  aval = pile.aval.replace(elt_ty=elt_ty)
+  return (lengths, pile.data), aval
+def _pile_unflatten(aval, x):
+  lengths, data = x
+  new_shape = [d.replace(lengths=lengths[d.lengths - 1])
+               if type(d) is IndexedAxisSize else d
+               for d in aval.elt_ty.shape]
+  elt_ty = aval.elt_ty.update(shape=tuple(new_shape))
+  aval = aval.replace(elt_ty=elt_ty)
+  return Pile(aval, data)
+register_pytree_node(Pile, _pile_flatten, _pile_unflatten)
+
+def _pile_result(axis_size, axis, segment_lens, x):
+  binder = core.Var(0, '', core.ShapedArray((), np.dtype('int32')))
+  shape = list(x.shape)
+  shape[axis] = IndexedAxisSize(binder, segment_lens)
+  elt_ty = core.DShapedArray(tuple(shape), x.dtype, x.weak_type)
+  return Pile(PileTy(binder, axis_size, elt_ty), x)
+
+@dataclasses.dataclass(frozen=True)
+class ConcatAxis:
+  axis: int
+  segment_lengths: Array
+
 
 def _update_annotation(
     f: lu.WrappedFun, orig_type: Optional[core.InputType],
     axis_size: core.AxisSize, axis_name: core.AxisName,
-    in_dims: Sequence[Optional[int]]) -> lu.WrappedFun:
+    explicit_in_dims: Sequence[Optional[Union[int, ConcatAxis]]],
+    segment_lens: Sequence[Array],
+  ) -> lu.WrappedFun:
   if orig_type is None: return f
-  if isinstance(axis_size, core.Tracer):
-    in_type_ = [(core.unmapped_aval(core.DBIdx(0), axis_name, dim, aval), keep)
-                for dim, (aval, keep) in zip(in_dims, orig_type)]
-    in_type = [(axis_size.aval, False), *in_type_]
-  else:
-    in_type = [(core.unmapped_aval(axis_size, axis_name, dim, aval), keep)
-               for dim, (aval, keep) in zip(in_dims, orig_type)]
-  return lu.annotate(f, tuple(in_type))
+  # By convention, `explicit_in_dims` only accounts for explicit arguments.
+  assert len(explicit_in_dims) == sum(explicit for _, explicit in orig_type)
+  # We need to:
+  #  * if `axis_size` is dynamic, add a new implicit binder (type) for it;
+  #  * for each element of `segment_lengths`, add a new explicit binder for it;
+  #  * drop other implicit binders, replacing DBIdx which refer to them with
+  #    Name objects;
+  #  * for each (aval, in_dim) pair: if int-valued in_dim, add batch axis (int
+  #    size if `axis_size` is int, otherwise Name); if ConcatAxis-valued in_dim,
+  #    add batch axis (int if corresponding segment_lengths is concrete, Name if
+  #    not);
+  #  * generate full in_type with implicit args too.
+
+  class Name:
+    def __init__(self, a): self.a = a
+  names = [Name(a) for a, _  in orig_type]
+  avals = [a.update(shape=tuple(names[d.val] if type(d) is pe.DBIdx else d  # type: ignore
+                                for d in a.shape))
+           if type(a) is core.DShapedArray else a for a, e in orig_type if e]
+
+  new_avals = [core.raise_to_shaped(core.get_aval(s)) for s in segment_lens]
+  sz = Name(axis_size.aval) if isinstance(axis_size, Tracer) else axis_size
+  for a, d in zip(avals, explicit_in_dims):
+    if isinstance(d, ConcatAxis):
+      s = segment_lens[d.segment_lengths.val]
+      if isinstance(core.get_aval(s), core.ConcreteArray):
+        shape = list(a.shape)  # type: ignore
+        shape[d.axis] = int(s.sum())  # specialize on shape if we can
+        new_avals.append(a.update(shape=tuple(shape)))
+      else:
+        new_avals.append(a)
+    else:
+      new_avals.append(core.unmapped_aval(sz, axis_name, d, a))  # type: ignore
+
+  mentioned = {d for a in new_avals if type(a) is core.DShapedArray
+               for d in a.shape if type(d) is Name}
+  expl_names = set(map(Name, new_avals))
+  impl_names = mentioned - expl_names  # type: ignore
+  impl_part = [(n.a, False) for n in impl_names]  # type: ignore
+  name_map = {n: pe.DBIdx(i) for i, n in enumerate((*impl_names, *expl_names))}
+  expl_part = [(a.update(shape=tuple(name_map.get(d, d) for d in a.shape))
+                if type(a) is core.DShapedArray else a, True) for a in new_avals]
+  return lu.annotate(f, (*impl_part, *expl_part))
 
 ### vmappable typeclass
 
@@ -55,7 +166,6 @@ Vmappable = Any
 Elt = Any
 MapSpec = Any
 AxisSize = Any
-Array = Any
 GetIdx = Callable[[], Tracer]  # TODO(mattjj): revise this laziness
 ToEltHandler = Callable[[Callable, GetIdx, Vmappable, MapSpec], Elt]
 FromEltHandler = Callable[[Callable, AxisSize, Elt, MapSpec], Vmappable]
@@ -65,10 +175,18 @@ def to_elt(trace: Trace, get_idx: GetIdx, x: Vmappable, spec: MapSpec) -> Elt:
   handler = to_elt_handlers.get(type(x))
   if handler:
     return handler(partial(to_elt, trace, get_idx), get_idx, x, spec)
-  else:
+  elif type(x) is Pile:
+    if spec is not pile_axis:
+      raise TypeError("pile input without using pile_axis in_axes spec")
+    (d, ias), = ((i, sz) for i, sz in enumerate(x.aval.elt_ty.shape)
+                 if type(sz) is IndexedAxisSize)
+    return BatchTracer(trace, x.data, ConcatAxis(d, ias.lengths))  # type: ignore
+  elif isinstance(spec, int) or spec is None:
     spec = spec and canonicalize_axis(spec, len(np.shape(x)))
     return (BatchTracer(trace, x, spec, source_info_util.current())
             if spec is not None else x)
+  else:
+    assert False
 to_elt_handlers: Dict[Type, ToEltHandler] = {}
 
 def from_elt(trace: 'BatchTrace', axis_size: AxisSize, x: Elt, spec: MapSpec
@@ -76,8 +194,14 @@ def from_elt(trace: 'BatchTrace', axis_size: AxisSize, x: Elt, spec: MapSpec
   handler = from_elt_handlers.get(type(x))
   if handler:
     return handler(partial(from_elt, trace), axis_size, x, spec)
+  x_ = trace.full_raise(x)
+  val, bdim = x_.val, x_.batch_dim
+  if type(bdim) is ConcatAxis:
+    if spec is not pile_axis:
+      # TODO(mattjj): improve this error message
+      raise TypeError("ragged output without using pile_axis out_axes spec")
+    return _pile_result(axis_size, bdim.axis, bdim.segment_lengths, val)
   else:
-    x_ = trace.full_raise(x)
     return matchaxis(trace.axis_name, axis_size, x_.batch_dim, spec, x_.val)
 from_elt_handlers: Dict[Type, FromEltHandler] = {}
 
@@ -98,7 +222,7 @@ def register_vmappable(data_type: Type, spec_type: Type, axis_size_type: Type,
   from_elt_handlers[data_type] = from_elt
   if make_iota: make_iota_handlers[axis_size_type] = make_iota
 vmappables: Dict[Type, Tuple[Type, Type]] = {}
-spec_types: Set[Type] = set()
+spec_types: Set[Type] = {PileAxis}
 
 def unregister_vmappable(data_type: Type) -> None:
   spec_type, axis_size_type = vmappables.pop(data_type)
@@ -109,7 +233,7 @@ def unregister_vmappable(data_type: Type) -> None:
     del make_iota_handlers[axis_size_type]
 
 def is_vmappable(x: Any) -> bool:
-  return type(x) in vmappables
+  return type(x) is Pile or type(x) in vmappables
 
 @lu.transformation_with_aux
 def flatten_fun_for_vmap(in_tree, *args_flat):
@@ -123,16 +247,17 @@ def flatten_fun_for_vmap(in_tree, *args_flat):
 NotMapped = type(None)
 not_mapped = None
 
+
 class BatchTracer(Tracer):
   __slots__ = ['val', 'batch_dim', 'source_info']
 
-  def __init__(self, trace, val, batch_dim: Optional[int],
+  def __init__(self, trace, val, batch_dim: Union[NotMapped, int, ConcatAxis],
                source_info: Optional[source_info_util.SourceInfo] = None):
     if config.jax_enable_checks:
-      assert type(batch_dim) in (int, NotMapped)
+      assert type(batch_dim) in (NotMapped, int, ConcatAxis)
       if type(batch_dim) is int:
         aval = raise_to_shaped(core.get_aval(val))
-        assert batch_dim is not_mapped or 0 <= batch_dim < len(aval.shape)  # type: ignore
+        assert 0 <= batch_dim < len(aval.shape)  # type: ignore
     self._trace = trace
     self.val = val
     self.batch_dim = batch_dim
@@ -143,7 +268,14 @@ class BatchTracer(Tracer):
     aval = raise_to_shaped(core.get_aval(self.val))
     if self.batch_dim is not_mapped:
       return aval
-    return core.mapped_aval(aval.shape[self.batch_dim], self.batch_dim, aval)
+    elif type(self.batch_dim) is int:
+      return core.mapped_aval(aval.shape[self.batch_dim], self.batch_dim, aval)
+    elif type(self.batch_dim) is ConcatAxis:
+      shape = list(aval.shape)
+      size_tracer = BatchTracer(self._trace, self.batch_dim.segment_lengths, 0)
+      shape[self.batch_dim.axis] = size_tracer
+      return core.DShapedArray(shape=tuple(shape), dtype=aval.dtype,
+                               weak_type=aval.weak_type)
 
   def full_lower(self):
     if self.batch_dim is not_mapped:
@@ -154,11 +286,17 @@ class BatchTracer(Tracer):
   def _origin_msg(self):
     if self.source_info is None:
       return ""
-    return ("\nThis Tracer was created on line "
-            f"{source_info_util.summarize(self.source_info)}")
+    return (f"\nThis BatchTracer with object id {id(self)} was created on line:"
+            f"\n  {source_info_util.summarize(self.source_info)}")
 
   def _contents(self):
     return [('val', self.val), ('batch_dim', self.batch_dim)]
+
+  def get_referent(self):
+    if self.batch_dim is None or type(self.batch_dim) is int:
+      return core.get_referent(self.val)
+    else:  # TODO(mattjj): could handle the ConcatAxis case?
+      return self
 
 class BatchTrace(Trace):
 
@@ -196,8 +334,9 @@ class BatchTrace(Trace):
     if self.axis_name is core.no_axis_name:
       # If axis name is `no_axis_name` we can't find it via `core.axis_name` so
       # we reconstruct it from the information we have available
-      axis_size, = core.dedup_referents(x.shape[d] for x, d in zip(vals, dims)
-                                        if d is not not_mapped)
+      sizes = (x.shape[d] if type(d) is int else len(d.segment_lengths)
+               for x, d in zip(vals, dims) if d is not not_mapped)
+      axis_size, = core.dedup_referents(sizes)
       return core.AxisEnvFrame(self.axis_name, axis_size, self.main)
     return core.axis_frame(self.axis_name)
 
@@ -218,27 +357,26 @@ class BatchTrace(Trace):
     src = source_info_util.current()
     if primitive.multiple_results:
       return [BatchTracer(self, x, d, src) for x, d in zip(val_out, dim_out)]
-      return map(partial(BatchTracer, self), val_out, dim_out)
     else:
       return BatchTracer(self, val_out, dim_out, src)
 
   def process_call(self, call_primitive, f, tracers, params):
     assert call_primitive.multiple_results
-    if config.jax_experimental_name_stack:
-      params = dict(params, name=params.get('name', f.__name__))
-    else:
-      params = dict(params, name=wrap_name(params.get('name', f.__name__), 'vmap'))
+    params = dict(params, name=params.get('name', f.__name__))
     vals, dims = unzip2((t.val, t.batch_dim) for t in tracers)
     if all(bdim is not_mapped for bdim in dims):
       return call_primitive.bind(f, *vals, **params)
-    else:
-      f_, dims_out = batch_subtrace(f, self.main, dims)
-      axis_size, = core.dedup_referents(x.shape[d] for x, d in zip(vals, dims)
-                                        if d is not not_mapped)
-      f_ = _update_annotation(f_, f.in_type, axis_size, self.axis_name, dims)
-      vals_out = call_primitive.bind(f_, *vals, **params)
-      src = source_info_util.current()
-      return [BatchTracer(self, v, d, src) for v, d in zip(vals_out, dims_out())]
+    sizes = (x.shape[d] if type(d) is int else len(d.segment_lengths)
+             for x, d in zip(vals, dims) if d is not not_mapped)
+    axis_size, = core.dedup_referents(sizes)
+    segment_lens, dims = unpack_concat_axes(dims)
+    f_, dims_out = batch_subtrace(f, self.main, tuple(dims))
+    f_ = _update_annotation(f_, f.in_type, axis_size, self.axis_name, dims,
+                            segment_lens)
+    vals_out = call_primitive.bind(f_, *segment_lens, *vals, **params)
+    vals_out, dims_out = reassemble_concat_axes(vals_out, dims_out())
+    src = source_info_util.current()
+    return [BatchTracer(self, v, d, src) for v, d in zip(vals_out, dims_out)]
 
   def post_process_call(self, call_primitive, out_tracers, params):
     vals, dims, srcs = unzip3((t.val, t.batch_dim, t.source_info)
@@ -285,10 +423,10 @@ class BatchTrace(Trace):
                      for out_axis, d in zip(out_axes_thunk(), dims_out()))
       new_params = dict(params, in_axes=new_in_axes, out_axes_thunk=new_out_axes_thunk)
       vals_out = map_primitive.bind(f, *vals, **new_params)
-      dims_out = (d + 1 if both_mapped(out_axis, d) and out_axis <= d else d
-                  for d, out_axis in zip(dims_out(), out_axes_thunk()))
+      dims_out_ = [d + 1 if both_mapped(out_axis, d) and out_axis <= d else d
+                   for d, out_axis in zip(dims_out(), out_axes_thunk())]
       src = source_info_util.current()
-      return [BatchTracer(self, v, d, src) for v, d in zip(vals_out, dims_out)]
+      return [BatchTracer(self, v, d, src) for v, d in zip(vals_out, dims_out_)]
 
   def post_process_map(self, call_primitive, out_tracers, params):
     vals, dims, srcs = unzip3((t.val, t.batch_dim, t.source_info)
@@ -345,7 +483,8 @@ class BatchTrace(Trace):
     out_vals = prim.bind(fun, fwd, bwd, *in_vals, out_trees=out_trees)
     fst, out_dims = lu.merge_linear_aux(out_dims1, out_dims2)
     if not fst:
-      out_dims = out_dims[-len(out_vals) % len(out_dims):]
+      _, res_tree = out_trees()
+      _, out_dims = split_list(out_dims, [res_tree.num_leaves])
     src = source_info_util.current()
     return [BatchTracer(self, v, d, src) for v, d in zip(out_vals, out_dims)]
 
@@ -454,15 +593,36 @@ def vtile(f_flat: lu.WrappedFun,
 
 @lu.transformation_with_aux
 def batch_subtrace(main, in_dims, *in_vals):
-  # used in e.g. process_call
   trace = main.with_cur_sublevel()
   in_dims = in_dims() if callable(in_dims) else in_dims
+  in_vals, in_dims = reassemble_concat_axes(in_vals, in_dims)
   in_tracers = [BatchTracer(trace, x, dim, source_info_util.current())
                 if dim is not None else x for x, dim in zip(in_vals, in_dims)]
   outs = yield in_tracers, {}
   out_tracers = map(trace.full_raise, outs)
   out_vals, out_dims = unzip2((t.val, t.batch_dim) for t in out_tracers)
-  yield out_vals, out_dims
+  segment_lens, out_dims = unpack_concat_axes(out_dims)
+  yield (*segment_lens, *out_vals), out_dims
+
+def unpack_concat_axes(dims):
+  if not any(type(d) is ConcatAxis for d in dims):
+    return [], dims
+  concat_axis_map = collections.OrderedDict()
+  def convert(d: ConcatAxis) -> ConcatAxis:
+    _, dbidx = concat_axis_map.setdefault(
+        id(core.get_referent(d.segment_lengths)),
+        (d.segment_lengths, pe.DBIdx(len(concat_axis_map))))
+    return ConcatAxis(d.axis, dbidx)
+  new_dims = [convert(d) if isinstance(d, ConcatAxis) else d for d in dims]
+  segment_lens = [s for s, _ in concat_axis_map.values()]
+  return segment_lens, new_dims
+
+def reassemble_concat_axes(vals, dims):
+  idxs = {d.segment_lengths.val for d in dims if isinstance(d, ConcatAxis)}
+  dims = [ConcatAxis(d.axis, vals[d.segment_lengths.val])
+          if isinstance(d, ConcatAxis) else d for d in dims]
+  vals = [x for i, x in enumerate(vals) if i not in idxs]
+  return vals, dims
 
 
 ### API for batching jaxprs
@@ -497,7 +657,7 @@ def _batch_jaxpr_axes(closed_jaxpr, axis_size, in_axes, out_axes_dest,
   f, out_batched = _batch_jaxpr_inner(f, axis_size, out_axes_dest)
   f = _batch_jaxpr_outer(f, axis_name, axis_size, in_axes, main_type)
   avals_in = [core.unmapped_aval(axis_size, axis_name, b, aval) if b is not not_mapped
-              else aval for aval, b in zip(closed_jaxpr.in_avals, in_axes)]
+              else aval for aval, b in unsafe_zip(closed_jaxpr.in_avals, in_axes)]
   jaxpr_out, _, consts = pe.trace_to_jaxpr_dynamic(f, avals_in)
   return core.ClosedJaxpr(jaxpr_out, consts), out_batched()
 
@@ -512,7 +672,7 @@ def _batch_jaxpr_inner(axis_size, out_axes_dest, main, in_axes, *in_vals):
 
   out_axes_dest = [(None if src is not_mapped else 0)
                    if dst is zero_if_mapped else dst
-                   for src, dst in zip(out_axes, out_axes_dest)]
+                   for src, dst in unsafe_zip(out_axes, out_axes_dest)]
   if len(out_axes_dest) != len(out_axes):
     out_axis_dest, = out_axes_dest
     out_axes_dest = [out_axis_dest] * len(out_axes)
@@ -527,7 +687,7 @@ def _batch_jaxpr_outer(axis_name, axis_size, in_dims, main_type, *in_vals):
     axis_size, = {x.shape[d] for x, d in zip(in_vals, in_dims) if d is not not_mapped}
   in_dims = in_dims() if callable(in_dims) else in_dims
   in_dims = [canonicalize_axis(ax, np.ndim(x)) if isinstance(ax, int)
-             else ax for x, ax in zip(in_vals, in_dims)]
+             else ax for x, ax in unsafe_zip(in_vals, in_dims)]
   with core.new_main(main_type, axis_name=axis_name) as main:
     with core.extend_axis_env(axis_name, axis_size, main):
       out_vals = yield (main, in_dims, *in_vals), {}
@@ -551,7 +711,8 @@ zero_if_mapped = ZeroIfMapped()
 
 @lu.transformation_with_aux
 def batch_custom_jvp_subtrace(main, in_dims, *in_vals):
-  size, = {x.shape[d] for x, d in zip(in_vals, in_dims) if d is not not_mapped}
+  size, = {x.shape[d] for x, d in zip(in_vals, in_dims * 2)
+           if d is not not_mapped}
   trace = main.with_cur_sublevel()
   in_tracers = [BatchTracer(trace, val, dim) if dim is not None else val
                 for val, dim in zip(in_vals, in_dims * 2)]
@@ -656,11 +817,34 @@ def defreducer(prim):
 def reducer_batcher(prim, batched_args, batch_dims, axes, **params):
   operand, = batched_args
   bdim, = batch_dims
-  axes = tuple(np.where(np.less(axes, bdim), axes, np.add(axes, 1)))
-  bdim_out = int(list(np.delete(np.arange(operand.ndim), axes)).index(bdim))
-  if 'input_shape' in params:
-    params = dict(params, input_shape=operand.shape)
-  return prim.bind(operand, axes=axes, **params), bdim_out
+  if isinstance(bdim, int):
+    axes = tuple(np.where(np.less(axes, bdim), axes, np.add(axes, 1)))
+    bdim_out = int(list(np.delete(np.arange(operand.ndim), axes)).index(bdim))
+    if 'input_shape' in params:
+      params = dict(params, input_shape=operand.shape)
+    return prim.bind(operand, axes=axes, **params), bdim_out
+  elif isinstance(bdim, ConcatAxis):
+    if bdim.axis in axes:
+      other_axes = [i for i in axes if i != bdim.axis]
+      if other_axes:
+        operand = prim.bind(operand, axes=other_axes, **params)
+      c_axis = bdim.axis - sum(d < bdim.axis for d in other_axes)
+      operand = bdim_at_front(operand, c_axis, operand.shape[c_axis])
+      return segment_sum(operand, bdim.segment_lengths), 0
+    else:
+      raise NotImplementedError  # TODO(mattjj)
+  else:
+    assert False
+
+# TODO(mattjj): replace with jax.lax.ops.segment_sum (once it's easier to trace
+# under dynamic shapes)
+def segment_sum(operand, segment_lens):
+  scat_idx = jax.numpy.cumsum(segment_lens) - segment_lens
+  segment_ids = jax.numpy.cumsum(
+      jax.numpy.zeros(operand.shape[0], 'int32').at[scat_idx].set(1)) - 1
+  out = jax.numpy.zeros((len(segment_lens), *operand.shape[1:]),
+                        operand.dtype).at[segment_ids].add(operand)
+  return out
 
 ### general utilities for manipulating axes on jaxpr types (not vmappables)
 
@@ -671,6 +855,12 @@ def broadcast(x, sz, axis):
   return jax.lax.broadcast_in_dim(x, shape, broadcast_dims)
 
 def matchaxis(axis_name, sz, src, dst, x, sum_match=False):
+  if dst == pile_axis:
+    x = bdim_at_front(x, src, sz)
+    elt_ty = x.aval.update(shape=x.shape[1:])
+    aval = PileTy(core.Var(0, '', core.ShapedArray((), np.dtype('int32'))),
+                  x.shape[0], elt_ty)
+    return Pile(aval, x)
   try:
     _ = core.get_aval(x)
   except TypeError as e:
@@ -687,8 +877,7 @@ def matchaxis(axis_name, sz, src, dst, x, sum_match=False):
   else:
     if (not isinstance(axis_name, core._TempAxisName) and
         axis_name is not core.no_axis_name):
-      raise ValueError(f'vmap has mapped output (axis_name={axis_name}) '
-                       f'but out_axes is {dst}')
+      raise ValueError(f'vmap has mapped output ({axis_name=}) but out_axes is {dst}')
     else:
       raise ValueError(f'vmap has mapped output but out_axes is {dst}')
 

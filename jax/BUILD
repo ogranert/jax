@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -99,8 +99,6 @@ py_library_providing_imports_info(
         "experimental/maps.py",
         "experimental/pjit.py",
         "experimental/global_device_array.py",
-        "experimental/array.py",
-        "experimental/sharding.py",
         "experimental/multihost_utils.py",
         # until checkify is moved out of experimental
         "experimental/checkify.py",
@@ -110,6 +108,7 @@ py_library_providing_imports_info(
         "experimental/compilation_cache/cache_interface.py",
     ],
     lib_rule = pytype_library,
+    pytype_srcs = glob(["_src/**/*.pyi"]),
     visibility = ["//visibility:public"],
     deps = select({
                ":enable_jaxlib_build": [":jaxlib_deps"],
@@ -148,11 +147,28 @@ pytype_library(
 
 pytype_library(
     name = "experimental_sparse",
-    srcs = glob([
-        "experimental/sparse/*.py",
-    ]),
+    srcs = glob(
+        [
+            "experimental/sparse/*.py",
+        ],
+        exclude = ["experimental/sparse/test_util.py"],
+    ),
     visibility = ["//visibility:public"],
     deps = [":jax"],
+)
+
+pytype_library(
+    name = "sparse_test_util",
+    testonly = 1,
+    srcs = [
+        "experimental/sparse/test_util.py",
+    ],
+    visibility = [":internal"],
+    deps = [
+        ":experimental_sparse",
+        ":jax",
+        ":test_util",
+    ] + py_deps("numpy"),
 )
 
 pytype_library(
@@ -231,4 +247,11 @@ pytype_library(
         ":experimental",
         ":jax",
     ],
+)
+
+pytype_library(
+    name = "rnn",
+    srcs = ["experimental/rnn.py"],
+    visibility = ["//visibility:public"],
+    deps = [":jax"],
 )

@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,14 +21,12 @@ import unittest
 
 from absl import logging
 from absl.testing import absltest
-from absl.testing import parameterized
 
 import jax
 from jax import ad_checkpoint
 from jax import dtypes
 from jax import lax
 from jax import numpy as jnp
-from jax._src import lib as jaxlib
 from jax._src import source_info_util
 from jax._src import test_util as jtu
 import jax._src.lib.xla_bridge
@@ -117,8 +115,16 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
 
   def test_nested_jit(self):
     f_jax = jax.jit(lambda x: jnp.sin(jax.jit(jnp.cos)(x)))
-    f_tf = jax2tf.convert(f_jax)
-    np.testing.assert_allclose(f_jax(0.7), f_tf(0.7))
+    x = 0.7
+    self.ConvertAndCompare(f_jax, x)
+
+  def test_nested_jit_pytree(self):
+    @jax.jit
+    def f_jax(xy):
+      x, y = xy
+      return x + y
+    xy = (0.7, 0.8)
+    self.ConvertAndCompare(f_jax, xy)
 
   def test_nested_jit_is_compiled(self):
     # Check that nested jax.jit are compiled with tf.function(jit_compile=True)
@@ -186,12 +192,10 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
 
     self.assertIsNotNone(f_tf.get_concrete_function())
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-    dict(testcase_name=f"_dtype={dtype.__name__}_function={with_function}",
-         dtype=dtype,
-         with_function=with_function)
-    for dtype in [np.int64, np.float64]
-    for with_function in [True, False]))
+  @jtu.sample_product(
+    dtype=[np.int64, np.float64],
+    with_function=[True, False],
+  )
   def test_converts_64bit(self, dtype=np.int64, with_function=False):
     if not config.jax_enable_x64:
       self.skipTest("requires x64 mode")
@@ -207,40 +211,46 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     self.assertAllClose(jnp.sin(big_const),
                         f_conv(tf.constant(big_const)))
 
-  def test_64bit_behavior_enable_x64(self):
+  def test_64bit_behavior_enable_x64_readme(self):
+    # Tests some of the examples from the README
     if not config.jax_enable_x64:
       self.skipTest("requires x64 mode")
 
     # JAX and TF have different default float types if JAX_ENABLE_X64=1
-    self.assertEqual(tf.math.sin(0.7).dtype, tf.float32)
-    self.assertEqual(jnp.sin(0.7).dtype, jnp.float64)
+    self.assertEqual(tf.math.sin(3.14).dtype, tf.float32)
+    self.assertEqual(jnp.sin(3.14).dtype, jnp.float64)
 
     # jax2tf.convert has the same behavior as JAX
-    self.assertEqual(jax2tf.convert(jnp.sin)(0.7).dtype, tf.float64)
+    self.assertEqual(jax2tf.convert(jnp.sin)(3.14).dtype, tf.float64)
+    # The following will compute `sin` in float64.
+    self.assertEqual(tf.function(jax2tf.convert(jnp.sin))(tf.Variable(3.14, dtype=tf.float64)).dtype, tf.float64)
 
-  def test_64bit_behavior_not_enable_x64(self):
+    # The following will compute `sin` in float32.
+    self.assertEqual(tf.function(jax2tf.convert(jnp.sin))(tf.Variable(3.14)).dtype, tf.float32)
+
+  def test_64bit_behavior_not_enable_x64_readme(self):
+    # Tests some of the examples from the README
     if config.jax_enable_x64:
       self.skipTest("requires not x64 mode")
 
-    # JAX and TF have same default float types if JAX_ENABLE_X64=1
-    self.assertEqual(tf.math.sin(0.7).dtype, tf.float32)
-    self.assertEqual(jnp.sin(0.7).dtype, jnp.float32)
+    # JAX and TF have same default float types if JAX_ENABLE_X64=0
+    self.assertEqual(tf.math.sin(3.14).dtype, tf.float32)
+    self.assertEqual(jnp.sin(3.14).dtype, jnp.float32)
 
-    # Except that JAX forces values to 32-bit
-    self.assertEqual(jnp.sin(np.float64(0.7)).dtype, jnp.float32)
+    self.assertEqual(tf.math.sin(np.float64(3.14)).dtype, tf.float64)
+    # JAX forces values to 32-bit
+    self.assertEqual(jnp.sin(np.float64(3.14)).dtype, jnp.float32)
 
     # jax2tf.convert has the same behavior as JAX
-    self.assertEqual(jax2tf.convert(jnp.sin)(0.7).dtype, tf.float32)
-    self.assertEqual(jax2tf.convert(jnp.sin)(np.float64(0.7)).dtype, tf.float32)
+    self.assertEqual(jax2tf.convert(jnp.sin)(3.14).dtype, tf.float32)
+    self.assertEqual(jax2tf.convert(jnp.sin)(np.float64(3.14)).dtype, tf.float32)
+    self.assertEqual(tf.function(jax2tf.convert(jnp.sin))(tf.Variable(3.14, dtype=tf.float64)).dtype, tf.float32)
 
   def test_function(self):
     f_jax = jax.jit(lambda x: jnp.sin(jnp.cos(x)))
     self.ConvertAndCompare(f_jax, 0.7)
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-      dict(testcase_name=f"function={with_function}",
-           with_function=with_function)
-      for with_function in [False, True]))
+  @jtu.sample_product(with_function=[False, True])
   def test_gradients_disabled(self, with_function=False):
     f_tf = jax2tf.convert(jnp.tan, with_gradient=False)
     if with_function:
@@ -256,10 +266,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
         y = f_tf(x)
         _ = tape.gradient(y, x)
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-    dict(testcase_name=f"function={with_function}",
-         with_function=with_function)
-    for with_function in [False, True]))
+  @jtu.sample_product(with_function=[False, True])
   def test_gradients(self, with_function=True):
     def f(x, y):
       return x * x, x * y
@@ -277,10 +284,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     self.assertAllClose(5., tape.gradient(v, x))
     self.assertAllClose(4., tape.gradient(v, y))
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-    dict(testcase_name=f"function={with_function}",
-         with_function=with_function)
-    for with_function in [False, True]))
+  @jtu.sample_product(with_function=[False, True])
   def test_gradients_pytree(self, with_function=True):
     def f(xy: Tuple[float, float]) -> Dict[str, float]:
       x, y = xy
@@ -354,10 +358,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     self.assertAllClose(grad_jax.b, grad_tf[1])
 
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-    dict(testcase_name=f"function={with_function}",
-         with_function=with_function)
-    for with_function in [False, True]))
+  @jtu.sample_product(with_function=[False, True])
   def test_gradients_with_ordered_dict_input(self, with_function=True):
     def f(inputs):
       out = 0.0
@@ -380,10 +381,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     self.assertAllClose(np.array([1.]), tape.gradient(u, x).numpy())
     self.assertAllClose(np.array([1., 1.]), tape.gradient(u, y).numpy())
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-      dict(testcase_name=f"function={with_function}",
-           with_function=with_function)
-      for with_function in [False, True]))
+  @jtu.sample_product(with_function=[False, True])
   def test_gradients_with_custom_jvp(self, with_function=True):
     """Check gradients, for a function with custom JVP."""
     @jax.custom_jvp
@@ -414,10 +412,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     self.assertAllClose(4. * 4., y)
     self.assertAllClose(3. * 4., tape.gradient(y, x))
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-      dict(testcase_name=f"function={with_function}",
-           with_function=with_function)
-      for with_function in [False, True]))
+  @jtu.sample_product(with_function=[False, True])
   def test_gradients_with_custom_vjp(self, with_function=True):
     """Check gradients, for a function with custom VJP."""
     @jax.custom_vjp
@@ -484,10 +479,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     self.assertAllClose(jnp.zeros(np.shape(d_dx_jax), np.int32),
                         d_dx_tf.numpy())
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-      dict(testcase_name=f"function={with_function}",
-           with_function=with_function)
-      for with_function in [False, True]))
+  @jtu.sample_product(with_function=[False, True])
   def test_gradients_unused_argument_readme(self, with_function=False):
     # x1 and x3 are not used. x3 has integer type.
     def fn(x0, x1, x2, x3):
@@ -532,10 +524,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     self.assertAllClose(g_jax2tf[2].numpy(), np.float32(2.))
     self.assertAllClose(g_jax2tf[3].numpy(), np.int32(0))
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-      dict(testcase_name=f"function={with_function}",
-           with_function=with_function)
-      for with_function in [False, True]))
+  @jtu.sample_product(with_function=[False, True])
   def test_gradients_int_argument(self, with_function=False):
     # https://github.com/google/jax/issues/6975
     # Also issue #6975.
@@ -778,22 +767,9 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     # The computation of grad_f computes "sin" 5 times, 3 for the forward pass
     # and then to rematerialize "x2" and "x3" in the backward pass.
     arg = np.array(3.)
-    # Check that we have a Sin under a conditional
-    f_tf = tf.function(jax2tf.convert(jax.grad(remat_f)), autograph=False)
-    f_tf_graph = f_tf.get_concrete_function(arg).graph.as_graph_def()
-    if jax.config.jax_remat_opt_barrier:
-      if config.jax2tf_default_experimental_native_lowering:
-        self.assertRegex(
-          str(f_tf_graph), r"mhlo.optimization_barrier")
-      else:
-        self.assertRegex(
-            str(f_tf_graph), r"XlaOptimizationBarrier")
-    elif config.jax_experimental_name_stack:
-      self.assertRegex(str(f_tf_graph),
-                       r'transpose/jax2tf_f_/jvp/checkpoint/cond/branch_1_fun/Sin')
-    else:
-      self.assertRegex(str(f_tf_graph),
-                       r'switch_case/indexed_case/Sin')
+    f_tf = jax2tf.convert(jax.grad(remat_f))
+    f_tf_hlo = self.TfToHlo(f_tf, arg)
+    self.assertRegex(f_tf_hlo, r"opt-barrier")
 
   def test_remat_free_var(self):
     def f(x):
@@ -818,12 +794,11 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     # in JAX prior to conversion).
     def f_jax():
       return jnp.sin(1.)
-    f_tf = tf.function(jax2tf.convert(f_jax), autograph=False)
-    f_tf_graph = f_tf.get_concrete_function().graph.as_graph_def()
-    if config.jax2tf_default_experimental_native_lowering:
-      self.assertIn("mhlo.sine", str(f_tf_graph))
-    else:
-      self.assertIn('op: "Sin"', str(f_tf_graph))
+    f_tf = jax2tf.convert(f_jax)
+    # for native lowering the HLO we get from TF is constant-folded, so this
+    # test fails.
+    if not config.jax2tf_default_experimental_native_lowering:
+      self.assertIn("sine(", self.TfToHlo(f_tf))
 
   def test_convert_of_nested_independent_jit(self):
     def func(x):
@@ -860,10 +835,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
         ValueError, "convert must be used outside all JAX transformations"):
       jax2tf.convert(outer)(2.)
 
-
-  @parameterized.named_parameters(jtu.cases_from_list(
-    dict(testcase_name=f"_{transform}", transform=transform)
-    for transform in ["jit", "jvp", "grad", "vmap"]))
+  @jtu.sample_product(transform=["jit", "jvp", "grad", "vmap"])
   def test_convert_under_transform_error(self, transform="vmap"):
     def outer(y):
       return jax2tf.convert(jnp.sin)(y)  # Inner convert takes tracer args
@@ -872,9 +844,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
         ValueError, "convert must be used outside all JAX transformations"):
       self.TransformConvertAndCompare(outer, np.ones((4,)), transform)
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-    dict(testcase_name=f"_{transform}", transform=transform)
-    for transform in ["jit", "jvp", "grad", "vmap"]))
+  @jtu.sample_product(transform=["jit", "jvp", "grad", "vmap"])
   def test_convert_under_transform_error_non_tracer(self, transform="vmap"):
     def outer(y):
       sin_1 = jax2tf.convert(jnp.sin)(1.)  # Inner convert takes non-tracer arg
@@ -885,23 +855,21 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
       self.TransformConvertAndCompare(outer, np.ones((4,)), transform)
 
   def test_name_scope(self):
-    @tf.function(autograph=False)
-    def run():
+    def run_tf():
       @jax.named_call
-      def my_test_function(x):
+      def my_test_function_jax(x):
         return x * x
 
-      def caller(x):
-        return my_test_function(jnp.sin(x))
+      def caller_jax(x):
+        return my_test_function_jax(jnp.sin(x))
 
-      out = jax2tf.convert(caller, with_gradient=False)(2.)
+      out = jax2tf.convert(caller_jax, with_gradient=False)(2.)
       return out
-    run_graph = run.get_concrete_function().graph.as_graph_def()
-    print(str(run_graph))
     if config.jax2tf_default_experimental_native_lowering:
-      self.assertIn("my_test_function/mul", str(run_graph))
+      self.assertIn("my_test_function_jax/mul", self.TfToHlo(run_tf))
     else:
-      self.assertIn("my_test_function/jit_fn_/Mul", str(run_graph))
+      self.assertIn("my_test_function_jax/jit_fn_/Mul",
+                    str(tf.function(run_tf, autograph=False).get_concrete_function().graph.as_graph_def()))
 
   def test_bfloat16_constant(self):
     # Re: https://github.com/google/jax/issues/3942
@@ -926,6 +894,8 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
   def test_shared_constants(self):
     # Check that the constants are shared properly in converted functions
     # See https://github.com/google/jax/issues/7992.
+    if config.jax2tf_default_experimental_native_lowering:
+      raise unittest.SkipTest("shared constants tests not interesting for native lowering")
     const = np.random.uniform(size=256).astype(np.float32)  # A shared constant
     def f(x):
       return x + const + const + const + const
@@ -936,6 +906,8 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
   def test_shared_constants_under_cond(self):
     # Check that the constants are shared properly in converted functions
     # See https://github.com/google/jax/issues/7992.
+    if config.jax2tf_default_experimental_native_lowering:
+      raise unittest.SkipTest("shared constants tests not interesting for native lowering")
     const = np.random.uniform(size=256).astype(np.float32)  # A shared constant
     x = np.ones((256,), dtype=np.float32)
     def f1(x):
@@ -948,6 +920,8 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
 
   def test_shared_constants_under_scan(self):
     # See https://github.com/google/jax/issues/7992.
+    if config.jax2tf_default_experimental_native_lowering:
+      raise unittest.SkipTest("shared constants tests not interesting for native lowering")
     const = np.random.uniform(size=256).astype(np.float32)  # A shared constant
     xs = np.ones((8, 256), dtype=np.float32)
     def f1(xs):
@@ -964,6 +938,8 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
 
   def test_shared_constants_under_jit(self):
     # We do not share constants under jit.
+    if config.jax2tf_default_experimental_native_lowering:
+      raise unittest.SkipTest("shared constants tests not interesting for native lowering")
     const = np.random.uniform(size=(16, 16)).astype(np.float32)  # A shared constant
     @jax.jit
     def g_jit(x):
@@ -983,10 +959,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     self.assertAllClose(tf_fn(tf.constant(1.375, tf.bfloat16)).numpy(),
                         jnp.bfloat16(2.750))
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-      dict(testcase_name=f"function={with_function}",
-           with_function=with_function)
-      for with_function in [False, True]))
+  @jtu.sample_product(with_function=[False, True])
   def test_kwargs(self, with_function=True):
     # Re: https://github.com/google/jax/issues/6791
     def f_jax(*, x):
@@ -998,10 +971,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
       f_tf(x=np.zeros(3, dtype=np.float32)),  # Call with kwargs.
       np.zeros((), dtype=np.float32))
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-      dict(testcase_name=f"function={with_function}",
-           with_function=with_function)
-      for with_function in [False, True]))
+  @jtu.sample_product(with_function=[False, True])
   def test_grad_kwargs(self, with_function=False):
     # Re: https://github.com/google/jax/issues/6791
     x = (np.zeros(3, dtype=np.float32),
@@ -1071,7 +1041,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
         f_simple, x,
         [tf_test_util.OpMetadataGraph(tf_type="Sin",
                                       source_file=__file__,
-                                      source_line=user_frame.line_num + 2,
+                                      source_line=user_frame.start_line + 2,
                                       op_name="jax2tf(f_simple)/sin",
                                       op_type="sin")
          ]
@@ -1095,17 +1065,17 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
         f_caller, x,
         [tf_test_util.OpMetadataGraph(tf_type="Tanh",
                                       source_file=__file__,
-                                      source_line=user_frame.line_num + 4,
+                                      source_line=user_frame.start_line + 4,
                                       op_name="jax2tf(f_caller)/tanh",
                                       op_type="tanh"),
          tf_test_util.OpMetadataGraph(tf_type="Cos",
                                       source_file=__file__,
-                                      source_line=user_frame.line_num + 2,
+                                      source_line=user_frame.start_line + 2,
                                       op_name="jax2tf(f_caller)/jit(f_callee)/cos",
                                       op_type="cos"),
          tf_test_util.OpMetadataGraph(tf_type="Sin",
                                       source_file=__file__,
-                                      source_line=user_frame.line_num + 6,
+                                      source_line=user_frame.start_line + 6,
                                       op_name="jax2tf(f_caller)/sin",
                                       op_type="sin"),
          ]
@@ -1129,17 +1099,17 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
         f_caller, x,
         [tf_test_util.OpMetadataGraph(tf_type="Tanh",
                                       source_file=__file__,
-                                      source_line=user_frame.line_num + 4,
+                                      source_line=user_frame.start_line + 4,
                                       op_name="jax2tf(f_caller)/tanh",
                                       op_type="tanh"),
          tf_test_util.OpMetadataGraph(tf_type="Cos",
                                       source_file=__file__,
-                                      source_line=user_frame.line_num + 2,
+                                      source_line=user_frame.start_line + 2,
                                       op_name="jax2tf(f_caller)/named(callee)/cos",
                                       op_type="cos"),
          tf_test_util.OpMetadataGraph(tf_type="Sin",
                                       source_file=__file__,
-                                      source_line=user_frame.line_num + 6,
+                                      source_line=user_frame.start_line + 6,
                                       op_name="jax2tf(f_caller)/sin",
                                       op_type="sin"),
          ]
@@ -1170,17 +1140,17 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
         f_while_cond, x,
         [tf_test_util.OpMetadataGraph(tf_type="Cos",
                                       source_file=__file__,
-                                      source_line=user_frame.line_num + 5,
+                                      source_line=user_frame.start_line + 5,
                                       op_name="jax2tf(f_while_cond)/while/body/cos",
                                       op_type="cos"),
          tf_test_util.OpMetadataGraph(tf_type="Sin",
                                       source_file=__file__,
-                                      source_line=user_frame.line_num + 7,
+                                      source_line=user_frame.start_line + 7,
                                       op_name="jax2tf(f_while_cond)/while/body/branch_1_fun/sin",
                                       op_type="sin"),
          tf_test_util.OpMetadataGraph(tf_type="FloorMod",
                                       source_file=__file__,
-                                      source_line=user_frame.line_num + 6,
+                                      source_line=user_frame.start_line + 6,
                                       op_name="jax2tf(f_while_cond)/while/body/rem",
                                       op_type="rem"),
          ]
@@ -1215,12 +1185,12 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
         f_while, x,
         [tf_test_util.OpMetadataGraph(tf_type="Sin",
                                       source_file=__file__,
-                                      source_line=user_frame.line_num + 4,
+                                      source_line=user_frame.start_line + 4,
                                       op_name="jax2tf(f_while)/while/body/sin",
                                       op_type="sin"),
          tf_test_util.OpMetadataGraph(tf_type="LessEqual",
                                       source_file=__file__,
-                                      source_line=user_frame.line_num + 8,
+                                      source_line=user_frame.start_line + 8,
                                       op_name="jax2tf(f_while)/while/body_pred/le",
                                       op_type="le"),
          ]
@@ -1237,98 +1207,6 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
         [],
         include_xla_op_metadata=False
     )
-
-def get_serialized_computation(
-    f_jax: Callable,
-    *args,
-    abstracted_axes: Optional[Tuple[Dict[int, str]]] = None) -> str:
-  lowered = jax.jit(f_jax, abstracted_axes=abstracted_axes).lower(*args)
-  mhlo_module = lowered.compiler_ir(dialect='mhlo')
-  mhlo_module_text = mlir.module_to_string(mhlo_module)
-  if jaxlib.version <= (0, 3, 14):
-    mhlo_module_text = jax2tf.jax2tf._fixup_mhlo_module_text(mhlo_module_text)
-  logging.info(f'Serialized ir.Module = {mhlo_module_text}')
-  return mhlo_module_text
-
-
-class XlaCallModuleTest(tf_test_util.JaxToTfTestCase):
-  """Unit tests for XlaCallModule. Will move these eventually to TF."""
-  def test_simple(self):
-
-    def f_jax(x):
-      return jnp.sin(x)
-
-    x = np.ones((2, 3), dtype=np.float32)
-
-    jax_res = f_jax(x)
-    res = tfxla.call_module([x],
-                            module=get_serialized_computation(f_jax, x),
-                            Tout=[jax_res.dtype],
-                            Sout=[jax_res.shape])
-    self.assertAllClose(tf.nest.map_structure(lambda t: t.numpy(), res),
-                        [jax_res])
-
-  def test_while(self):
-    # With nested computation
-    def f_jax(count, x):
-      return lax.while_loop(lambda carry: carry[0] < count, lambda carry:
-                            (carry[0] + 1, carry[1] + 1.), (0, x))[1]
-
-    count = np.int32(5)
-    x = np.ones((2, 3), dtype=np.float32)
-
-    jax_res = f_jax(count, x)
-    res = tfxla.call_module([count, x],
-                            module=get_serialized_computation(f_jax, count, x),
-                            Tout=[jax_res.dtype],
-                            Sout=[jax_res.shape])
-    self.assertAllClose(tf.nest.map_structure(lambda t: t.numpy(), res),
-                        [jax_res])
-
-  def test_multiple_args_results(self):
-
-    def f_jax(x1, x2):
-      return (jnp.sin(x1), jnp.cos(x2))
-
-    x1 = np.ones((2, 3), dtype=np.float32)
-    x2 = np.ones((3, 4), dtype=np.float32)
-
-    jax_res = f_jax(x1, x2)
-
-    def f_tf(x1_tf, x2_tf):
-      return tfxla.call_module([x1_tf, x2_tf],
-                               module=get_serialized_computation(f_jax, x1, x2),
-                               Tout=[jax_res[0].dtype, jax_res[1].dtype],
-                               Sout=[jax_res[0].shape, jax_res[1].shape])
-
-    res = tf.function(f_tf, jit_compile=True, autograph=False)(x1, x2)
-    self.assertAllClose(tf.nest.map_structure(lambda t: t.numpy(), res),
-                        jax_res)
-
-  @unittest.skip("TODO(necula): 'mhlo.dynamic_iota' op can't be translated to XLA HLO")
-  def test_shape_poly_arange(self):
-    if not config.jax_dynamic_shapes:
-      raise unittest.SkipTest("jax_dynamic_shapes must be enabled")
-    def f_jax(x):  # x: f32[b]
-      return jnp.arange(x.shape[0]) + x
-
-    x1 = np.ones((5,), dtype=np.float32)
-    jax_res = f_jax(x1)
-
-    def f_tf(x1_tf):
-      return tfxla.call_module([x1_tf],
-                               module=get_serialized_computation(
-                                   f_jax, x1,
-                                   abstracted_axes=({
-                                       0: 'b'
-                                   },)),
-                               Tout=[jax_res.dtype],
-                               Sout=[jax_res.shape],
-                               dim_args_spec=('0.0',))
-
-    res = tf.function(f_tf, jit_compile=True, autograph=False)(x1)
-    self.assertAllClose(
-        tf.nest.map_structure(lambda t: t.numpy(), res), jax_res)
 
   # TODO(necula): figure out this failure
   @jtu.skip_on_flag("jax2tf_default_experimental_native_lowering", True)
@@ -1364,27 +1242,247 @@ class XlaCallModuleTest(tf_test_util.JaxToTfTestCase):
       # TODO(b/243146552) We can switch to ConvertAndCompare after this bug fix.
       np.array_equal(jax_out._value, np.array(tf_out))
 
-    # Test 2: use GDA as JAX function input
-    def jax_func_2(input_data, params):
-      handle = pjit(
-          jnp.matmul,
-          in_axis_resources=(P("y", "x"), P(("x", "y"),)),
-          out_axis_resources=None)
-      return handle(input_data, params)
+  @jtu.with_mesh([("x", 2)])
+  def test_pjit_basic1D(self):
 
-    with global_mesh:
-      tf_func_2 = tf.function(
-          jax2tf.convert(jax_func_2, enable_xla=True),
-          jit_compile=True,
-      )
-      jax_out_2 = jax_func_2(input_data=input_data, params=params)
-      tf_out_2 = tf_func_2(input_data=input_data, params=params)
-      # TODO(b/243146552) We can switch to ConvertAndCompare after this bug fix.
-      np.array_equal(jax_out_2._value, np.array(tf_out_2))
+    def func_jax(x, y):
+      return x + y
+
+    shape = (8, 10)
+    x = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    in_axis_resources = (P("x"), P("x"))
+    out_axis_resources = None
+    res_jax = pjit(
+        func_jax,
+        in_axis_resources=in_axis_resources,
+        out_axis_resources=out_axis_resources)(x, x)
+    module = get_serialized_computation(
+        func_jax,
+        x,
+        x,
+        use_pjit=True,
+        in_axis_resources=in_axis_resources,
+        out_axis_resources=out_axis_resources)
+
+    def f_tf(x_tf, y_tf):
+      return tfxla.call_module([x_tf, y_tf],
+                               version=2,
+                               module=module,
+                               Tout=[x.dtype],
+                               Sout=[x.shape])
+
+    res_tf = tf.function(f_tf, jit_compile=True, autograph=False)(x, x)[0]
+    self.assertAllClose(res_tf.numpy(), res_jax)
+
+  def assertAllOperationStartWith(self, g: tf.Graph, scope_name: str):
+    """Assert all operations name start with ```scope_name```.
+
+    Also the scope_name only occur one time.
+    """
+    result = g.get_operations()
+    if not result:
+      self.fail("result is empty.")
+    for op in result:
+      logging.info("tf op.name = %s", op.name)
+      if not op.name.startswith(scope_name):
+        self.fail(f"{op.name} does not start with {scope_name}.")
+
+  def test_name_scope_polymorphic(self):
+    if config.jax2tf_default_experimental_native_lowering and not config.jax_dynamic_shapes:
+      self.skipTest("shape polymorphism but --jax_dynamic_shapes is not set.")
+
+    def func_jax(x, y):
+      return jnp.sin(x) + jnp.cos(y)
+
+    func_tf = jax2tf.convert(
+        func_jax, polymorphic_shapes="(b,...)", with_gradient=True)
+
+    outer_scope = "output_a"
+
+    g = tf.Graph()
+    with g.as_default() as g:
+      with tf.name_scope(outer_scope):
+        x = tf.Variable(
+            tf.zeros(shape=(1, 5), dtype=tf.dtypes.float32), name="x")
+        y = tf.compat.v1.placeholder(tf.dtypes.float32, (None, 5), "y")
+        _ = func_tf(x, y)
+    self.assertAllOperationStartWith(g, outer_scope)
+
+    # wrap tf.function
+    g2 = tf.Graph()
+    with g2.as_default() as g:
+      with tf.name_scope(outer_scope):
+        x = tf.Variable(
+            tf.zeros(shape=(1, 5), dtype=tf.dtypes.float32), name="x")
+        y = tf.compat.v1.placeholder(tf.dtypes.float32, (None, 5), "y")
+        _ = tf.function(func_tf, jit_compile=True, autograph=False)(x, y)
+    self.assertAllOperationStartWith(g2, outer_scope)
+
+  def test_name_scope_cond(self):
+
+    def f(x):
+
+      def f_pos(x):
+        with jax.named_scope("jax_f_pos"):
+          return lax.cond(x < 1., jnp.cos, jnp.sin, x)
+
+      with jax.named_scope("jax_f_outer"):
+        return lax.cond(x > 0., f_pos, lambda x: x, x)
+
+    @tf.function(jit_compile=True, autograph=False)
+    def outer_forward():
+      with tf.name_scope("tf_outer_forward"):
+        x = 0.5
+        f_tf = jax2tf.convert(f)
+        _ = f_tf(x)
+
+    g = outer_forward.get_concrete_function().graph
+    self.assertAllOperationStartWith(g, "tf_outer_forward")
+    for func in g._functions.values():
+      self.assertAllOperationStartWith(
+          func.graph, "tf_outer_forward/jax2tf_f_/jax_f_outer")
+
+    x = tf.Variable(0.5, name="tf_outer_back/x")
+
+    @tf.function(jit_compile=True, autograph=False)
+    def outer_back():
+      with tf.name_scope("tf_outer_back"):
+        f_tf = jax2tf.convert(f)
+        with tf.GradientTape() as tape:
+          res_tf = f_tf(x)
+          _ = tape.gradient(res_tf, x)
+
+    g = outer_back.get_concrete_function().graph
+    self.assertAllOperationStartWith(g, "tf_outer_back")
+    for func in g._functions.values():
+      self.assertAllOperationStartWith(func.graph, "tf_outer_back")
+
+  def test_name_scope_while_loop(self):
+
+    def f(x):
+      with tf.name_scope("outer_scope"):
+
+        def condition(x):
+          return jnp.sum(x, keepdims=False) < 100
+
+        def body(x):
+          return jnp.add(x, 2.0)
+
+        result = jax.lax.while_loop(condition, body, x)
+        return result
+
+    tf_f = tf.function(jax2tf.convert(f), jit_compile=True, autograph=False)
+    g = tf_f.get_concrete_function(tf.zeros((1, 3))).graph
+
+    for func in g._functions.values():
+      for op in func.graph.get_operations():
+        if op.name.count(f"outer_scope/jax2tf_{f.__name__}_/while") > 1:
+          self.fail(
+              "tf graph has repeated name issue on when converting lax.while to tf.while."
+              f"See op.name = : {op.name}")
+
+def get_serialized_computation(
+    f_jax: Callable,
+    *args,
+    abstracted_axes: Optional[Tuple[Dict[int, str]]] = None,
+    use_pjit: bool = False,
+    in_axis_resources = None,
+    out_axis_resources = None) -> str:
+  if use_pjit:
+    assert not abstracted_axes
+    lowered = pjit(f_jax,
+                   in_axis_resources=in_axis_resources,
+                   out_axis_resources=out_axis_resources).lower(*args)
+  else:
+    lowered = jax.jit(f_jax, abstracted_axes=abstracted_axes).lower(*args)
+  stablehlo_module_text = mlir.module_to_string(lowered._lowering.stablehlo())
+  logging.info(f'Serialized ir.Module = {stablehlo_module_text}')
+  return stablehlo_module_text
+
+
+class XlaCallModuleTest(tf_test_util.JaxToTfTestCase):
+  """Unit tests for XlaCallModule. Will move these eventually to TF."""
+  def test_simple(self):
+
+    def f_jax(x):
+      return jnp.sin(x)
+
+    x = np.ones((2, 3), dtype=np.float32)
+
+    jax_res = f_jax(x)
+    res = tfxla.call_module([x],
+                            version=2,
+                            module=get_serialized_computation(f_jax, x),
+                            Tout=[jax_res.dtype],
+                            Sout=[jax_res.shape])
+    self.assertAllClose(tf.nest.map_structure(lambda t: t.numpy(), res),
+                        [jax_res])
+
+  def test_while(self):
+    # With nested computation
+    def f_jax(count, x):
+      return lax.while_loop(lambda carry: carry[0] < count, lambda carry:
+                            (carry[0] + 1, carry[1] + 1.), (0, x))[1]
+
+    count = np.int32(5)
+    x = np.ones((2, 3), dtype=np.float32)
+
+    jax_res = f_jax(count, x)
+    res = tfxla.call_module([count, x],
+                            version=2,
+                            module=get_serialized_computation(f_jax, count, x),
+                            Tout=[jax_res.dtype],
+                            Sout=[jax_res.shape])
+    self.assertAllClose(tf.nest.map_structure(lambda t: t.numpy(), res),
+                        [jax_res])
+
+  def test_multiple_args_results(self):
+
+    def f_jax(x1, x2):
+      return (jnp.sin(x1), jnp.cos(x2))
+
+    x1 = np.ones((2, 3), dtype=np.float32)
+    x2 = np.ones((3, 4), dtype=np.float32)
+
+    jax_res = f_jax(x1, x2)
+
+    def f_tf(x1_tf, x2_tf):
+      return tfxla.call_module([x1_tf, x2_tf],
+                               version=2,
+                               module=get_serialized_computation(f_jax, x1, x2),
+                               Tout=[jax_res[0].dtype, jax_res[1].dtype],
+                               Sout=[jax_res[0].shape, jax_res[1].shape])
+
+    res = tf.function(f_tf, jit_compile=True, autograph=False)(x1, x2)
+    self.assertAllClose(tf.nest.map_structure(lambda t: t.numpy(), res),
+                        jax_res)
+
+  @unittest.skip("TODO(necula): 'mhlo.dynamic_iota' op can't be translated to XLA HLO")
+  def test_shape_poly_arange(self):
+    if not config.jax_dynamic_shapes:
+      raise unittest.SkipTest("jax_dynamic_shapes must be enabled")
+    def f_jax(x):  # x: f32[b]
+      return jnp.arange(x.shape[0]) + x
+
+    x1 = np.ones((5,), dtype=np.float32)
+    jax_res = f_jax(x1)
+
+    def f_tf(x1_tf):
+      return tfxla.call_module([x1_tf],
+                               version=2,
+                               module=get_serialized_computation(
+                                   f_jax, x1,
+                                   abstracted_axes=({
+                                       0: 'b'
+                                   },)),
+                               Tout=[jax_res.dtype],
+                               Sout=[jax_res.shape],
+                               dim_args_spec=('0.0',))
+
+    res = tf.function(f_tf, jit_compile=True, autograph=False)(x1)
+    self.assertAllClose(
+        tf.nest.map_structure(lambda t: t.numpy(), res), jax_res)
 
 
 if __name__ == "__main__":
-  # TODO: Remove once tensorflow is 2.10.0 everywhere.
-  if not hasattr(tfxla, "optimization_barrier"):
-    jax.config.update("jax_remat_opt_barrier", False)
   absltest.main(testLoader=jtu.JaxTestLoader())

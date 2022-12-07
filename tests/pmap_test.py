@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 
 
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
 from functools import partial
 import itertools as it
 import gc
@@ -38,7 +39,7 @@ from jax._src.lax import parallel
 from jax._src import api as src_api
 from jax import random
 from jax.core import ShapedArray
-from jax import (pmap, soft_pmap, jit, vmap, jvp, grad, make_jaxpr,
+from jax import (pmap, jit, vmap, jvp, grad, make_jaxpr,
                  linearize, device_put)
 from jax._src import config as jax_config
 from jax._src import device_array
@@ -46,14 +47,19 @@ from jax._src.lib import xla_bridge
 from jax._src.util import prod, safe_map, safe_zip
 from jax.interpreters import pxla
 from jax.interpreters import xla
-from jax.experimental import array
-from jax.experimental.sharding import PmapSharding
+from jax._src import array
+from jax._src.sharding import PmapSharding
 from jax.ad_checkpoint import checkpoint as new_checkpoint
 
 from jax.config import config
 config.parse_flags_with_absl()
 
 prev_xla_flags = None
+
+
+with contextlib.suppress(ImportError):
+  import pytest
+  pytestmark = pytest.mark.multiaccelerator
 
 compatible_shapes = [[(3,)], [(3, 4), (3, 1), (1, 4)], [(2, 3, 4), (2, 1, 4)]]
 
@@ -181,6 +187,13 @@ class PythonPmapTest(jtu.JaxTestCase):
     ans = f(x)
     self.assertAllClose(ans, expected, check_dtypes=False)
 
+  def testDefaultDeviceOrdering(self):
+    # Users rely on the fact that the default order of jax.devices() matches
+    # the default order of pmap for single-host jobs.
+    device_order = jax.devices()
+    pmap_sharding = pmap(lambda x: x)(np.arange(jax.device_count())).sharding
+    self.assertListEqual(device_order, pmap_sharding.devices.tolist())
+
   def testLowerCompile(self):
     f = self.pmap(lambda x: x - lax.pmean(x, 'i'), axis_name='i')
     shape = (jax.device_count(), 4)
@@ -232,7 +245,9 @@ class PythonPmapTest(jtu.JaxTestCase):
     f_exe = f.lower(x_f32).compile()
     self.assertRaisesRegex(
         TypeError,
-        "Computation compiled for input types:\n.*float32.*\n"
+        "Computation was compiled for different input types and called with "
+        "different types. One of the mismatches is:\n"
+        "Compiled with:\n.*float32.*\n"
         "called with:\n.*int32.*",
         lambda: f_exe(x_i32))
 
@@ -287,6 +302,7 @@ class PythonPmapTest(jtu.JaxTestCase):
     f = f.lower(x).compile()
     self.assertIsInstance(f.as_text(), (str, type(None)))
 
+  @jtu.skip_on_xla_cpu_mlir
   def testLowerCompileCostAnalysis(self):
     f = self.pmap(lambda x: x - lax.pmean(x, 'i'), axis_name='i')
     shape = (jax.device_count(), 4)
@@ -294,6 +310,7 @@ class PythonPmapTest(jtu.JaxTestCase):
     f = f.lower(x).compile()
     f.cost_analysis()  # doesn't raise
 
+  @jtu.skip_on_xla_cpu_mlir
   def testLowerCompileMemoryAnalysis(self):
     f = self.pmap(lambda x: x - lax.pmean(x, 'i'), axis_name='i')
     shape = (jax.device_count(), 4)
@@ -344,6 +361,15 @@ class PythonPmapTest(jtu.JaxTestCase):
     ans = f(x)
     self.assertAllClose(ans, expected, check_dtypes=False)
 
+  def testGatherNegativeAxis(self):
+    f = self.pmap(lambda x: lax.all_gather(x, 'i', axis=-1), axis_name='i')
+
+    shape = (jax.device_count(), 4)
+    x = np.arange(prod(shape), dtype=np.float32).reshape(shape)
+    expected = np.array([x.T] * jax.device_count())
+    ans = f(x)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
   def testGatherTiled(self):
     f = self.pmap(lambda x: lax.all_gather(x, 'i', tiled=True), axis_name='i')
 
@@ -353,6 +379,29 @@ class PythonPmapTest(jtu.JaxTestCase):
     expected = np.array([x] * device_count).reshape(device_count, -1)
     ans = f(x)
     self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def testGatherTiledNegativeAxis(self):
+    f = self.pmap(lambda x: lax.all_gather(x, 'i', tiled=True, axis=-1),
+                  axis_name='i')
+
+    device_count = jax.device_count()
+    shape = (device_count, 4, 3)
+    x = np.arange(prod(shape), dtype=np.float32).reshape(shape)
+    expected = np.array([x.transpose(1, 0, 2).reshape(4, -1)] * device_count)
+    ans = f(x)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+  @parameterized.named_parameters([
+    ('Gather', lax.all_gather),
+    ('ReduceScatter', lax.psum_scatter)
+  ])
+  def testVmapOf(self, prim):
+    f = self.pmap(partial(prim, axis_name='i'), axis_name='i')
+
+    device_count = jax.device_count()
+    shape = (4, device_count, device_count)
+    x = np.arange(prod(shape), dtype=np.float32).reshape(shape)
+    self.assertAllClose(vmap(f)(x), jnp.stack([f(xs) for xs in x], axis=0))
 
   def testReduceScatter(self):
     f = self.pmap(lambda x: lax.psum_scatter(x, 'i'), axis_name='i')
@@ -556,7 +605,7 @@ class PythonPmapTest(jtu.JaxTestCase):
     f_ans = f(x, y)
     self.assertAllClose(f_ans, f_expected)
     if config.jax_array:
-      self.assertIsInstance(f_ans, array.Array)
+      self.assertIsInstance(f_ans, array.ArrayImpl)
       sharding_spec = f_ans.sharding.sharding_spec
     else:
       self.assertIsInstance(f_ans, pxla.ShardedDeviceArray)
@@ -571,7 +620,7 @@ class PythonPmapTest(jtu.JaxTestCase):
     g_ans = g(x, y)
     self.assertAllClose(g_ans, g_expected)
     if config.jax_array:
-      self.assertIsInstance(g_ans, array.Array)
+      self.assertIsInstance(g_ans, array.ArrayImpl)
       sharding_spec = g_ans.sharding.sharding_spec
     else:
       self.assertIsInstance(g_ans, pxla.ShardedDeviceArray)
@@ -722,7 +771,7 @@ class PythonPmapTest(jtu.JaxTestCase):
     y = f(x)
     self.assertIsInstance(y, jnp.ndarray)
     if config.jax_array:
-      self.assertIsInstance(y, array.Array)
+      self.assertIsInstance(y, array.ArrayImpl)
     else:
       self.assertIsInstance(y, pxla.ShardedDeviceArray)
       self.assertIsInstance(y, device_array.DeviceArray)
@@ -730,7 +779,7 @@ class PythonPmapTest(jtu.JaxTestCase):
     self.assertAllClose(y, 2 * x, check_dtypes=False)
     z = f(y)
     if config.jax_array:
-      self.assertIsInstance(z, array.Array)
+      self.assertIsInstance(z, array.ArrayImpl)
     else:
       self.assertIsInstance(z, pxla.ShardedDeviceArray)
       self.assertIsInstance(z, device_array.DeviceArray)
@@ -740,7 +789,7 @@ class PythonPmapTest(jtu.JaxTestCase):
     # test that we can pass in a regular DeviceArray
     y = f(device_put(x))
     if config.jax_array:
-      self.assertIsInstance(y, array.Array)
+      self.assertIsInstance(y, array.ArrayImpl)
     else:
       self.assertIsInstance(y, pxla.ShardedDeviceArray)
       self.assertIsInstance(y, device_array.DeviceArray)
@@ -914,13 +963,30 @@ class PythonPmapTest(jtu.JaxTestCase):
 
     self.assertAllClose(ans, expected, check_dtypes=False)
 
+  @parameterized.named_parameters(it.chain.from_iterable([
+      (name, prim, False, False),
+      (name + 'Tiled', prim, True, False),
+      (name + 'IndexGroups', prim, False, True),
+    ] for name, prim in
+    (('Gather', lax.all_gather), ('ReduceScatter', lax.psum_scatter))
+  ))
   @ignore_slow_all_to_all_warning()
-  def testGradOfGather(self):
+  def testGradOf(self, prim, tiled, use_axis_index_groups):
+    axis_index_groups = None
+    devices = jax.devices()
+
+    if use_axis_index_groups:
+      if len(devices) < 2:
+        raise SkipTest("Need at least two devices")
+      axis_index_groups = [(l.id, r.id)
+                           for l, r in np.asarray(devices).reshape(-1, 2)]
+
     @partial(self.pmap, axis_name='i')
     def f(x):
-      return lax.all_gather(x, axis_name='i')
+      return prim(x, axis_name='i', tiled=tiled,
+                  axis_index_groups=axis_index_groups)
 
-    shape = (jax.device_count(), 4)
+    shape = (len(devices), 2 if axis_index_groups else jax.device_count())
     x = np.arange(prod(shape), dtype=np.float32).reshape(shape)
     jtu.check_grads(f, (x,), 2, ["fwd", "rev"], 1e-2, 1e-2, eps=1.)
 
@@ -1545,128 +1611,6 @@ class PythonPmapTest(jtu.JaxTestCase):
       r_db = r.device_buffers
     self.assertEqual(len(r_db), 6)
 
-  @ignore_xmap_warning()
-  def testSoftPmapBatchMatmul(self):
-    if config.jax_array:
-      raise unittest.SkipTest('Does not work with `Array`.')
-    n = 4 * jax.device_count()
-    xs = np.arange(n * 2 * 3).reshape(n, 2, 3)
-    ys = np.arange(n * 3 * 4).reshape(n, 3, 4)
-    ans = soft_pmap(jnp.dot, 'i')(xs, ys)
-    expected = np.einsum('nij,njk->nik', xs, ys)
-    self.assertAllClose(ans, expected, check_dtypes=False)
-
-  @ignore_xmap_warning()
-  def testSoftPmapBatchMatmulJit(self):
-    if config.jax_array:
-      raise unittest.SkipTest('Does not work with `Array`.')
-    n = 4 * jax.device_count()
-    xs = np.arange(n * 2 * 3).reshape(n, 2, 3)
-    ys = np.arange(n * 3 * 4).reshape(n, 3, 4)
-    ans = soft_pmap(jit(jnp.dot), 'i')(xs, ys)
-    expected = np.einsum('nij,njk->nik', xs, ys)
-    self.assertAllClose(ans, expected, check_dtypes=False)
-
-  @ignore_xmap_warning()
-  def testSoftPmapPsumConstant(self):
-    if config.jax_array:
-      raise unittest.SkipTest('Does not work with `Array`.')
-    n = 4 * jax.device_count()
-    def f(_):
-      return lax.psum(1, 'i')
-    ans = soft_pmap(f, 'i')(jnp.ones(n))
-    expected = n * np.ones(n)
-    self.assertAllClose(ans, expected, check_dtypes=False)
-
-  @ignore_xmap_warning()
-  def testSoftPmapPsum(self):
-    if config.jax_array:
-      raise unittest.SkipTest('Does not work with `Array`.')
-    n = 4 * jax.device_count()
-    def f(x):
-      return x / lax.psum(x, 'i')
-    ans = soft_pmap(f, 'i')(jnp.ones(n))
-    expected = np.ones(n) / n
-    self.assertAllClose(ans, expected, check_dtypes=False)
-
-  @ignore_xmap_warning()
-  def testSoftPmapAxisIndex(self):
-    if config.jax_array:
-      raise unittest.SkipTest('Does not work with `Array`.')
-    n = 4 * jax.device_count()
-    def f(x):
-      return x * lax.axis_index('i')
-    ans = soft_pmap(f, 'i')(2 * jnp.ones(n, dtype='int32'))
-    expected = 2 * np.arange(n)
-    self.assertAllClose(ans, expected, check_dtypes=False)
-
-  @ignore_xmap_warning()
-  def testSoftPmapOfJit(self):
-    if config.jax_array:
-      raise unittest.SkipTest('Does not work with `Array`.')
-    n = 4 * jax.device_count()
-    def f(x):
-      return 3 * x
-    ans = soft_pmap(jit(f), 'i')(np.arange(n))
-    expected = 3 * np.arange(n)
-    self.assertAllClose(ans, expected, check_dtypes=False)
-
-  @ignore_xmap_warning()
-  @unittest.skip("not implemented")  # TODO(mattjj): re-implement
-  def testSoftPmapNested(self):
-    if config.jax_array:
-      raise unittest.SkipTest('Does not work with `Array`.')
-    n = 4 * jax.device_count()
-
-    @partial(soft_pmap, axis_name='i')
-    @partial(soft_pmap, axis_name='j')
-    def f(x):
-      i_size = lax.psum(1, 'i')
-      return x + lax.axis_index('i') + i_size * lax.axis_index('j')
-
-    ans = f(jnp.zeros((n, n)))
-    expected = np.arange(n ** 2).reshape(n, n).T
-    self.assertAllClose(ans, expected, check_dtypes=False)
-
-  @ignore_xmap_warning()
-  @unittest.skip("not implemented")  # TODO(mattjj): re-implement
-  def testGradOfSoftPmap(self):
-    n = 4 * jax.device_count()
-
-    @partial(soft_pmap, axis_name='i')
-    def f(x):
-      return x * lax.axis_index('i')
-
-    ans = grad(lambda x: jnp.sum(f(x)))(jnp.zeros((n, n)))
-    expected = np.repeat(np.arange(n)[:, None], n, axis=1)
-    self.assertAllClose(ans, expected, check_dtypes=False)
-
-  @ignore_xmap_warning()
-  def testSoftPmapDevicePersistence(self):
-    if config.jax_array:
-      raise unittest.SkipTest('Does not work with `Array`.')
-    device_count = jax.device_count()
-    shape = (2 * 2 * device_count, 2, 3)
-
-    # check that we can maintain device persistence across calls
-    x = np.arange(prod(shape)).reshape(shape)
-    x = soft_pmap(lambda x: x)(x)
-    self.assertIsInstance(x, pxla.ShardedDeviceArray)
-    x._npy_value = np.float32(np.nan)  # can't be coerced to ndarray for xfer
-    x = soft_pmap(lambda x: x)(x)  # doesn't crash
-    self.assertIsInstance(x, pxla.ShardedDeviceArray)
-
-  @unittest.skip("the underlying code here is broken")  # TODO(mattjj)
-  def testSoftPmapAllToAll(self):
-    if config.jax_array:
-      raise unittest.SkipTest('Does not work with `Array`.')
-    n = 4 * jax.device_count()
-    def f(x):
-      return lax.all_to_all(x, 'i', 0, 0)
-    ans = soft_pmap(f, 'i')(jnp.arange(n ** 2).reshape(n, n))
-    expected = np.arange(n ** 2).reshape(n, n).T
-    self.assertAllClose(ans, expected, check_dtypes=False)
-
   def testShardedDeviceArrayBlockUntilReady(self):
     x = np.arange(jax.device_count())
     x = self.pmap(lambda x: x)(x)
@@ -1728,7 +1672,7 @@ class PythonPmapTest(jtu.JaxTestCase):
     y = f(x)
     self.assertIsInstance(y, jnp.ndarray)
     if config.jax_array:
-      self.assertIsInstance(y, array.Array)
+      self.assertIsInstance(y, array.ArrayImpl)
     else:
       self.assertIsInstance(y, pxla.ShardedDeviceArray)
 
@@ -1768,7 +1712,7 @@ class PythonPmapTest(jtu.JaxTestCase):
 
     vals = list(range(500))
     ndevices = jax.device_count()
-    self.assertAllClose(f(jnp.array([vals] * ndevices)),
+    self.assertAllClose(f([np.array([i] * ndevices) for i in range(500)]),
                         jnp.array([sum(vals)] * ndevices))
 
   def testPostProcessMap2(self):
@@ -2046,7 +1990,7 @@ class PythonPmapTest(jtu.JaxTestCase):
       pmapped_f(inputs, np.asarray(1))
 
   @parameterized.named_parameters(
-      {"testcase_name": f"_axis_size={axis_size}", "axis_size": axis_size}
+      {"testcase_name": f"_{axis_size=}", "axis_size": axis_size}
       for axis_size in [1, 2])
   def test_grad_of_pmap_compilation_caching(self, axis_size):
     if len(jax.local_devices()) < axis_size:
@@ -2394,18 +2338,30 @@ class VmapPmapCollectivesTest(jtu.JaxTestCase):
     self.assertAllClose(pmap(pmap(f, axis_name='j'), axis_name='i')(x),
                         vmap(vmap(f, axis_name='j'), axis_name='i')(x))
 
-  def testAllGatherWithVmap(self):
+  @parameterized.named_parameters([
+    ('AllGather', lax.all_gather),
+    ('ReduceScatter', lax.psum_scatter),
+  ])
+  def testWithVmap(self, prim):
     def f(map2):
-      @partial(jax.pmap, axis_name='i')
-      @partial(map2)
-      def f(x):
-        return jax.lax.all_gather(x, 'i')
-      return f
+      return jax.pmap(map2(partial(prim, axis_name='i')), axis_name='i')
 
     if jax.device_count() < 4:
       raise SkipTest("test requires at least four devices")
-    x = jnp.ones((2, 2, 64, 64))
+    x = jnp.ones((2, 2, 2, 64))
     self.assertAllClose(f(jax.pmap)(x), f(jax.vmap)(x))
+
+  @parameterized.named_parameters(it.chain.from_iterable([
+    ('AllGather' + ('Tiled' if tiled else ''), lax.all_gather, tiled),
+    ('ReduceScatter' + ('Tiled' if tiled else ''), lax.psum_scatter, tiled),
+  ] for tiled in (False, True)))
+  def testVsVmap(self, prim, tiled):
+    if jax.device_count() < 4:
+      raise SkipTest("test requires at least four devices")
+    shape = (4, 4, 8)
+    x = jnp.arange(np.prod(shape)).reshape(shape)
+    f = partial(prim, axis_name='i', tiled=tiled)
+    self.assertAllClose(vmap(f, axis_name='i')(x), pmap(f, axis_name='i')(x))
 
 
 class PmapWithDevicesTest(jtu.JaxTestCase):
@@ -2630,12 +2586,10 @@ class PmapWithDevicesTest(jtu.JaxTestCase):
     x = jnp.arange(device_count)
     tree_util.tree_map(self.assertAllClose, f(x), {'a': x})
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-      {"testcase_name": f"_{in_axes}_{out_axes}",
-       "in_axes": in_axes, "out_axes": out_axes}
-      for in_axes in all_bdims((3, 4), (3, 1), (1, 4), pmap=True)
-      for out_axes in out_bdims((3, 4), True)
-  ))
+  @jtu.sample_product(
+    in_axes=all_bdims((3, 4), (3, 1), (1, 4), pmap=True),
+    out_axes=out_bdims((3, 4), True),
+  )
   def testPmapAllAxesGrad(self, in_axes, out_axes):
     def f(x, y, z):
       return jnp.sin(x + y) * z
@@ -2671,7 +2625,7 @@ class ShardedDeviceArrayTest(jtu.JaxTestCase):
   def testThreadsafeIndexing(self):
     # NOTE(skye): I picked these values to be big enough to cause interesting
     # execution overlap, but small enough to not use too much memory. YMMV.
-    shape = (8, 8000, 1000)
+    shape = (8, 4000, 1000)
 
     if jax.device_count() < shape[0]:
       raise SkipTest(f"requires {shape[0]} devices")
@@ -2707,7 +2661,7 @@ class ShardedDeviceArrayTest(jtu.JaxTestCase):
     self.assertIsNone(sharded_x._npy_value)
 
     if config.jax_array:
-      arr_type = array.Array
+      arr_type = array.ArrayImpl
     else:
       arr_type = device_array.DeviceArray
 
@@ -2717,7 +2671,7 @@ class ShardedDeviceArrayTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
       ('sda', False, pxla.ShardedDeviceArray, 'device_buffers'),
-      ('array', True, array.Array, '_arrays')
+      ('array', True, array.ArrayImpl, '_arrays')
   )
   def test_device_put_sharded(self, is_jax_array, array_type, buffer_attr):
     devices = jax.local_devices()
@@ -2726,6 +2680,10 @@ class ShardedDeviceArrayTest(jtu.JaxTestCase):
     with jax_config.jax_array(is_jax_array):
       y = jax.device_put_sharded(x, devices)
     self.assertIsInstance(y, array_type)
+    self.assertIsInstance(y.sharding, jax.sharding.PmapSharding)
+    for s in y.addressable_shards:
+      self.assertArraysEqual(s.data, y[s.index])
+      self.assertEqual(s.replica_id, 0)
     buffers = getattr(y, buffer_attr)
     self.assertEqual(len(buffers), len(devices))
     self.assertTrue(all(b.device() == d for b, d in zip(buffers, devices)))
@@ -2733,7 +2691,7 @@ class ShardedDeviceArrayTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
       ('sda', False, pxla.ShardedDeviceArray, 'device_buffers'),
-      ('array', True, array.Array, '_arrays')
+      ('array', True, array.ArrayImpl, '_arrays')
   )
   def test_device_put_sharded_pytree(self, is_jax_array, array_type, buffer_attr):
     devices = jax.local_devices()
@@ -2754,7 +2712,7 @@ class ShardedDeviceArrayTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
       ('sda', False, pxla.ShardedDeviceArray, 'device_buffers'),
-      ('array', True, array.Array, '_arrays')
+      ('array', True, array.ArrayImpl, '_arrays')
   )
   def test_device_put_replicated(self, is_jax_array, array_type, buffer_attr):
     devices = jax.local_devices()
@@ -2770,7 +2728,7 @@ class ShardedDeviceArrayTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
       ('sda', False, pxla.ShardedDeviceArray, 'device_buffers'),
-      ('array', True, array.Array, '_arrays')
+      ('array', True, array.ArrayImpl, '_arrays')
   )
   def test_device_put_replicated_pytree(self, is_jax_array, array_type, buffer_attr):
     devices = jax.local_devices()
@@ -2955,7 +2913,7 @@ class ShardArgsTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
       {"testcase_name":
-       f"_shape={shape}_spec={_spec_str(spec)}_arg={make_arg.__name__}"
+       f"_{shape=}_spec={_spec_str(spec)}_arg={make_arg.__name__}"
        .replace(" ", ""),
        "shape": shape, "spec": spec, "make_arg": make_arg}
       for make_arg in [numpy_array, device_array]
@@ -3022,7 +2980,7 @@ class ArrayPmapTest(jtu.JaxTestCase):
 
     expected = input_data * input_data
 
-    self.assertIsInstance(out, array.Array)
+    self.assertIsInstance(out, array.ArrayImpl)
     for s in out.addressable_shards:
       self.assertArraysEqual(s.data._arrays[0], expected[s.index])
     self.assertArraysEqual(out, expected)
@@ -3040,8 +2998,8 @@ class ArrayPmapTest(jtu.JaxTestCase):
     with jax_config.jax_array(True):
       out1, out2 = f(input_array, input_array)
 
-    self.assertIsInstance(out1, array.Array)
-    self.assertIsInstance(out2, array.Array)
+    self.assertIsInstance(out1, array.ArrayImpl)
+    self.assertIsInstance(out2, array.ArrayImpl)
     for s1, s2 in safe_zip(out1.addressable_shards, out2.addressable_shards):
       self.assertArraysEqual(s1.data._arrays[0], input_data[s1.index])
       self.assertArraysEqual(s2.data._arrays[0], input_data[s2.index])
@@ -3064,8 +3022,8 @@ class ArrayPmapTest(jtu.JaxTestCase):
     with jax_config.jax_array(True):
       out1, out2 = f(a1, a2)
 
-    self.assertIsInstance(out1, array.Array)
-    self.assertIsInstance(out2, array.Array)
+    self.assertIsInstance(out1, array.ArrayImpl)
+    self.assertIsInstance(out2, array.ArrayImpl)
     self.assertEqual(out1.shape, (2,))
     self.assertEqual(out2.shape, (dc, dc, 2))
     for i, (s1, s2) in enumerate(safe_zip(out1.addressable_shards, out2.addressable_shards)):
@@ -3133,6 +3091,30 @@ class ArrayPmapTest(jtu.JaxTestCase):
     w = jax.pmap(jnp.cos)(z)
 
     self.assertArraysEqual(w, jnp.cos(jnp.sin(x) ** 2))
+
+  @jax_config.jax_array(True)
+  def test_same_out_sharding_id(self):
+    if config.jax_disable_jit:
+      self.skipTest('Skip this under eager pmap mode.')
+    shape = (jax.device_count(), 2)
+    arr, inp_data = create_input_array_for_pmap(shape)
+
+    f = pmap(lambda x: x)
+    out1 = f(arr)
+    self.assertArraysEqual(out1, inp_data)
+    out1_sharding_id = id(out1.sharding)
+
+    out2 = f(out1)
+    self.assertArraysEqual(out2, inp_data)
+    out2_sharding_id = id(out2.sharding)
+
+    out3 = f(out2)
+    self.assertArraysEqual(out3, inp_data)
+    out3_sharding_id = id(out3.sharding)
+
+    self.assertEqual(out1_sharding_id, out2_sharding_id)
+    self.assertEqual(out1_sharding_id, out3_sharding_id)
+    self.assertEqual(out2_sharding_id, out3_sharding_id)
 
 
 class EagerPmapMixin:

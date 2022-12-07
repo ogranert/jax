@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -66,7 +66,7 @@ different result shape. In general, **such errors and also exceptions raised
 by the host computation may be difficult to debug**. See the Debugging section
 below.
 This is a problem for :func:`call` but not for :func:`id_tap` because for the
-latter the decice code does not expect a returned value.
+latter the device code does not expect a returned value.
 
 The :func:`call` API can be used inside a jit or pmap computation or inside
 cond/scan/while control flow. When used inside :func:`jax.pmap`, there will be
@@ -457,8 +457,8 @@ receiver, it may be hard to debug the calls. In particular, the stack trace
 will not include the calling code. You can use the flag
 ``jax_host_callback_inline`` (or the environment variable
 ``JAX_HOST_CALLBACK_INLINE``) to ensure that the calls to the callbacks are
-inlined. This works only if the calls are outside a staging context (``jit``
-or a control-flow primitive).
+inlined. This works only if the calls are outside a staging context
+(:func:`~jax.jit` or a control-flow primitive).
 
 The C++ `receiver
 <https://github.com/tensorflow/tensorflow/blob/master/tensorflow/compiler/xla/python/outfeed_receiver.cc>`_
@@ -497,13 +497,12 @@ Still to do:
 import atexit
 import functools
 import itertools
+import logging
 import threading
 import traceback
 from typing import (Any, Callable, Dict, List, Optional, Sequence,
                     Tuple, cast)
 import warnings
-
-from absl import logging
 
 from jax._src import api
 from jax import core
@@ -531,6 +530,8 @@ import numpy as np
 
 
 FLAGS = config.FLAGS
+
+logger = logging.getLogger(__name__)
 
 
 def _inline_host_callback() -> bool:
@@ -750,7 +751,7 @@ def _call(callback_func: Callable, arg, *,
     # Turn abstract values into ShapesDtypeStruct
     flat_results_shape, result_treedef = pytree.flatten(result_shape)
     try:
-      flat_results_aval = [core.ShapedArray(np.shape(r), dtypes.result_type(r))
+      flat_results_aval = [core.ShapedArray(np.shape(r), dtypes.dtype(r, canonicalize=True))
                            for r in flat_results_shape]
     except Exception:
       msg = ("result_shape should be a pytree of values with structure "
@@ -1231,9 +1232,10 @@ def _outside_call_run_callback(
   try:
     arg = api.tree_unflatten(arg_treedef, arrays)
     unpacked_transforms = _unpack_transforms(transforms)
-    if logging.vlog_is_on(2):
-      logging.vlog(2,
-                   f"Outside call invoking call_func {callback}, device={device}, transforms={unpacked_transforms}")
+    logger.debug(
+      "Outside call invoking call_func %s, device=%s, transforms=%s",
+      callback, device, unpacked_transforms
+    )
     res = callback(arg, device, unpacked_transforms)
     if identity:
       return tuple(arrays)
@@ -1250,10 +1252,9 @@ def _outside_call_run_callback(
 
       canonical_flat_results = tuple(util.safe_map(xla.canonicalize_dtype, actual_flat_results))
       actual_flat_results_aval = _values_to_avals(canonical_flat_results)
-      if logging.vlog_is_on(2):
-        logging.vlog(
-            2,
-            f"Outside call {callback} result {flat_results_aval}. Sending to infeed for device {device}."
+      logger.debug(
+        "Outside call %s result %s. Sending to infeed for device %s.",
+        callback, flat_results_aval, device,
         )
 
       if not all(ea.strip_weak_type() == ra.strip_weak_type()
@@ -1273,7 +1274,7 @@ def _outside_call_run_callback(
       return canonical_flat_results
 
   except Exception as e:
-    logging.error("Outside call %s threw exception %s.", callback, e)
+    logger.error("Outside call %s threw exception %s.", callback, e)
     if send_infeed:
       # Prepare some results to send in case of error. We are sending something
       # with a distinctive shape (int8[12345]), one that is unlikely to be what the device
@@ -1285,12 +1286,12 @@ def _outside_call_run_callback(
       # TODO: implement a proper error handling for TPU
       if device.platform != "tpu":
         canonical_flat_results = [xla.canonicalize_dtype(np.arange(12345, dtype=np.int8))]
-        if logging.vlog_is_on(2):
-          logging.vlog(2, f"Outside call consumer {callback} exception {e}. Sending to infeed the error result.")
+        logger.debug("Outside call consumer %s exception %s. Sending to infeed the error result.",
+                     callback, e)
         device.transfer_to_infeed(tuple(canonical_flat_results))
       else:
-        if logging.vlog_is_on(2):
-          logging.vlog(2, f"Outside call consumer {callback} exception {e}. On TPU we do not send infeed.")
+        logger.debug("Outside call consumer %s exception %s. On TPU we do not send infeed.",
+                     callback, e)
     raise e  # Let the exception propagate
 
 
@@ -1650,16 +1651,6 @@ def _rewrite_eqn(eqn: core.JaxprEqn, eqns: List[core.JaxprEqn],
                 # compilation to XLA, which does not use those parameters.
                 bwd="illegal param",
                 out_trees="illegal param")))
-  elif eqn.primitive is core.named_call_p:
-    call_jaxpr = cast(core.Jaxpr, eqn.params["call_jaxpr"])
-    eqns.append(
-        eqn.replace(
-            invars=eqn.invars + [input_token_var, input_itoken_var],
-            outvars=eqn.outvars + [output_token_var, output_itoken_var],
-            params=dict(
-                eqn.params,
-                call_jaxpr=_rewrite_jaxpr(call_jaxpr, True, True),
-            )))
   elif eqn.primitive is pjit.pjit_p:
     jaxpr = cast(core.ClosedJaxpr, eqn.params["jaxpr"])
     eqns.append(
@@ -1860,17 +1851,16 @@ _callback_handler_data = _CallbackHandlerData()
 
 # This function is called from C++; it must not allow exceptions through.
 def _callback_input_received(device, consumer_id, arrays: Tuple):
-  logging.vlog(
-      2,
-      f"Callback input received on device {device} for consumer {consumer_id} "
-      + "arrays: " + (", ".join([f"({a.dtype}{a.shape})" for a in arrays])))
+  array_repr = ", ".join([f"({a.dtype}{a.shape})" for a in arrays])
+  logger.debug("Callback input received on device %s for consumer %s arrays: %s",
+    device, consumer_id, array_repr)
   callback = _callback_handler_data.callback_registry_by_id.get(consumer_id)
   assert callback is not None, "We should have crashed in the runtime"
   try:
     return callback(arrays, device)
   except Exception as e:
     formatted_e = traceback.format_exc()
-    logging.error("Postponing exception raised in callback function: %s", formatted_e)
+    logger.error("Postponing exception raised in callback function: %s", formatted_e)
     _callback_handler_data.last_callback_exception = (e, formatted_e)
 
 
@@ -1920,11 +1910,10 @@ def _initialize_outfeed_receiver(
     if clients_with_outfeed:
       devices_with_outfeed = list(
         itertools.chain(*[backend.local_devices() for backend in clients_with_outfeed]))
-      if logging.vlog_is_on(2):
-        logging.vlog(
-            2,
-            f"Starting outfeed_receiver for {[str(d) for d in devices_with_outfeed]}. "
-            f"max_callback_queue_size_bytes={max_callback_queue_size_bytes}")
+      if logger.isEnabledFor(logging.DEBUG):
+        device_repr = ", ".join([str(d) for d in devices_with_outfeed])
+        logger.debug("Starting outfeed_receiver for %s. max_callback_queue_size_bytes=%s",
+                       device_repr, max_callback_queue_size_bytes)
       _callback_handler_data.receiver = outfeed_receiver_module.start(
           _callback_input_received, tuple(clients_with_outfeed),
           max_callback_queue_size_bytes)
@@ -1959,43 +1948,40 @@ def barrier_wait(logging_name: Optional[str] = None):
       for this invocation. See `Debugging` in the module documentation.
   """
   logging_name = logging_name or ""
-  if logging.vlog_is_on(2):
-    logging.vlog(2, f"barrier_wait[{logging_name}]: start")
+  logger.debug("barrier_wait[%s]: start", logging_name)
 
   lock = threading.Lock()
   cv = threading.Condition(lock=lock)
   devices_at_barrier = []  # Protected by lock
   def barrier_tap_received(dev_idx, _):
     device = _callback_handler_data.devices[dev_idx]
-    if logging.vlog_is_on(2):
-      logging.vlog(
-          2,
-          f"barrier_wait[{logging_name}]: at barrier_tap for device {device} "
-          f". Thread {threading.current_thread()}")
+    logger.debug(
+      "barrier_wait[%s]: at barrier_tap for device %s. Thread %s",
+      logging_name, device, threading.current_thread()
+    )
     with lock:
       devices_at_barrier.append(device)
-      if logging.vlog_is_on(2):
+      if logger.isEnabledFor(logging.DEBUG):
         waiting_for_devices = [d for d in _callback_handler_data.devices
                                if d not in devices_at_barrier]
-        logging.vlog(2,
-                     f"barrier_wait[{logging_name}]: still waiting "
-                     f"for {len(waiting_for_devices)} devices at "
-                     f"barrier ({waiting_for_devices})")
+        logger.debug(
+          "barrier_wait[%s]: still waiting for %s devices at barrier (%s)",
+          logging_name, len(waiting_for_devices), waiting_for_devices
+        )
       cv.notify()
 
   for d_idx, d in enumerate(_callback_handler_data.devices):
-    if logging.vlog_is_on(2):
-      logging.vlog(2,
-                   f"barrier_wait[{logging_name}]: enqueueing barrier on device {d}")
+    logger.debug("barrier_wait[%s]: enqueueing barrier on device %s", logging_name, d)
     x_on_dev = api.device_put(d_idx, device=d)
     api.jit(lambda x: id_tap(barrier_tap_received, x), device=d)(x_on_dev)
-  if logging.vlog_is_on(2):
-    logging.vlog(2,
-                 f"barrier_wait[{logging_name}]: waiting for callbacks")
+
+  logger.debug("barrier_wait[%s]: waiting for callbacks", logging_name)
+
   with lock:
     cv.wait_for(lambda: len(devices_at_barrier) == len(_callback_handler_data.devices))
-  if logging.vlog_is_on(2):
-    logging.vlog(2, f"barrier_wait[{logging_name}]: done")
+
+  logger.debug("barrier_wait[%s]: done", logging_name)
+
   if _callback_handler_data.last_callback_exception is not None:
     last_exception, formatted_last_exception = _callback_handler_data.last_callback_exception
     _callback_handler_data.last_callback_exception = None

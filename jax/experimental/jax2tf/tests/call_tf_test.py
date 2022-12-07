@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -236,8 +236,7 @@ class CallTfTest(tf_test_util.JaxToTfTestCase):
 
   @_parameterized_jit
   def test_with_var_read(self, with_jit=True):
-    if jtu.device_under_test() == "gpu":
-      raise unittest.SkipTest("Test fails on GPU")
+    # The variable is placed on the default TF device.
     outer_var_array = np.array([3., 4.], dtype=np.float32)
     outer_var = tf.Variable(outer_var_array)
 
@@ -250,8 +249,6 @@ class CallTfTest(tf_test_util.JaxToTfTestCase):
 
   @_parameterized_jit
   def test_with_var_read_x64(self, with_jit=True):
-    if jtu.device_under_test() == "gpu":
-      raise unittest.SkipTest("Test fails on GPU")
     outer_var_array = np.array([3., 4.], dtype=np.float64)
     outer_var = tf.Variable(outer_var_array)
 
@@ -264,8 +261,6 @@ class CallTfTest(tf_test_util.JaxToTfTestCase):
 
   def test_with_var_different_shape(self):
     # See https://github.com/google/jax/issues/6050
-    if jtu.device_under_test() == "gpu":
-      raise unittest.SkipTest("Test fails on GPU")
     v = tf.Variable((4., 2.), dtype=tf.float32)
 
     def tf_func(x):
@@ -478,7 +473,7 @@ class CallTfTest(tf_test_util.JaxToTfTestCase):
 
   @parameterized.named_parameters(
       dict(
-          testcase_name=f"_degree={degree}{'_jit' if with_jit else ''}",
+          testcase_name=f"_{degree=}{'_jit' if with_jit else ''}",
           degree=degree,
           with_jit=with_jit)
       for degree in [1, 2, 3, 4]
@@ -638,6 +633,7 @@ class CallTfTest(tf_test_util.JaxToTfTestCase):
     f_tf2 = jax2tf.convert(f_jax2)
     res = tf.function(f_tf2, autograph=False)(x)
     self.assertAllClose(res.numpy(), f_jax(x))
+
 
   def test_module_documentation(self):
     def cos_tf(x):

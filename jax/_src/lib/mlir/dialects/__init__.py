@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,3 +19,7 @@ import jaxlib.mlir.dialects.mhlo as mhlo
 import jaxlib.mlir.dialects.func as func
 import jaxlib.mlir.dialects.ml_program as ml_program
 import jaxlib.mlir.dialects.sparse_tensor as sparse_tensor
+
+from jax.lib import xla_client
+if xla_client.mlir_api_version >= 37:
+  import jaxlib.mlir.dialects.stablehlo as stablehlo

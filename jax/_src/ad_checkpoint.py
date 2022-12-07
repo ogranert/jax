@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,13 +13,9 @@
 # limitations under the License.
 
 from functools import partial
-import operator as op
 from typing import (Callable, Optional, List, Tuple, Sequence, Set, Union, Any,
                     FrozenSet)
 import types
-
-from absl import logging
-import numpy as np
 
 import jax
 from jax import core
@@ -31,11 +27,12 @@ from jax.interpreters import partial_eval as pe
 from jax.interpreters import xla
 from jax.tree_util import tree_flatten, tree_unflatten
 from jax._src import ad_util
-from jax._src import lax
 from jax._src import util
 from jax._src import source_info_util
 from jax._src import traceback_util
 from jax._src.api_util import flatten_fun, shaped_abstractify
+from jax._src.lax import lax as lax_internal
+from jax._src.lax import convolution as lax_convolution
 from jax._src.lib.mlir.dialects import mhlo
 from jax._src.traceback_util import api_boundary
 from jax._src.util import (unzip2, wraps, split_list, partition_list, safe_map,
@@ -60,12 +57,12 @@ def nothing_saveable(*_, **__) -> bool:
 
 def checkpoint_dots(prim, *_, **__) -> bool:
   # Matrix multiplies are expensive, so let's save them (and nothing else).
-  return prim in {lax.lax.dot_general_p,
-                  lax.convolution.conv_general_dilated_p}
+  return prim in {lax_internal.dot_general_p,
+                  lax_convolution.conv_general_dilated_p}
 
 def dot_with_no_batch_dims(prim, *_, **params) -> bool:
   # This is a useful heuristic for transformers.
-  if prim is lax.lax.dot_general_p:
+  if prim is lax_internal.dot_general_p:
     (_, _), (lhs_b, rhs_b) = params['dimension_numbers']
     if not lhs_b and not rhs_b:
       return True
@@ -119,7 +116,7 @@ def checkpoint(fun: Callable, *, prevent_cse: bool = True,
                ) -> Callable:
   """Make ``fun`` recompute internal linearization points when differentiated.
 
-  The :func:`jax.checkpoint` decorator, aliased to ``jax.remat``, provides a
+  The :func:`jax.checkpoint` decorator, aliased to :func:`jax.remat`, provides a
   way to trade off computation time and memory cost in the context of automatic
   differentiation, especially with reverse-mode autodiff like :func:`jax.grad`
   and :func:`jax.vjp` but also with :func:`jax.linearize`.
@@ -154,10 +151,11 @@ def checkpoint(fun: Callable, *, prevent_cse: bool = True,
       generated from differentiation. This CSE prevention has costs because it
       can foil other optimizations, and because it can incur high overheads on
       some backends, especially GPU. The default is True because otherwise,
-      under a ``jit`` or ``pmap``, CSE can defeat the purpose of this decorator.
-      But in some settings, like when used inside a ``scan``, this CSE
-      prevention mechanism is unnecessary, in which case ``prevent_cse`` can be
-      set to False.
+      under a :func:`~jax.jit` or :func:`~jax.pmap`, CSE can defeat the purpose
+      of this decorator.
+      But in some settings, like when used inside a :func:`~jax.lax.scan`, this
+      CSE prevention mechanism is unnecessary, in which case ``prevent_cse`` can
+      be set to False.
     static_argnums: Optional, int or sequence of ints, a keyword-only argument
       indicating which argument values on which to specialize for tracing and
       caching purposes. Specifying arguments as static can avoid
@@ -189,7 +187,7 @@ def checkpoint(fun: Callable, *, prevent_cse: bool = True,
   ...   return z
   ...
   >>> jax.value_and_grad(g)(2.0)
-  (DeviceArray(0.78907233, dtype=float32, weak_type=True), DeviceArray(-0.2556391, dtype=float32, weak_type=True))
+  (Array(0.78907233, dtype=float32, weak_type=True), Array(-0.2556391, dtype=float32, weak_type=True))
 
   Here, the same value is produced whether or not the :func:`jax.checkpoint`
   decorator is present. When the decorator is not present, the values
@@ -201,11 +199,11 @@ def checkpoint(fun: Callable, *, prevent_cse: bool = True,
   At that time, the value ``jnp.sin(2.0)`` is recomputed, along with the values
   ``jnp.cos(2.0)`` and ``jnp.cos(jnp.sin(2.0))``.
 
-  While ``jax.checkpoint`` controls what values are stored from the forward-pass
-  to be used on the backward pass, the total amount of memory required to
-  evaluate a function or its VJP depends on many additional internal details of
-  that function. Those details include which numerical primitives are used,
-  how they're composed, where jit and control flow primitives like scan
+  While :func:`jax.checkpoint` controls what values are stored from the
+  forward-pass to be used on the backward pass, the total amount of memory
+  required to evaluate a function or its VJP depends on many additional internal
+  details of that function. Those details include which numerical primitives are
+  used, how they're composed, where jit and control flow primitives like scan
   are used, and other factors.
 
   The :func:`jax.checkpoint` decorator can be applied recursively to express
@@ -254,7 +252,7 @@ def checkpoint(fun: Callable, *, prevent_cse: bool = True,
 
   As an alternative to using ``static_argnums`` (and
   ``jax.ensure_compile_time_eval``), it may be easier to compute some values
-  outside the ``jax.checkpoint``-decorated function and then close over them.
+  outside the :func:`jax.checkpoint`-decorated function and then close over them.
   """
   @wraps(fun)
   @api_boundary
@@ -365,13 +363,14 @@ def _trace_to_jaxpr(fun, in_tree, in_avals):
 ### Utilities
 
 def saved_residuals(f, *args, **kwargs) -> List[Tuple[core.AbstractValue, str]]:
-  args, in_tree = tree_flatten((args, kwargs))
+  in_leaves, in_tree = tree_flatten((args, kwargs))
 
   def f_(*args):
     args, kwargs = tree_unflatten(in_tree, args)
     return f(*args, **kwargs)
 
-  jaxpr = jax.make_jaxpr(lambda *args: jax.linearize(f_, *args)[1])(*args).jaxpr
+  jaxpr = jax.make_jaxpr(lambda *args: jax.linearize(f_, *args)[1])(
+      *in_leaves).jaxpr
   res_lits = [x for x in jaxpr.outvars if     isinstance(x, core.Literal)]
   res_vars = {x for x in jaxpr.outvars if not isinstance(x, core.Literal)}
 
@@ -384,7 +383,7 @@ def saved_residuals(f, *args, **kwargs) -> List[Tuple[core.AbstractValue, str]]:
     if v in res_vars:
       results.append((v.aval, 'from a constant'))
 
-  assert len(jaxpr.invars) == len(args)
+  assert len(jaxpr.invars) == len(in_leaves)
   for i, v in enumerate(jaxpr.invars):
     if v in res_vars:
       src = f'from {pe.arg_info_pytree(f, in_tree, True, [i])}'
@@ -439,8 +438,8 @@ def remat_jvp(primals, tangents, jaxpr, prevent_cse, differentiated, policy):
 ad.primitive_jvps[remat_p] = remat_jvp
 
 remat_allowed_effects: Set[core.Effect] = set()
-remat_allowed_effects.add(lax.lax.InOutFeedEffect.Infeed)
-remat_allowed_effects.add(lax.lax.InOutFeedEffect.Outfeed)
+remat_allowed_effects.add(lax_internal.InOutFeedEffect.Infeed)
+remat_allowed_effects.add(lax_internal.InOutFeedEffect.Outfeed)
 
 def remat_partial_eval(trace, *tracers, jaxpr, **params):
   assert not jaxpr.constvars
@@ -569,6 +568,8 @@ def remat_vmap(axis_size, axis_name, main_type, args, dims, *, jaxpr, **params):
       [batching.zero_if_mapped] * len(jaxpr.outvars),
       axis_name=axis_name, main_type=main_type)
   jaxpr_batched, consts = jaxpr_batched_.jaxpr, jaxpr_batched_.consts
+  if consts:
+    jaxpr_batched = pe.convert_constvars_jaxpr(jaxpr_batched)
   out_dims = [0 if b else None for b in out_batched]
   return remat_p.bind(*consts, *args, jaxpr=jaxpr_batched, **params), out_dims
 batching.axis_primitive_batchers[remat_p] = remat_vmap
@@ -595,12 +596,7 @@ def remat_lowering(*args, jaxpr: core.Jaxpr, prevent_cse: bool,
   assert not jaxpr.constvars
 
   if differentiated and prevent_cse:
-    if jax.config.jax_remat_opt_barrier:
-      translation_rule = _remat_translation_using_opt_barrier
-    elif is_gpu_platform:
-      translation_rule = _remat_translation_using_while
-    else:
-      translation_rule = _remat_translation_using_cond
+    translation_rule = _remat_translation_using_opt_barrier
   else:
     translation_rule = lambda *args, jaxpr: core.eval_jaxpr(jaxpr, (), *args)
 
@@ -609,52 +605,6 @@ def remat_lowering(*args, jaxpr: core.Jaxpr, prevent_cse: bool,
 def _remat_translation_using_opt_barrier(*args, jaxpr: core.Jaxpr):
   args = _optimization_barrier(args)
   return core.eval_jaxpr(jaxpr, (), *args)
-
-# TODO(mattjj): add core utility for 'create dummy value for this type'?
-def _dummy_like(aval: core.AbstractValue) -> Any:
-  if aval is core.abstract_token:
-    return jax.lax.create_token()
-  elif isinstance(aval, (core.ShapedArray, core.DShapedArray)):
-    return jax.lax.broadcast(jax.lax.empty(aval.dtype), aval.shape)  # type: ignore
-  else:
-    raise ValueError(aval)
-
-def _remat_translation_using_while(*args, jaxpr: core.Jaxpr):
-  # Implements:
-  #  for(counter=0, result=0; counter < rng(1, 2); counter ++) {
-  #     result = eval_jaxpr(*args)
-  #  }
-  # The loop carry is a tuple: (counter, result, args)
-  avals_out = tuple(v.aval for v in jaxpr.outvars)
-  carry_init = (np.int32(0), tuple(map(_dummy_like, avals_out)), args)
-  def cond(carry):
-    counter, _, _ = carry
-    unif = jax.lax.rng_uniform(np.int32(1), np.int32(2), shape=())
-    return counter < unif
-
-  def body(carry):
-    counter, _, args = carry
-    results = core.eval_jaxpr(jaxpr, (), *args)
-    return (counter + 1, tuple(results), args)
-
-  carry_res = jax.lax.while_loop(cond, body, carry_init)
-  return carry_res[1]
-
-def _remat_translation_using_cond(*args, jaxpr: core.Jaxpr):
-  # Implements:
-  #  if(rng(0, 1) < 2)
-  #    return eval_jaxpr(*args)
-  #  else:
-  #    return 0
-  avals_out = tuple(v.aval for v in jaxpr.outvars)
-
-  def remat_comp(*args):
-    return tuple(core.eval_jaxpr(jaxpr, (), *args))
-  def dummy_comp(*args):
-    return tuple(map(_dummy_like, avals_out))
-
-  unif = jax.lax.rng_uniform(np.float32(0), np.float32(1), shape=())
-  return jax.lax.cond(unif < np.float32(2), remat_comp, dummy_comp, *args)
 
 mlir.register_lowering(
     remat_p, mlir.lower_fun(remat_lowering, multiple_results=True))

@@ -1,6 +1,7 @@
-from absl.testing import absltest, parameterized
+from absl.testing import absltest
 import scipy.optimize
 
+import jax
 from jax import grad
 from jax.config import config
 import jax.numpy as jnp
@@ -61,11 +62,9 @@ class TestLineSearch(jtu.JaxTestCase):
 
   # -- Generic scalar searches
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-    {"testcase_name": f"_name={name}", "name": name}
-    for name in ['_scalar_func_1',
-                 '_scalar_func_2',
-                 '_scalar_func_3']))
+  @jtu.sample_product(
+    name=['_scalar_func_1', '_scalar_func_2', '_scalar_func_3'],
+  )
   def test_scalar_search_wolfe2(self, name):
 
     def bind_index(func, idx):
@@ -85,10 +84,9 @@ class TestLineSearch(jtu.JaxTestCase):
 
   # -- Generic line searches
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-    {"testcase_name": f"_name={name}", "name": name}
-    for name in ['_line_func_1',
-                 '_line_func_2']))
+  @jtu.sample_product(
+    name=['_line_func_1', '_line_func_2'],
+  )
   def test_line_search_wolfe2(self, name):
     def bind_index(func, idx):
       # Remember Python's closure semantics!
@@ -153,10 +151,11 @@ class TestLineSearch(jtu.JaxTestCase):
 
     # assert not line_search(jax.value_and_grad(f), np.ones(2), np.array([-0.5, -0.25])).failed
     xk = jnp.ones(2)
-    pk = jnp.array([-0.5, -0.25])
+    pk = jnp.array([-0.5, -0.25], dtype=xk.dtype)
     res = line_search(f, xk, pk, maxiter=100)
 
-    scipy_res = scipy.optimize.line_search(f, grad(f), xk, pk)
+    with jax.numpy_dtype_promotion('standard'):
+      scipy_res = scipy.optimize.line_search(f, grad(f), xk, pk)
 
     self.assertAllClose(scipy_res[0], res.a_k, atol=1e-5, check_dtypes=False)
     self.assertAllClose(scipy_res[3], res.f_k, atol=1e-5, check_dtypes=False)

@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,37 +18,59 @@ from functools import partial
 import numpy as np
 import textwrap
 import operator
-from typing import Optional, Tuple, Union, cast
+from typing import Literal, Optional, Tuple, Union, cast, overload
 
+import jax
 from jax import jit, custom_jvp
 from jax import lax
 
 from jax._src.lax import lax as lax_internal
 from jax._src.lax import linalg as lax_linalg
 from jax._src.numpy import lax_numpy as jnp
-from jax._src.numpy.util import _wraps, _promote_dtypes_inexact
+from jax._src.numpy.util import _wraps, _promote_dtypes_inexact, _check_arraylike
 from jax._src.util import canonicalize_axis
+from jax._src.typing import ArrayLike, Array
 
 
-def _T(x):
+def _T(x: ArrayLike) -> Array:
   return jnp.swapaxes(x, -1, -2)
 
 
-def _H(x):
+def _H(x: ArrayLike) -> Array:
   return jnp.conjugate(jnp.swapaxes(x, -1, -2))
+
+
+def _symmetrize(x: Array) -> Array: return (x + _H(x)) / 2
 
 
 @_wraps(np.linalg.cholesky)
 @jit
-def cholesky(a):
+def cholesky(a: ArrayLike) -> Array:
+  _check_arraylike("jnp.linalg.cholesky", a)
   a, = _promote_dtypes_inexact(jnp.asarray(a))
   return lax_linalg.cholesky(a)
 
+@overload
+def svd(a: ArrayLike, full_matrices: bool = True, *, compute_uv: Literal[True],
+        hermitian: bool = False) -> Tuple[Array, Array, Array]: ...
+@overload
+def svd(a: ArrayLike, full_matrices: bool, compute_uv: Literal[True],
+        hermitian: bool = False) -> Tuple[Array, Array, Array]: ...
+@overload
+def svd(a: ArrayLike, full_matrices: bool = True, *, compute_uv: Literal[False],
+        hermitian: bool = False) -> Array: ...
+@overload
+def svd(a: ArrayLike, full_matrices: bool, compute_uv: Literal[False],
+        hermitian: bool = False) -> Array: ...
+@overload
+def svd(a: ArrayLike, full_matrices: bool = True, compute_uv: bool = True,
+        hermitian: bool = False) -> Union[Array, Tuple[Array, Array, Array]]: ...
 
 @_wraps(np.linalg.svd)
 @partial(jit, static_argnames=('full_matrices', 'compute_uv', 'hermitian'))
-def svd(a, full_matrices: bool = True, compute_uv: bool = True,
-        hermitian: bool = False):
+def svd(a: ArrayLike, full_matrices: bool = True, compute_uv: bool = True,
+        hermitian: bool = False) -> Union[Array, Tuple[Array, Array, Array]]:
+  _check_arraylike("jnp.linalg.svd", a)
   a, = _promote_dtypes_inexact(jnp.asarray(a))
   if hermitian:
     w, v = lax_linalg.eigh(a)
@@ -71,13 +93,14 @@ def svd(a, full_matrices: bool = True, compute_uv: bool = True,
 
 @_wraps(np.linalg.matrix_power)
 @partial(jit, static_argnames=('n',))
-def matrix_power(a, n):
-  a, = _promote_dtypes_inexact(jnp.asarray(a))
+def matrix_power(a: ArrayLike, n: int) -> Array:
+  _check_arraylike("jnp.linalg.matrix_power", a)
+  arr, = _promote_dtypes_inexact(jnp.asarray(a))
 
-  if a.ndim < 2:
+  if arr.ndim < 2:
     raise TypeError("{}-dimensional array given. Array must be at least "
-                    "two-dimensional".format(a.ndim))
-  if a.shape[-2] != a.shape[-1]:
+                    "two-dimensional".format(arr.ndim))
+  if arr.shape[-2] != arr.shape[-1]:
     raise TypeError("Last 2 dimensions of the array must be square")
   try:
     n = operator.index(n)
@@ -85,31 +108,32 @@ def matrix_power(a, n):
     raise TypeError(f"exponent must be an integer, got {n}") from err
 
   if n == 0:
-    return jnp.broadcast_to(jnp.eye(a.shape[-2], dtype=a.dtype), a.shape)
+    return jnp.broadcast_to(jnp.eye(arr.shape[-2], dtype=arr.dtype), arr.shape)
   elif n < 0:
-    a = inv(a)
-    n = np.abs(n)
+    arr = inv(arr)
+    n = abs(n)
 
   if n == 1:
-    return a
+    return arr
   elif n == 2:
-    return a @ a
+    return arr @ arr
   elif n == 3:
-    return (a @ a) @ a
+    return (arr @ arr) @ arr
 
   z = result = None
   while n > 0:
-    z = a if z is None else (z @ z)
+    z = arr if z is None else (z @ z)  # type: ignore[operator]
     n, bit = divmod(n, 2)
     if bit:
       result = z if result is None else (result @ z)
-
+  assert result is not None
   return result
 
 
 @_wraps(np.linalg.matrix_rank)
 @jit
-def matrix_rank(M, tol=None):
+def matrix_rank(M: ArrayLike, tol: Optional[ArrayLike] = None) -> Array:
+  _check_arraylike("jnp.linalg.matrix_rank", M)
   M, = _promote_dtypes_inexact(jnp.asarray(M))
   if M.ndim < 2:
     return jnp.any(M != 0).astype(jnp.int32)
@@ -121,7 +145,7 @@ def matrix_rank(M, tol=None):
 
 
 @custom_jvp
-def _slogdet_lu(a):
+def _slogdet_lu(a: Array) -> Tuple[Array, Array]:
   dtype = lax.dtype(a)
   lu, pivot, _ = lax_linalg.lu(a)
   diag = jnp.diagonal(lu, axis1=-2, axis2=-1)
@@ -143,7 +167,7 @@ def _slogdet_lu(a):
   return sign, jnp.real(logdet)
 
 @custom_jvp
-def _slogdet_qr(a):
+def _slogdet_qr(a: Array) -> Tuple[Array, Array]:
   # Implementation of slogdet using QR decomposition. One reason we might prefer
   # QR decomposition is that it is more amenable to a fast batched
   # implementation on TPU because of the lack of row pivoting.
@@ -171,7 +195,8 @@ def _slogdet_qr(a):
         LU decomposition if ``None``.
     """))
 @partial(jit, static_argnames=('method',))
-def slogdet(a, *, method: Optional[str] = None):
+def slogdet(a: ArrayLike, *, method: Optional[str] = None) -> Tuple[Array, Array]:
+  _check_arraylike("jnp.linalg.slogdet", a)
   a, = _promote_dtypes_inexact(jnp.asarray(a))
   a_shape = jnp.shape(a)
   if len(a_shape) < 2 or a_shape[-1] != a_shape[-2]:
@@ -201,7 +226,7 @@ def _slogdet_jvp(primals, tangents):
 _slogdet_lu.defjvp(_slogdet_jvp)
 _slogdet_qr.defjvp(_slogdet_jvp)
 
-def _cofactor_solve(a, b):
+def _cofactor_solve(a: ArrayLike, b: ArrayLike) -> Tuple[Array, Array]:
   """Equivalent to det(a)*solve(a, b) for nonsingular mat.
 
   Intermediate function used for jvp and vjp of det.
@@ -273,8 +298,8 @@ def _cofactor_solve(a, b):
   # partial_det[:, -2] contains det(u) / u_{nn}.
   partial_det = jnp.cumprod(diag, axis=-1) * sign[..., None]
   lu = lu.at[..., -1, -1].set(1.0 / partial_det[..., -2])
-  permutation = jnp.broadcast_to(permutation, batch_dims + (a_shape[-1],))
-  iotas = jnp.ix_(*(lax.iota(jnp.int32, b) for b in batch_dims + (1,)))
+  permutation = jnp.broadcast_to(permutation, (*batch_dims, a_shape[-1]))
+  iotas = jnp.ix_(*(lax.iota(jnp.int32, b) for b in (*batch_dims, 1)))
   # filter out any matrices that are not full rank
   d = jnp.ones(x.shape[:-1], x.dtype)
   d = lax_linalg.triangular_solve(lu, d, left_side=True, lower=False)
@@ -292,12 +317,12 @@ def _cofactor_solve(a, b):
   return partial_det[..., -1], x
 
 
-def _det_2x2(a):
+def _det_2x2(a: Array) -> Array:
   return (a[..., 0, 0] * a[..., 1, 1] -
            a[..., 0, 1] * a[..., 1, 0])
 
 
-def _det_3x3(a):
+def _det_3x3(a: Array) -> Array:
   return (a[..., 0, 0] * a[..., 1, 1] * a[..., 2, 2] +
           a[..., 0, 1] * a[..., 1, 2] * a[..., 2, 0] +
           a[..., 0, 2] * a[..., 1, 0] * a[..., 2, 1] -
@@ -309,7 +334,8 @@ def _det_3x3(a):
 @custom_jvp
 @_wraps(np.linalg.det)
 @jit
-def det(a):
+def det(a: ArrayLike) -> Array:
+  _check_arraylike("jnp.linalg.det", a)
   a, = _promote_dtypes_inexact(jnp.asarray(a))
   a_shape = jnp.shape(a)
   if len(a_shape) >= 2 and a_shape[-1] == 2 and a_shape[-2] == 2:
@@ -341,21 +367,26 @@ At present, non-symmetric eigendecomposition is only implemented on the CPU
 backend. However eigendecomposition for symmetric/Hermitian matrices is
 implemented more widely (see :func:`jax.numpy.linalg.eigh`).
 """)
-def eig(a):
+def eig(a: ArrayLike) -> Tuple[Array, Array]:
+  _check_arraylike("jnp.linalg.eig", a)
   a, = _promote_dtypes_inexact(jnp.asarray(a))
-  return lax_linalg.eig(a, compute_left_eigenvectors=False)
+  w, v = lax_linalg.eig(a, compute_left_eigenvectors=False)
+  return w, v
 
 
 @_wraps(np.linalg.eigvals)
 @jit
-def eigvals(a):
+def eigvals(a: ArrayLike) -> Array:
+  _check_arraylike("jnp.linalg.eigvals", a)
   return lax_linalg.eig(a, compute_left_eigenvectors=False,
                         compute_right_eigenvectors=False)[0]
 
 
 @_wraps(np.linalg.eigh)
 @partial(jit, static_argnames=('UPLO', 'symmetrize_input'))
-def eigh(a, UPLO=None, symmetrize_input=True):
+def eigh(a: ArrayLike, UPLO: Optional[str] = None,
+         symmetrize_input: bool = True) -> Tuple[Array, Array]:
+  _check_arraylike("jnp.linalg.eigh", a)
   if UPLO is None or UPLO == "L":
     lower = True
   elif UPLO == "U":
@@ -371,70 +402,91 @@ def eigh(a, UPLO=None, symmetrize_input=True):
 
 @_wraps(np.linalg.eigvalsh)
 @partial(jit, static_argnames=('UPLO',))
-def eigvalsh(a, UPLO='L'):
+def eigvalsh(a: ArrayLike, UPLO: Optional[str] = 'L') -> Array:
+  _check_arraylike("jnp.linalg.eigvalsh", a)
   w, _ = eigh(a, UPLO)
   return w
 
 
-@partial(custom_jvp, nondiff_argnums=(1,))
+@partial(custom_jvp, nondiff_argnums=(1, 2))
 @_wraps(np.linalg.pinv, lax_description=textwrap.dedent("""\
     It differs only in default value of `rcond`. In `numpy.linalg.pinv`, the
     default `rcond` is `1e-15`. Here the default is
     `10. * max(num_rows, num_cols) * jnp.finfo(dtype).eps`.
     """))
-@jit
-def pinv(a, rcond=None):
+@partial(jit, static_argnames=('hermitian',))
+def pinv(a: ArrayLike, rcond: Optional[ArrayLike] = None,
+         hermitian: bool = False) -> Array:
   # Uses same algorithm as
   # https://github.com/numpy/numpy/blob/v1.17.0/numpy/linalg/linalg.py#L1890-L1979
-  a = jnp.conj(a)
+  _check_arraylike("jnp.linalg.pinv", a)
+  arr = jnp.asarray(a)
+  m, n = arr.shape[-2:]
+  if m == 0 or n == 0:
+    return jnp.empty(arr.shape[:-2] + (n, m), arr.dtype)
+  arr = jnp.conj(arr)
   if rcond is None:
-    max_rows_cols = max(a.shape[-2:])
-    rcond = 10. * max_rows_cols * jnp.array(jnp.finfo(a.dtype).eps)
+    max_rows_cols = max(arr.shape[-2:])
+    rcond = 10. * max_rows_cols * jnp.array(jnp.finfo(arr.dtype).eps)
   rcond = jnp.asarray(rcond)
-  u, s, vh = svd(a, full_matrices=False)
+  u, s, vh = svd(arr, full_matrices=False, hermitian=hermitian)
   # Singular values less than or equal to ``rcond * largest_singular_value``
   # are set to zero.
   rcond = lax.expand_dims(rcond[..., jnp.newaxis], range(s.ndim - rcond.ndim - 1))
-  cutoff = rcond * jnp.amax(s, axis=-1, keepdims=True, initial=-jnp.inf)
+  cutoff = rcond * s[..., 0:1]
   s = jnp.where(s > cutoff, s, jnp.inf).astype(u.dtype)
-  res = jnp.matmul(_T(vh), jnp.divide(_T(u), s[..., jnp.newaxis]))
-  return lax.convert_element_type(res, a.dtype)
+  res = jnp.matmul(_T(vh), jnp.divide(_T(u), s[..., jnp.newaxis]),
+                   precision=lax.Precision.HIGHEST)
+  return lax.convert_element_type(res, arr.dtype)
 
 
 @pinv.defjvp
-def _pinv_jvp(rcond, primals, tangents):
+@jax.default_matmul_precision("float32")
+def _pinv_jvp(rcond, hermitian, primals, tangents):
   # The Differentiation of Pseudo-Inverses and Nonlinear Least Squares Problems
   # Whose Variables Separate. Author(s): G. H. Golub and V. Pereyra. SIAM
   # Journal on Numerical Analysis, Vol. 10, No. 2 (Apr., 1973), pp. 413-432.
   # (via https://en.wikipedia.org/wiki/Moore%E2%80%93Penrose_inverse#Derivative)
-  a, = primals
+  a, = primals  # m x n
   a_dot, = tangents
-  p = pinv(a, rcond=rcond)
+  p = pinv(a, rcond=rcond, hermitian=hermitian)  # n x m
+  if hermitian:
+    # svd(..., hermitian=True) symmetrizes its input, and the JVP must match.
+    a = _symmetrize(a)
+    a_dot = _symmetrize(a_dot)
+
+  # TODO(phawkins): this could be simplified in the Hermitian case if we
+  # supported triangular matrix multiplication.
   m, n = a.shape[-2:]
-  # TODO(phawkins): on TPU, we would need to opt into high precision here.
-  # TODO(phawkins): consider if this can be simplified in the Hermitian case.
-  p_dot = -p @ a_dot @ p
-  I_n = lax.expand_dims(jnp.eye(m, dtype=a.dtype), range(a.ndim - 2))
-  p_dot = p_dot + p @ _H(p) @ _H(a_dot) @ (I_n - a @ p)
-  I_m = lax.expand_dims(jnp.eye(n, dtype=a.dtype), range(a.ndim - 2))
-  p_dot = p_dot + (I_m - p @ a) @ _H(a_dot) @ _H(p) @ p
+  if m >= n:
+    s = (p @ _H(p)) @ _H(a_dot)  # nxm
+    t = (_H(a_dot) @ _H(p)) @ p  # nxm
+    p_dot = -(p @ a_dot) @ p + s - (s @ a) @ p + t - (p @ a) @ t
+  else:  # m < n
+    s = p @ (_H(p) @ _H(a_dot))
+    t = _H(a_dot) @ (_H(p) @ p)
+    p_dot = -p @ (a_dot @ p) + s - s @ (a @ p) + t - p @ (a @ t)
   return p, p_dot
 
 
 @_wraps(np.linalg.inv)
 @jit
-def inv(a):
-  if jnp.ndim(a) < 2 or a.shape[-1] != a.shape[-2]:
+def inv(a: ArrayLike) -> Array:
+  _check_arraylike("jnp.linalg.inv", a)
+  arr = jnp.asarray(a)
+  if arr.ndim < 2 or arr.shape[-1] != arr.shape[-2]:
     raise ValueError(
-      f"Argument to inv must have shape [..., n, n], got {a.shape}.")
+      f"Argument to inv must have shape [..., n, n], got {arr.shape}.")
   return solve(
-    a, lax.broadcast(jnp.eye(a.shape[-1], dtype=lax.dtype(a)), a.shape[:-2]))
+    arr, lax.broadcast(jnp.eye(arr.shape[-1], dtype=arr.dtype), arr.shape[:-2]))
 
 
 @_wraps(np.linalg.norm)
 @partial(jit, static_argnames=('ord', 'axis', 'keepdims'))
-def norm(x, ord=None, axis : Union[None, Tuple[int, ...], int] = None,
-         keepdims=False):
+def norm(x: ArrayLike, ord: Union[int, str, None] = None,
+         axis: Union[None, Tuple[int, ...], int] = None,
+         keepdims: bool = False) -> Array:
+  _check_arraylike("jnp.linalg.norm", x)
   x, = _promote_dtypes_inexact(jnp.asarray(x))
   x_shape = jnp.shape(x)
   ndim = len(x_shape)
@@ -477,9 +529,9 @@ def norm(x, ord=None, axis : Union[None, Tuple[int, ...], int] = None,
       raise ValueError(msg)
     else:
       abs_x = jnp.abs(x)
-      ord = lax_internal._const(abs_x, ord)
-      ord_inv = lax_internal._const(abs_x, 1. / ord)
-      out = jnp.sum(abs_x ** ord, axis=axis, keepdims=keepdims)
+      ord_arr = lax_internal._const(abs_x, ord)
+      ord_inv = lax_internal._const(abs_x, 1. / ord_arr)
+      out = jnp.sum(abs_x ** ord_arr, axis=axis, keepdims=keepdims)
       return jnp.power(out, ord_inv)
 
   elif num_axes == 2:
@@ -526,10 +578,15 @@ def norm(x, ord=None, axis : Union[None, Tuple[int, ...], int] = None,
     raise ValueError(
         f"Invalid axis values ({axis}) for jnp.linalg.norm.")
 
+@overload
+def qr(a: ArrayLike, mode: Literal["r"]) -> Array: ...
+@overload
+def qr(a: ArrayLike, mode: str = "reduced") -> Union[Array, Tuple[Array, Array]]: ...
 
 @_wraps(np.linalg.qr)
 @partial(jit, static_argnames=('mode',))
-def qr(a, mode="reduced"):
+def qr(a: ArrayLike, mode: str = "reduced") -> Union[Array, Tuple[Array, Array]]:
+  _check_arraylike("jnp.linalg.qr", a)
   a, = _promote_dtypes_inexact(jnp.asarray(a))
   if mode == "raw":
     a, taus = lax_linalg.geqrf(a)
@@ -548,12 +605,14 @@ def qr(a, mode="reduced"):
 
 @_wraps(np.linalg.solve)
 @jit
-def solve(a, b):
+def solve(a: ArrayLike, b: ArrayLike) -> Array:
+  _check_arraylike("jnp.linalg.solve", a, b)
   a, b = _promote_dtypes_inexact(jnp.asarray(a), jnp.asarray(b))
   return lax_linalg._solve(a, b)
 
 
-def _lstsq(a, b, rcond, *, numpy_resid=False):
+def _lstsq(a: ArrayLike, b: ArrayLike, rcond: Optional[float], *,
+           numpy_resid: bool = False) -> Tuple[Array, Array, Array, Array]:
   # TODO: add lstsq to lax_linalg and implement this function via those wrappers.
   # TODO: add custom jvp rule for more robust lstsq differentiation
   a, b = _promote_dtypes_inexact(a, b)
@@ -570,17 +629,22 @@ def _lstsq(a, b, rcond, *, numpy_resid=False):
       f"{b.ndim}-dimensional array given. Array must be one or two-dimensional")
   m, n = a.shape
   dtype = a.dtype
-  if rcond is None:
-    rcond = jnp.finfo(dtype).eps * max(n, m)
+  if a.size == 0:
+    s = jnp.empty(0, dtype=a.dtype)
+    rank = jnp.array(0, dtype=int)
+    x = jnp.empty((n, *b.shape[1:]), dtype=a.dtype)
   else:
-    rcond = jnp.where(rcond < 0, jnp.finfo(dtype).eps, rcond)
-  u, s, vt = svd(a, full_matrices=False)
-  mask = s >= jnp.array(rcond, dtype=s.dtype) * s[0]
-  rank = mask.sum()
-  safe_s = jnp.where(mask, s, 1).astype(a.dtype)
-  s_inv = jnp.where(mask, 1 / safe_s, 0)[:, jnp.newaxis]
-  uTb = jnp.matmul(u.conj().T, b, precision=lax.Precision.HIGHEST)
-  x = jnp.matmul(vt.conj().T, s_inv * uTb, precision=lax.Precision.HIGHEST)
+    if rcond is None:
+      rcond = jnp.finfo(dtype).eps * max(n, m)
+    else:
+      rcond = jnp.where(rcond < 0, jnp.finfo(dtype).eps, rcond)
+    u, s, vt = svd(a, full_matrices=False)
+    mask = s >= jnp.array(rcond, dtype=s.dtype) * s[0]
+    rank = mask.sum()
+    safe_s = jnp.where(mask, s, 1).astype(a.dtype)
+    s_inv = jnp.where(mask, 1 / safe_s, 0)[:, jnp.newaxis]
+    uTb = jnp.matmul(u.conj().T, b, precision=lax.Precision.HIGHEST)
+    x = jnp.matmul(vt.conj().T, s_inv * uTb, precision=lax.Precision.HIGHEST)
   # Numpy returns empty residuals in some cases. To allow compilation, we
   # default to returning full residuals in all cases.
   if numpy_resid and (rank < n or m <= n):
@@ -607,7 +671,9 @@ _jit_lstsq = jit(partial(_lstsq, numpy_resid=False))
     The lstsq function does not currently have a custom JVP rule, so the gradient is
     poorly behaved for some inputs, particularly for low-rank `a`.
     """))
-def lstsq(a, b, rcond=None, *, numpy_resid=False):
+def lstsq(a: ArrayLike, b: ArrayLike, rcond: Optional[float] = None, *,
+          numpy_resid: bool = False) -> Tuple[Array, Array, Array, Array]:
+  _check_arraylike("jnp.linalg.lstsq", a, b)
   if numpy_resid:
     return _lstsq(a, b, rcond, numpy_resid=True)
   return _jit_lstsq(a, b, rcond)

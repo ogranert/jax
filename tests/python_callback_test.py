@@ -1,4 +1,4 @@
-# Copyright 2022 Google LLC
+# Copyright 2022 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,9 +24,9 @@ from jax import lax
 from jax import tree_util
 from jax._src import debugging
 from jax._src import dispatch
-from jax._src import lib as jaxlib
 from jax._src import test_util as jtu
 from jax._src import util
+from jax._src.lib import xla_bridge
 from jax.config import config
 from jax.experimental import maps
 from jax.interpreters import mlir
@@ -56,12 +56,6 @@ def setUpModule():
 def tearDownModule():
   prev_xla_flags()
 
-
-# TODO(sharadmv): remove jaxlib guards for TPU tests when jaxlib minimum
-#                 version is >= 0.3.15
-disabled_backends = []
-if jaxlib.version < (0, 3, 15):
-  disabled_backends.append("tpu")
 
 callback_p = core.Primitive("callback")
 callback_p.multiple_results = True
@@ -125,8 +119,7 @@ def callback_lowering(ctx, *args, effect, callback, **params):
 
 mlir.register_lowering(callback_p, callback_lowering, platform="cpu")
 mlir.register_lowering(callback_p, callback_lowering, platform="gpu")
-if jaxlib.version >= (0, 3, 15):
-  mlir.register_lowering(callback_p, callback_lowering, platform="tpu")
+mlir.register_lowering(callback_p, callback_lowering, platform="tpu")
 
 
 class PythonCallbackTest(jtu.JaxTestCase):
@@ -135,8 +128,9 @@ class PythonCallbackTest(jtu.JaxTestCase):
     super().tearDown()
     dispatch.runtime_tokens.clear()
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_with_scalar_values(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     @jax.jit
     def f(x):
@@ -147,7 +141,6 @@ class PythonCallbackTest(jtu.JaxTestCase):
     self.assertEqual(out, 1.)
 
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_with_wrong_number_of_args(self):
 
     @jax.jit
@@ -160,7 +153,6 @@ class PythonCallbackTest(jtu.JaxTestCase):
       f()
       jax.effects_barrier()
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_with_wrong_number_of_returned_values(self):
 
     @jax.jit
@@ -182,7 +174,6 @@ class PythonCallbackTest(jtu.JaxTestCase):
       g()
       jax.effects_barrier()
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_with_wrong_shape_outputs(self):
 
     @jax.jit
@@ -195,7 +186,6 @@ class PythonCallbackTest(jtu.JaxTestCase):
       f()
       jax.effects_barrier()
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_with_wrong_dtype_outputs(self):
 
     def _cb():
@@ -210,8 +200,9 @@ class PythonCallbackTest(jtu.JaxTestCase):
       f()
       jax.effects_barrier()
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_with_single_return_value(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     @jax.jit
     def f():
@@ -222,8 +213,9 @@ class PythonCallbackTest(jtu.JaxTestCase):
     jax.effects_barrier()
     np.testing.assert_allclose(out, np.ones(4, np.float32))
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_with_multiple_return_values(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     @jax.jit
     def f():
@@ -236,8 +228,9 @@ class PythonCallbackTest(jtu.JaxTestCase):
     np.testing.assert_allclose(x, np.ones(4, np.float32))
     np.testing.assert_allclose(y, np.ones(5, np.int32))
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_with_multiple_arguments_and_return_values(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def _callback(x, y, z):
       return (x, y + z)
@@ -251,7 +244,6 @@ class PythonCallbackTest(jtu.JaxTestCase):
     np.testing.assert_allclose(x, np.ones(3))
     np.testing.assert_allclose(y, np.array([1., 3., 5]))
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_send_recv_zero_dim_arrays(self):
 
     def _callback(x):
@@ -271,8 +263,9 @@ class PythonCallbackTest(jtu.JaxTestCase):
       np.testing.assert_allclose(
           f(jnp.zeros(0, jnp.float32)), np.zeros(0, np.float32))
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_with_pytree_arguments_and_return_values(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def _callback(x):
       return dict(y=[x])
@@ -286,8 +279,9 @@ class PythonCallbackTest(jtu.JaxTestCase):
     jax.effects_barrier()
     self.assertEqual(out, dict(y=[2.]))
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_inside_of_while_loop_of_scalars(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def _callback(x):
       return (x + 1.).astype(x.dtype)
@@ -304,8 +298,9 @@ class PythonCallbackTest(jtu.JaxTestCase):
     jax.effects_barrier()
     self.assertEqual(out, 10.)
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_inside_of_while_loop(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def _callback(x):
       return (x + 1.).astype(x.dtype)
@@ -325,8 +320,9 @@ class PythonCallbackTest(jtu.JaxTestCase):
     jax.effects_barrier()
     np.testing.assert_allclose(out, jnp.arange(10., 15.))
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_inside_of_cond_of_scalars(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def _callback1(x):
       return (x + 1.).astype(x.dtype)
@@ -352,8 +348,9 @@ class PythonCallbackTest(jtu.JaxTestCase):
     jax.effects_barrier()
     self.assertEqual(out, 0.)
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_inside_of_cond(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def _callback1(x):
       return x + 1.
@@ -379,8 +376,9 @@ class PythonCallbackTest(jtu.JaxTestCase):
     jax.effects_barrier()
     np.testing.assert_allclose(out, jnp.zeros(2))
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_inside_of_scan_of_scalars(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def _callback(x):
       return (x + 1.).astype(x.dtype)
@@ -398,8 +396,9 @@ class PythonCallbackTest(jtu.JaxTestCase):
     jax.effects_barrier()
     self.assertEqual(out, 10.)
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_inside_of_scan(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def _callback(x):
       return x + 1.
@@ -417,8 +416,9 @@ class PythonCallbackTest(jtu.JaxTestCase):
     jax.effects_barrier()
     np.testing.assert_allclose(out, jnp.arange(2.) + 10.)
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_inside_of_pmap_of_scalars(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def _callback(x):
       return (x + 1.).astype(x.dtype)
@@ -432,8 +432,9 @@ class PythonCallbackTest(jtu.JaxTestCase):
     np.testing.assert_allclose(
         out, np.arange(jax.local_device_count(), dtype=np.float32) + 1.)
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_inside_of_pmap(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def _callback(x):
       return x + 1.
@@ -456,8 +457,9 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
     super().tearDown()
     dispatch.runtime_tokens.clear()
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_pure_callback_passes_ndarrays_without_jit(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def cb(x):
       self.assertIs(type(x), np.ndarray)
@@ -467,15 +469,15 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
       return jax.pure_callback(cb, x, x)
     f(jnp.array(2.))
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_simple_pure_callback(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     @jax.jit
     def f(x):
       return jax.pure_callback(lambda x: (x * 2.).astype(x.dtype), x, x)
     self.assertEqual(f(2.), 4.)
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_can_dce_pure_callback(self):
 
     if jax.default_backend() == "tpu":
@@ -494,7 +496,6 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
     _ = f(2.)
     self.assertEmpty(log)
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_with_wrong_number_of_args(self):
 
     @jax.jit
@@ -507,7 +508,6 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
       f()
       jax.effects_barrier()
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_with_wrong_number_of_returned_values(self):
 
     @jax.jit
@@ -528,7 +528,6 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
       g()
       jax.effects_barrier()
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_with_wrong_shape_outputs(self):
 
     @jax.jit
@@ -541,7 +540,6 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
       f()
       jax.effects_barrier()
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_with_wrong_dtype_outputs(self):
 
     def _cb():
@@ -556,7 +554,6 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
       f()
       jax.effects_barrier()
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_with_wrongly_specified_64_bit_dtype(self):
     if config.jax_enable_x64:
       raise unittest.SkipTest("Test only needed when 64-bit mode disabled.")
@@ -571,6 +568,8 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
       jax.effects_barrier()
 
   def test_can_vmap_pure_callback(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     @jax.jit
     @jax.vmap
@@ -588,11 +587,24 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
     @jax.jit
     @functools.partial(jax.vmap, in_axes=(0, None))
     def h(x, y):
-      return jax.pure_callback(lambda x, y: np.sin(x) + y, x, x, y)
+      out_shape = jax.ShapeDtypeStruct(x.shape, np.result_type(x.dtype, y.dtype))
+      return jax.pure_callback(lambda x, y: np.sin(x) + y, out_shape, x, y)
     out = h(jnp.arange(4.), 4.)
-    np.testing.assert_allclose(out, np.sin(np.arange(4.)) + 4.)
+    self.assertArraysAllClose(out, np.sin(np.arange(4.)) + 4.,
+                              rtol=1E-7, check_dtypes=False)
+
+    @jax.jit
+    @functools.partial(jax.vmap)
+    def h(x, y):
+      out_shape = jax.ShapeDtypeStruct(x.shape, np.result_type(x.dtype, y.dtype))
+      return jax.pure_callback(lambda x, y: np.sin(x) + y, out_shape, x, y)
+    out = h(jnp.arange(4.), jnp.arange(10., 14.))
+    self.assertArraysAllClose(out, np.sin(np.arange(4.)) + np.arange(10., 14.),
+                              rtol=1E-7, check_dtypes=False)
 
   def test_vmap_vectorized_callback(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def cb(x):
       self.assertTupleEqual(x.shape, ())
@@ -641,6 +653,8 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
       jax.effects_barrier()
 
   def test_can_pmap_pure_callback(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     @jax.pmap
     def f(x):
@@ -662,6 +676,8 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
       f(2.)
 
   def test_can_take_grad_of_pure_callback_with_custom_jvp(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     @jax.custom_jvp
     def sin(x):
@@ -679,8 +695,9 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
     out = f(2.)
     np.testing.assert_allclose(out, jnp.cos(2.))
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_inside_of_cond(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def _callback1(x):
       return x + 1.
@@ -704,8 +721,9 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
     out = f(False, jnp.ones(2))
     np.testing.assert_allclose(out, jnp.zeros(2))
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_inside_of_scan(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def _callback(x):
       return x + 1.
@@ -722,8 +740,9 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
     out = f(jnp.arange(2.))
     np.testing.assert_allclose(out, jnp.arange(2.) + 10.)
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_inside_of_while_loop(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def _cond_callback(x):
       return np.any(x < 10)
@@ -746,8 +765,9 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
     out = f(jnp.arange(5.))
     np.testing.assert_allclose(out, jnp.arange(10., 15.))
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_inside_of_pmap(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def _callback(x):
       return x + 1.
@@ -763,8 +783,9 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
         out,
         np.arange(2 * jax.local_device_count()).reshape([-1, 2]) + 1.)
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_callback_inside_xmap(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def _callback(x):
       return (x + 1.).astype(x.dtype)
@@ -778,8 +799,9 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
       out = f(np.arange(40.))
     np.testing.assert_allclose(out, jnp.arange(1., 41.))
 
-  @jtu.skip_on_devices(*disabled_backends)
   def test_vectorized_callback_inside_xmap(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
 
     def _callback(x):
       return (x + 1.).astype(x.dtype)
@@ -793,6 +815,15 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
       out = f(np.arange(40.))
     np.testing.assert_allclose(out, jnp.arange(1., 41.))
 
+  def test_array_layout_is_preserved(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
+
+    def g(x):
+      return jax.pure_callback(lambda x: x, x, x)
+
+    x = np.arange(6, dtype=np.int32).reshape((3, 2))
+    np.testing.assert_allclose(g(x), x)
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,34 +12,64 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-import functools
-from functools import partial
-import itertools as it
 from collections import namedtuple
+import functools
+from functools import partial, cached_property
+import itertools as it
+import logging
 import operator
 import types
-import threading
-from typing import (Any, Callable, Dict, Iterable, List, Tuple, Generic,
-                    TypeVar, Set, Iterator, Sequence, Optional)
-import weakref
+from typing import (Any, Callable, Generic, Iterable, Iterator, List,
+                    Optional, Sequence, Set, Tuple, TypeVar, overload,
+                    TYPE_CHECKING, cast)
 
-from absl import logging
 import numpy as np
 
 from jax._src.lib import xla_client as xc
-from jax._src.lib import xla_extension_version
 from jax.config import config
+
+logger = logging.getLogger(__name__)
 
 Seq = Sequence
 
 T = TypeVar("T")
+T1 = TypeVar("T1")
+T2 = TypeVar("T2")
+T3 = TypeVar("T3")
+
+# safe_zip cannot yet be fully annotated, so we use a strategy similar
+# to that used for builtins.zip in python/typeshed. This supports
+# return types matching input types for up to three arguments.
+@overload
+def safe_zip(__arg1: Iterable[T1]) -> List[Tuple[T1]]: ...
+@overload
+def safe_zip(__arg1: Iterable[T1], __arg2: Iterable[T2]) -> List[Tuple[T1, T2]]: ...
+@overload
+def safe_zip(__arg1: Iterable[T1], __arg2: Iterable[T2], __arg3: Iterable[T3]) -> List[Tuple[T1, T2, T3]]: ...
+@overload
+def safe_zip(__arg1: Iterable[Any], __arg2: Iterable[Any], __arg3: Iterable[Any], __arg4: Iterable[Any], *args) -> List[Tuple[Any, ...]]: ...
 
 def safe_zip(*args):
+  args = list(map(list, args))
   n = len(args[0])
   for arg in args[1:]:
     assert len(arg) == n, f'length mismatch: {list(map(len, args))}'
   return list(zip(*args))
+
+# safe_map cannot yet be fully annotated, so we use a strategy similar
+# to that used for builtins.map in python/typeshed. This supports
+# checking input types for the callable with up to three arguments.
+@overload
+def safe_map(f: Callable[[T1], T], __arg1: Iterable[T1]) -> List[T]: ...
+
+@overload
+def safe_map(f: Callable[[T1, T2], T], __arg1: Iterable[T1], __arg2: Iterable[T2]) -> List[T]: ...
+
+@overload
+def safe_map(f: Callable[[T1, T2, T3], T], __arg1: Iterable[T1], __arg2: Iterable[T2], __arg3: Iterable[T3]) -> List[T]: ...
+
+@overload
+def safe_map(f: Callable[..., T], __arg1: Iterable[Any], __arg2: Iterable[Any], __arg3: Iterable[Any], __arg4: Iterable[Any], *args) -> List[T]: ...
 
 def safe_map(f, *args):
   args = list(map(list, args))
@@ -48,24 +78,26 @@ def safe_map(f, *args):
     assert len(arg) == n, f'length mismatch: {list(map(len, args))}'
   return list(map(f, *args))
 
-def unzip2(xys):
+def unzip2(xys: Iterable[Tuple[T1, T2]]
+    ) -> Tuple[Tuple[T1, ...], Tuple[T2, ...]]:
   """Unzip sequence of length-2 tuples into two tuples."""
   # Note: we deliberately don't use zip(*xys) because it is lazily evaluated,
   # is too permissive about inputs, and does not guarantee a length-2 output.
-  xs = []
-  ys = []
+  xs: List[T1] = []
+  ys: List[T2] = []
   for x, y in xys:
     xs.append(x)
     ys.append(y)
   return tuple(xs), tuple(ys)
 
-def unzip3(xyzs):
+def unzip3(xyzs: Iterable[Tuple[T1, T2, T3]]
+    ) -> Tuple[Tuple[T1, ...], Tuple[T2, ...], Tuple[T3, ...]]:
   """Unzip sequence of length-3 tuples into three tuples."""
   # Note: we deliberately don't use zip(*xyzs) because it is lazily evaluated,
   # is too permissive about inputs, and does not guarantee a length-3 output.
-  xs = []
-  ys = []
-  zs = []
+  xs: List[T1] = []
+  ys: List[T2] = []
+  zs: List[T3] = []
   for x, y, z in xyzs:
     xs.append(x)
     ys.append(y)
@@ -238,76 +270,7 @@ def weakref_lru_cache(call: Callable, maxsize=2048):
   and strong refs to all subsequent operations. In all other respects it should
   behave similar to `functools.lru_cache`.
   """
-  if xla_extension_version >= 87:
-    return xc.weakref_lru_cache(config._trace_context, call, maxsize)
-  cache: Dict[Any, Any] = {}
-  hits = misses = 0
-  lock = threading.Lock()
-
-  def remove_key(tctx, args, kwargs, weak_arg):
-    k = (weak_arg, tctx, args, kwargs)
-    try:
-      # This has a chance to race with the iteration in next(iter(cache)),
-      # but we cannot lock because GC can get triggered synchronously inside
-      # a critical section and will not relinquish control until the callback
-      # has finished. This would lead to a deadlock between this weakref
-      # cleanup function and any function below which locks.
-      del cache[k]
-    except KeyError:
-      pass
-
-  def wrapped(weak_arg, *args, **kwargs):
-    nonlocal hits, misses
-    if config.jax_check_tracer_leaks:
-      return call(weak_arg, *args, **kwargs)
-    kwargs_key = tuple(kwargs.items())
-    tctx = config._trace_context()
-    k = (weakref.ref(weak_arg,
-         functools.partial(remove_key, tctx, args, kwargs_key)),
-         tctx, args, kwargs_key)
-    with lock:
-      if k in cache:
-        hits += 1
-        result = cache[k]
-        # del and reinsert to bump key in the insertion order.
-        del cache[k]
-        cache[k] = result
-        return result
-      misses += 1
-    result = call(weak_arg, *args, **kwargs)
-    with lock:
-      cache[k] = result
-      num_errors = 0
-      while len(cache) > maxsize:
-        try:
-          del_k = next(iter(cache))
-          # This happens if a weakref callback happens between iter and
-          # next. Just ignore the error. WeakKeyDictionary handles this
-          # by deferring the deletes, but that has a chance at leaking,
-          # and this solution is easier.
-        except RuntimeError:
-          num_errors += 1
-          if num_errors > len(cache):
-            # This must be some other problem.
-            raise
-          else:
-            continue
-        del cache[del_k]
-      return result
-
-  def cache_info():
-    with lock:
-      return CacheInfo(hits, misses, maxsize, len(cache))
-
-  def cache_clear():
-    nonlocal hits, misses
-    with lock:
-      hits = misses = 0
-      cache.clear()
-
-  wrapped.cache_info = cache_info
-  wrapped.cache_clear = cache_clear
-  return wrapped
+  return xc.weakref_lru_cache(config._trace_context, call, maxsize)
 
 def prod(xs):
   out = 1
@@ -371,21 +334,16 @@ def wrap_name(name, transform_name):
   return transform_name + '(' + name + ')'
 
 def new_name_stack(name: str = ''):
-  if config.jax_experimental_name_stack:
-    from jax._src import source_info_util
-    name_stack = source_info_util.NameStack()
-    if name:
-      name_stack = name_stack.extend(name)
-    return name_stack
-  return name + '/'
+  from jax._src import source_info_util
+  name_stack = source_info_util.NameStack()
+  if name:
+    name_stack = name_stack.extend(name)
+  return name_stack
 
 def extend_name_stack(stack, name: str):
-  if config.jax_experimental_name_stack:
-    from jax._src import source_info_util
-    assert isinstance(stack, source_info_util.NameStack), stack
-    return stack.extend(name)
-  assert isinstance(stack, str)
-  return stack + name + '/'
+  from jax._src import source_info_util
+  assert isinstance(stack, source_info_util.NameStack), stack
+  return stack.extend(name)
 
 def canonicalize_axis(axis, num_dims) -> int:
   """Canonicalize an axis in [-num_dims, num_dims) to [0, num_dims)."""
@@ -510,7 +468,7 @@ def distributed_debug_log(*pairs):
       lines.append("DISTRIBUTED_DEBUG logging failed!")
       lines.append(f"{e}")
     lines.append("DISTRIBUTED_DEBUG_END")
-    logging.warning("\n".join(lines))
+    logger.warning("\n".join(lines))
 
 
 class OrderedSet(Generic[T]):
@@ -553,3 +511,38 @@ class HashableWrapper:
     if not isinstance(other, HashableWrapper):
       return False
     return self.x == other.x if self.hash is not None else self.x is other.x
+
+
+def _original_func(f):
+  if isinstance(f, property):
+    return cast(property, f).fget
+  elif isinstance(f, cached_property):
+    return f.func
+  return f
+
+
+def use_cpp_class(cpp_cls):
+  """A helper decorator to replace a python class with its C++ version"""
+
+  def wrapper(cls):
+    if TYPE_CHECKING or cpp_cls is None:
+      return cls
+
+    exclude_methods = {'__module__', '__dict__', '__doc__'}
+
+    for attr_name, attr in cls.__dict__.items():
+      if attr_name not in exclude_methods and not hasattr(
+          _original_func(attr), "_use_cpp"):
+        setattr(cpp_cls, attr_name, attr)
+
+    cpp_cls.__doc__ = cls.__doc__
+
+    return cpp_cls
+
+  return wrapper
+
+def use_cpp_method(f):
+  """A helper decorator to exclude methods from the set that are forwarded to C++ class"""
+  original_func = _original_func(f)
+  original_func._use_cpp = True
+  return f

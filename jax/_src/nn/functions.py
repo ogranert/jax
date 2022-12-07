@@ -1,4 +1,4 @@
-# Copyright 2019 Google LLC
+# Copyright 2019 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,8 +27,7 @@ from jax import lax
 from jax import core
 from jax.core import AxisName
 from jax._src import util
-from jax.scipy.special import expit
-from jax.scipy.special import logsumexp as _logsumexp
+from jax._src.ops.special import logsumexp as _logsumexp
 import jax.numpy as jnp
 
 Array = Any
@@ -45,10 +44,20 @@ def relu(x: Array) -> Array:
   .. math::
     \mathrm{relu}(x) = \max(x, 0)
 
+  except under differentiation, we take:
+
+  .. math::
+    \nabla \mathrm{relu}(0) = 0
+
+  For more information see
+  `Numerical influence of ReLU’(0) on backpropagation
+  <https://openreview.net/forum?id=urrcVI-_jRm>`_.
+
   Args:
     x : input array
   """
   return jnp.maximum(x, 0)
+# For behavior at 0, see https://openreview.net/forum?id=urrcVI-_jRm
 relu.defjvps(lambda g, ans, x: lax.select(x > 0, g, lax.full_like(g, 0)))
 
 @jax.jit
@@ -399,15 +408,15 @@ def one_hot(x: Array, num_classes: int, *,
   ``num_classes`` with the element at ``index`` set to one::
 
     >>> jax.nn.one_hot(jnp.array([0, 1, 2]), 3)
-    DeviceArray([[1., 0., 0.],
-                  [0., 1., 0.],
-                  [0., 0., 1.]], dtype=float32)
+    Array([[1., 0., 0.],
+           [0., 1., 0.],
+           [0., 0., 1.]], dtype=float32)
 
   Indicies outside the range [0, num_classes) will be encoded as zeros::
 
     >>> jax.nn.one_hot(jnp.array([-1, 3]), 3)
-    DeviceArray([[0., 0., 0.],
-                 [0., 0., 0.]], dtype=float32)
+    Array([[0., 0., 0.],
+           [0., 0., 0.]], dtype=float32)
 
   Args:
     x: A tensor of indices.

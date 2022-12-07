@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,28 +13,44 @@
 # limitations under the License.
 
 import hashlib
+import logging
 import os
 import re
 import sys
 from typing import List, Optional
 
-import jax
 from jax.experimental.compilation_cache.gfile_cache import GFileCache
+from jax._src import path as pathlib
 from jax._src.lib import version_str as jaxlib_version_str
 from jax._src.lib import xla_client
-from absl import logging
+from jax.interpreters import xla
 
 _cache = None
 
+logger = logging.getLogger(__name__)
+
+
 def initialize_cache(path):
   """Creates a global cache object. Should only be called once per process.
+
+  Will throw an assertion error if called a second time with a different path.
+
+  Args:
+    path: path for the cache directory.
+
   """
   global _cache
+  if _cache is not None and _cache._path == pathlib.Path(path):
+    logger.warning("Cache already previously initialized at %s", _cache._path)
+    return
+
   assert _cache == None, f"The cache path has already been initialized to {_cache._path}"
   _cache = GFileCache(path)
-  logging.warning("Initialized persistent compilation cache at %s", path)
+  logger.warning("Initialized persistent compilation cache at %s", path)
 
-def get_executable(xla_computation, compile_options, backend) -> Optional[xla_client.Executable]:
+
+def get_executable(xla_computation, compile_options,
+                   backend) -> Optional[xla.XlaLoadedExecutable]:
   """Returns the cached executable if present, or None otherwise."""
   assert _cache is not None, "initialize_cache must be called before you can call get_executable()"
   cache_key = get_cache_key(xla_computation, compile_options, backend)
@@ -47,24 +63,24 @@ def get_executable(xla_computation, compile_options, backend) -> Optional[xla_cl
   return xla_executable_deserialized
 
 def put_executable(module_name, xla_computation, compile_options,
-                   executable: xla_client.Executable, backend):
+                   executable: xla.XlaLoadedExecutable, backend):
   """Adds 'executable' to the cache, possibly evicting older entries."""
   assert _cache is not None, "initialize_cache must be called before you can call put_executable()"
   cache_key = get_cache_key(xla_computation, compile_options, backend)
-  logging.info('Writing %s to persistent compilation cache with key %s.',
+  logger.info('Writing %s to persistent compilation cache with key %s.',
                module_name, cache_key)
   serialized_executable = backend.serialize_executable(executable)
   _cache.put(cache_key, serialized_executable)
 
 def _log_cache_key_hash(hash_obj, last_serialized: str, hashfn):
-  if logging.vlog_is_on(1):
+  if logger.isEnabledFor(logging.DEBUG):
     # Log the hash of just this entry
     fresh_hash_obj = hashlib.sha256()
     hashfn(fresh_hash_obj)
-    logging.vlog(1, "get_cache_key hash of serialized %s: %s", last_serialized,
+    logger.debug("get_cache_key hash of serialized %s: %s", last_serialized,
                  fresh_hash_obj.digest().hex())
     # Log the cumulative hash
-    logging.vlog(1, "get_cache_key hash after serializing %s: %s",
+    logger.debug("get_cache_key hash after serializing %s: %s",
                  last_serialized, hash_obj.digest().hex())
 
 def get_cache_key(xla_computation, compile_options, backend) -> str:
@@ -113,8 +129,8 @@ def _hash_computation(hash_obj, xla_computation):
   hash_obj.update(scrubbed_hlo)
 
 def _hash_compile_options(hash_obj, compile_options_obj):
-  # TODO(phawkins): simplify this code when jaxlib >= 0.3.16 is the minimum.
-  expected_num_compile_options = 33 if xla_client._version >= 84 else 32
+  # TODO(parkers): simplify this code when jaxlib >= 0.3.23 is the minimum.
+  expected_num_compile_options = 35 if xla_client._version >= 104 else 33
   assert len(dir(compile_options_obj)) == expected_num_compile_options, (
       f"Unexpected number of CompileOption fields: "
       f"{len(dir(compile_options_obj))}. This likely: means that an extra "
@@ -131,9 +147,7 @@ def _hash_compile_options(hash_obj, compile_options_obj):
   _hash_int(hash_obj, compile_options_obj.profile_version)
   if compile_options_obj.device_assignment is not None:
     hash_obj.update(compile_options_obj.device_assignment.serialize())
-  # TODO(phawkins): simplify this code when jaxlib >= 0.3.16 is the minimum.
-  if xla_client._version >= 84:
-    _hash_bool(hash_obj, compile_options_obj.compile_portable_executable)
+  _hash_bool(hash_obj, compile_options_obj.compile_portable_executable)
 
 def _hash_executable_build_options(hash_obj, executable_obj):
   expected_options = 34
@@ -212,9 +226,9 @@ def _hash_xla_flags(hash_obj):
   # (e.g. --xla_force_host_platform_device_count=8) (I think).
   for flag in xla_flags:
     if flag.split('=')[0] in _xla_flags_to_exclude_from_cache_key:
-      logging.vlog(1, "Not including XLA flag in cache key: %s", flag)
+      logger.debug("Not including XLA flag in cache key: %s", flag)
       continue
-    logging.vlog(1, "Including XLA flag in cache key: %s", flag)
+    logger.debug("Including XLA flag in cache key: %s", flag)
     _hash_string(hash_obj, flag)
 
 def _hash_int(hash_obj, int_var):

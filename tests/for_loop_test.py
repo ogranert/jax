@@ -1,4 +1,4 @@
-# Copyright 2022 Google LLC
+# Copyright 2022 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,9 +19,10 @@ from absl.testing import parameterized
 import numpy as np
 
 import jax
+from jax import random
 from jax._src import test_util as jtu
-import jax.numpy as jnp
 from jax._src.lax.control_flow import for_loop
+import jax.numpy as jnp
 
 from jax.config import config
 config.parse_flags_with_absl()
@@ -30,10 +31,20 @@ def remat_of_for_loop(nsteps, body, state, **kwargs):
   return jax.remat(lambda state: for_loop.for_loop(nsteps, body, state,
                                                    **kwargs))(state)
 
+def nested_for_loop(nsteps, body, state, **kwargs):
+  def outer_body(_, refs):
+    def inner_body(i, _):
+      body(i, refs)
+      return
+    for_loop.for_loop(nsteps, inner_body, ())
+  return for_loop.for_loop(1, outer_body, state)
+
 FOR_LOOP_IMPLS = [
     (for_loop.for_loop, 'for_loop'),
     (jax.jit(for_loop.for_loop, static_argnums=(0, 1)), 'jit_for_loop'),
     (remat_of_for_loop, 'remat_for_loop'),
+    (nested_for_loop, 'nested_for_loop'),
+    (partial(for_loop.for_loop, unroll=3), 'unrolled_for_loop'),
 ]
 
 
@@ -196,12 +207,9 @@ for_reference = for_loop.discharged_for_loop
 
 class ForLoopTransformationTest(jtu.JaxTestCase):
 
-  @parameterized.named_parameters(
-      {"testcase_name": "_f={}_nsteps={}_impl={}".format(
-        for_body_name, nsteps, impl_name),
-        "f": for_body, "body_shapes": body_shapes,
-        "ref": ref, "n": nsteps, "for_impl": for_impl}
-      for for_impl, impl_name in FOR_LOOP_IMPLS
+  @jtu.sample_product(
+    [dict(for_body_name=for_body_name, f=for_body, ref=ref,
+          body_shapes=body_shapes, n=nsteps)
       for for_body_name, for_body, ref, body_shapes, nsteps in [
         ("swap", for_body_swap, swap_ref, [(4,), (4,)], 4),
         ("swap_swap", for_body_swap_swap, swap_swap_ref, [(4,), (4,)], 4),
@@ -210,8 +218,14 @@ class ForLoopTransformationTest(jtu.JaxTestCase):
         ("accum", for_body_accum, accum_ref, [(4,), (4,)], 3),
         ("sin_sq", for_body_sin_sq, sin_sq_ref, [(4,), (4,)], 4),
         ("reverse", for_body_reverse, reverse_ref, [(4,), (4,)], 4),
-      ])
-  def test_for_jvp(self, f, ref, body_shapes, n, for_impl):
+      ]
+    ],
+    [dict(for_impl=for_impl, impl_name=impl_name)
+     for for_impl, impl_name in FOR_LOOP_IMPLS],
+  )
+  @jtu.skip_on_devices("gpu")  # TODO(mattjj,sharadmv): timeouts?
+  def test_for_jvp(self, f, ref, body_shapes, n, for_impl, for_body_name,
+                   impl_name):
     for_ = for_impl
     rng = self.rng()
 
@@ -223,14 +237,11 @@ class ForLoopTransformationTest(jtu.JaxTestCase):
     expected = jax.jvp(ref, args, args)
     self.assertAllClose(ans, ans_discharged, check_dtypes=True, rtol=tol, atol=tol)
     self.assertAllClose(ans, expected, check_dtypes=True, rtol=tol, atol=tol)
-    jtu.check_grads(partial(for_, n, f), (args,), order=3, modes=["fwd"])
+    jtu.check_grads(partial(for_, n, f), (args,), order=2, modes=["fwd"])
 
-  @parameterized.named_parameters(
-      {"testcase_name": "_f={}_nsteps={}_impl={}".format(
-        for_body_name, nsteps, impl_name),
-        "f": for_body, "body_shapes": body_shapes,
-        "ref": ref, "n": nsteps, "for_impl": for_impl}
-      for for_impl, impl_name in FOR_LOOP_IMPLS
+  @jtu.sample_product(
+    [dict(for_body_name=for_body_name, f=for_body, ref=ref,
+          body_shapes=body_shapes, n=nsteps)
       for for_body_name, for_body, ref, body_shapes, nsteps in [
         ("swap", for_body_swap, swap_ref, [(4,), (4,)], 4),
         ("swap_swap", for_body_swap_swap, swap_swap_ref, [(4,), (4,)], 4),
@@ -239,8 +250,14 @@ class ForLoopTransformationTest(jtu.JaxTestCase):
         ("accum", for_body_accum, accum_ref, [(4,), (4,)], 3),
         ("sin_sq", for_body_sin_sq, sin_sq_ref, [(4,), (4,)], 4),
         ("reverse", for_body_reverse, reverse_ref, [(4,), (4,)], 4),
-      ])
-  def test_for_linearize(self, f, ref, body_shapes, n, for_impl):
+      ]
+    ],
+    [dict(for_impl=for_impl, impl_name=impl_name)
+     for for_impl, impl_name in FOR_LOOP_IMPLS],
+  )
+  @jtu.skip_on_devices("gpu")  # TODO(mattjj,sharadmv): timeouts?
+  def test_for_linearize(self, f, ref, body_shapes, n, for_impl, for_body_name,
+                         impl_name):
     for_ = for_impl
     rng = self.rng()
 
@@ -298,7 +315,7 @@ class ForLoopTransformationTest(jtu.JaxTestCase):
       _, b, c = for_impl(5, body, (a, b, c))
       return b, c
     a = jnp.arange(5.) + 1.
-    b = 1.
+    b = jnp.ones_like(a[0])
     _, f_lin = jax.linearize(f, a, b)
     expected_tangents = f_lin(a, b)
     _, actual_tangents = jax.jvp(f, (a, b), (a, b))
@@ -321,19 +338,16 @@ class ForLoopTransformationTest(jtu.JaxTestCase):
       _, b, c, _ = for_impl(5, body2, (a, b, c, 0))
       return b, c
     a = jnp.arange(5.) + 1.
-    b = 1.
+    b = jnp.ones_like(a[0])
     _, g_lin = jax.linearize(f, a, b)
     expected_tangents = g_lin(a, b)
     _, actual_tangents = jax.jvp(g, (a, b), (a, b))
     np.testing.assert_allclose(actual_tangents[0], expected_tangents[0])
     np.testing.assert_allclose(actual_tangents[1], expected_tangents[1])
 
-  @parameterized.named_parameters(
-      {"testcase_name": "_f={}_nsteps={}_impl={}".format(
-        for_body_name, nsteps, impl_name),
-        "f": for_body, "body_shapes": body_shapes,
-        "ref": ref, "n": nsteps, "for_impl": for_impl}
-      for for_impl, impl_name in FOR_LOOP_IMPLS
+  @jtu.sample_product(
+    [dict(for_body_name=for_body_name, f=for_body, ref=ref,
+          body_shapes=body_shapes, n=nsteps)
       for for_body_name, for_body, ref, body_shapes, nsteps in [
         ("noop", for_body_noop, noop_ref, [(4,), (4,)], 4),
         ("swap", for_body_swap, swap_ref, [(4,), (4,)], 4),
@@ -343,8 +357,15 @@ class ForLoopTransformationTest(jtu.JaxTestCase):
         ("accum", for_body_accum, accum_ref, [(4,), (4,)], 3),
         ("sin_sq", for_body_sin_sq, sin_sq_ref, [(4,), (4,)], 4),
         ("reverse", for_body_reverse, reverse_ref, [(4,), (4,)], 4),
-      ])
-  def test_for_grad(self, f, ref, body_shapes, n, for_impl):
+      ]
+    ],
+    [dict(for_impl=for_impl, impl_name=impl_name)
+     for for_impl, impl_name in FOR_LOOP_IMPLS],
+  )
+  @jtu.skip_on_devices("gpu")  # TODO(mattjj,sharadmv): timeouts?
+  @jtu.skip_on_flag("jax_skip_slow_tests", True)
+  def test_for_grad(self, f, ref, body_shapes, n, for_impl, for_body_name,
+                    impl_name):
     for_ = for_impl
     rng = self.rng()
 
@@ -358,8 +379,27 @@ class ForLoopTransformationTest(jtu.JaxTestCase):
     self.assertAllClose(ans, ans_discharged, check_dtypes=True, rtol=tol,
                         atol=tol)
     self.assertAllClose(ans, expected, check_dtypes=True, rtol=tol, atol=tol)
-    jtu.check_grads(lambda *args: for_(n, f, args)[1].sum(), args, order=3,
+    jtu.check_grads(lambda *args: for_(n, f, args)[1].sum(), args, order=2,
                     rtol=7e-3, atol=1e-2)
+
+  @jtu.skip_on_devices("gpu")  # TODO(mattjj,sharadmv): timeouts?
+  def test_grad_of_triple_nested_for_loop(self):
+
+    func = lambda x: jnp.sin(x) + 1.
+
+    @jax.jit
+    def f(x):
+      out = jnp.zeros_like(x)
+      def body(i, j, k, refs):
+        x_ref, out_ref = refs
+        y = func(x_ref[i, j, k])
+        out_ref[i, j, k] += y
+      return for_loop.for_loop(x.shape, body, (x, out))[1].sum()
+
+    x = random.normal(random.PRNGKey(0), (5, 4, 3))
+    ref = lambda x: jax.vmap(jax.vmap(jax.vmap(func)))(x).sum()
+    self.assertAllClose(f(x), ref(x))
+    jtu.check_grads(f, (x,), order=2, atol=0.1, rtol=0.1)
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

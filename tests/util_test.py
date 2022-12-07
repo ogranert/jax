@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -79,6 +79,15 @@ class UtilTest(jtu.JaxTestCase):
       example_cached_fn(stable_keys[i % len(stable_keys)])
       example_cached_fn(Key())
 
+  def test_weakref_lru_cache_asan_problem(self):
+
+    @weakref_lru_cache
+    def reference_loop_generator(x):
+      return x
+
+    for _ in range(4097):
+      reference_loop_generator(lambda x: x)
+
 
 if __name__ == "__main__":
-    absltest.main(testLoader=jtu.JaxTestLoader())
+  absltest.main(testLoader=jtu.JaxTestLoader())

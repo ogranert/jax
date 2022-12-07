@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,4 +14,4 @@
 
 # TODO(phawkins): fix users of this alias and delete this file.
 
-from jax._src.config import config
+from jax._src.config import config  # noqa: F401

@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -91,7 +91,7 @@ symlink_inputs(
     name = "chlo_dialect",
     rule = py_library,
     symlinked_inputs = {"srcs": {"dialects": [
-        "@org_tensorflow//tensorflow/compiler/xla/mlir_hlo/stablehlo:chlo_ops_py_files",
+        "@stablehlo//:chlo_ops_py_files",
     ]}},
     deps = [
         ":core",
@@ -147,7 +147,7 @@ symlink_inputs(
     name = "stablehlo_dialect",
     rule = py_library,
     symlinked_inputs = {"srcs": {"dialects": [
-        "@org_tensorflow//tensorflow/compiler/xla/mlir_hlo/stablehlo:stablehlo_ops_py_files",
+        "@stablehlo//:stablehlo_ops_py_files",
     ]}},
     deps = [
         ":core",

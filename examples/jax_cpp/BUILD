@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,8 +29,8 @@ tf_cc_binary(
         "@org_tensorflow//tensorflow/compiler/xla:shape_util",
         "@org_tensorflow//tensorflow/compiler/xla:status",
         "@org_tensorflow//tensorflow/compiler/xla:statusor",
-        "@org_tensorflow//tensorflow/compiler/xla/pjrt:cpu_device",
         "@org_tensorflow//tensorflow/compiler/xla/pjrt:pjrt_client",
+        "@org_tensorflow//tensorflow/compiler/xla/pjrt:tfrt_cpu_pjrt_client",
         "@org_tensorflow//tensorflow/compiler/xla/service:hlo_proto_cc",
         "@org_tensorflow//tensorflow/compiler/xla/tools:hlo_module_loader",
         "@org_tensorflow//tensorflow/core/platform:logging",

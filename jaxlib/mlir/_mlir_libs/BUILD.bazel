@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -106,7 +106,7 @@ py_extension(
 py_extension(
     name = "_mlirHlo",
     srcs = [
-        "@org_tensorflow//tensorflow/compiler/xla/mlir_hlo:python/MlirHloModule.cc",
+        "@org_tensorflow//tensorflow/compiler/xla/mlir_hlo:bindings/python/MlirHloModule.cc",
     ],
     copts = COPTS,
     deps = [
@@ -126,7 +126,7 @@ py_extension(
 py_extension(
     name = "_chlo",
     srcs = [
-        "@org_tensorflow//tensorflow/compiler/xla/mlir_hlo/stablehlo:stablehlo/integrations/python/ChloModule.cpp",
+        "@stablehlo//:stablehlo/integrations/python/ChloModule.cpp",
     ],
     copts = COPTS,
     deps = [
@@ -134,15 +134,15 @@ py_extension(
         "@llvm-project//mlir:CAPIIRHeaders",
         "@llvm-project//mlir:MLIRBindingsPythonHeaders",
         "@local_config_python//:headers",
-        "@org_tensorflow//tensorflow/compiler/xla/mlir_hlo/stablehlo:chlo_capi_headers",
         "@pybind11",
+        "@stablehlo//:chlo_capi_headers",
     ],
 )
 
 py_extension(
     name = "_stablehlo",
     srcs = [
-        "@org_tensorflow//tensorflow/compiler/xla/mlir_hlo/stablehlo:stablehlo/integrations/python/StablehloModule.cpp",
+        "@stablehlo//:stablehlo/integrations/python/StablehloModule.cpp",
     ],
     copts = COPTS,
     deps = [
@@ -150,8 +150,8 @@ py_extension(
         "@llvm-project//mlir:CAPIIRHeaders",
         "@llvm-project//mlir:MLIRBindingsPythonHeaders",
         "@local_config_python//:headers",
-        "@org_tensorflow//tensorflow/compiler/xla/mlir_hlo/stablehlo:stablehlo_capi_headers",
         "@pybind11",
+        "@stablehlo//:stablehlo_capi_headers",
     ],
 )
 
@@ -175,8 +175,8 @@ cc_library(
         "@llvm-project//mlir:CAPITransformsObjects",
         "@llvm-project//mlir:MLIRBindingsPythonCAPIObjects",
         "@org_tensorflow//tensorflow/compiler/xla/mlir_hlo:CAPIObjects",
-        "@org_tensorflow//tensorflow/compiler/xla/mlir_hlo/stablehlo:chlo_capi_objects",
-        "@org_tensorflow//tensorflow/compiler/xla/mlir_hlo/stablehlo:stablehlo_capi_objects",
+        "@stablehlo//:chlo_capi_objects",
+        "@stablehlo//:stablehlo_capi_objects",
     ],
 )
 
@@ -203,5 +203,10 @@ cc_binary(
 windows_cc_shared_mlir_library(
     name = "jaxlib_mlir_capi_dll",
     out = "jaxlib_mlir_capi.dll",
+    exported_symbol_prefixes = [
+        "mlir",
+        "chlo",
+        "stablehlo",
+    ],
     deps = [":jaxlib_mlir_capi_objects"],
 )

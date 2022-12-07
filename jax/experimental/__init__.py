@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# TODO(https://github.com/google/jax/issues/13487): Remove PartitionSpec in
+# 3 months from `jax.experimental.PartitionSpec`.
 from jax.interpreters.pxla import PartitionSpec as PartitionSpec
 from jax.experimental.x64_context import (
   enable_x64 as enable_x64,

@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -329,11 +329,28 @@ deflinear(lax.squeeze_p)
 deflinear(lax.rev_p)
 deflinear(lax.transpose_p)
 deflinear(lax.slice_p)
-deflinear(lax.dynamic_slice_p)
 deflinear(lax.reduce_sum_p)
 deflinear(lax.reduce_window_sum_p)
 deflinear(lax.fft_p)
 deflinear(dispatch.device_put_p)
+
+def _dynamic_slice_jet_rule(primals_in, series_in, **params):
+  operand, *start_indices = primals_in
+  primal_out = lax.dynamic_slice_p.bind(operand, *start_indices, **params)
+  series_out = [lax.dynamic_slice_p.bind(terms_in[0], *start_indices, **params)
+                for terms_in in zip(*series_in)]
+  return primal_out, series_out
+
+jet_rules[lax.dynamic_slice_p] = _dynamic_slice_jet_rule
+
+def _dynamic_update_slice_jet_rule(primals_in, series_in, **params):
+  operand, update, *start_indices = primals_in
+  primal_out = lax.dynamic_update_slice_p.bind(operand, update, *start_indices)
+  series_out = [lax.dynamic_update_slice_p.bind(*terms_in[:2], *start_indices, **params)
+                for terms_in in zip(*series_in)]
+  return primal_out, series_out
+
+jet_rules[lax.dynamic_update_slice_p] = _dynamic_update_slice_jet_rule
 
 def _cumulative_jet_rule(primals_in, series_in, *, axis: int, reverse: bool,
                          combine_fn: Callable):

@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.abspath('..'))
 # -- Project information -----------------------------------------------------
 
 project = 'JAX'
-copyright = '2020, Google LLC. NumPy and SciPy documentation are copyright the respective authors.'
+copyright = '2020, The JAX Authors. NumPy and SciPy documentation are copyright the respective authors.'
 author = 'The JAX authors'
 
 # The short X.Y version
@@ -197,6 +197,8 @@ nb_execution_timeout = 100
 # List of patterns, relative to source directory, that match notebook
 # files that will not be executed.
 nb_execution_excludepatterns = [
+    # Includes GPU timings that shouldn't be executed by doc build
+    'notebooks/quickstart.*',
     # Slow notebook: long time to load tf.ds
     'notebooks/neural_network_with_tfds_data.*',
     # Slow notebook
@@ -208,6 +210,7 @@ nb_execution_excludepatterns = [
     # TODO(jakevdp): enable execution on the following if possible:
     'jax-101/*',
     'notebooks/xmap_tutorial.*',
+    'notebooks/Parallelism_with_JAX.*',
 ]
 
 # -- Options for HTMLHelp output ---------------------------------------------

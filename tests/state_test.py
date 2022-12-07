@@ -1,4 +1,4 @@
-# Copyright 2022 Google LLC
+# Copyright 2022 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ from jax.interpreters import partial_eval as pe
 from jax._src import test_util as jtu
 from jax._src.util import tuple_insert
 import jax.numpy as jnp
+from jax._src.lax.control_flow import for_loop
 
 try:
   import hypothesis as hp
@@ -373,31 +374,31 @@ class StatePrimitivesTest(jtu.JaxTestCase):
     self.assertEqual(jaxpr.eqns[2].primitive, state.get_p)
     self.assertEqual(jaxpr.eqns[3].primitive, state.get_p)
 
-  @parameterized.parameters(jtu.cases_from_list([
-      dict(ref_shape=ref_shape, ref_bdim=ref_bdim, idx_shape=idx_shape,
-           indexed_dims=indexed_dims, idx_bdims=idx_bdims, out_bdim=out_bdim,
-           op=op)
-      for ref_shape in [(1,), (2, 3), (4, 5, 6)]
-      for ref_bdim in range(1 + len(ref_shape))
-      for idx_shape in [(), (1,), (2,), (5, 6)]
-      for indexed_dims in it.product([True, False], repeat=len(ref_shape))
-      for idx_bdims in it.product([None, *range(1 + len(idx_shape))],
-                                  repeat=sum(indexed_dims))
-      for out_bdim in range(1 + len(ref_shape) - sum(indexed_dims)
-                            + len(idx_shape) * any(indexed_dims))
-      for op in [
-          lambda x_ref, indexer: [x_ref[indexer]],
-          lambda x_ref, indexer: [
-              state.ref_swap(x_ref, indexer,
-                             jnp.ones(x_ref.shape, x_ref.dtype)[None][(0,
-                               *indexer)])],
-          lambda x_ref, indexer: (
-              state.ref_addupdate(x_ref, indexer,
-                                  jnp.ones(x_ref.shape, x_ref.dtype)[None][(0,
-                                    *indexer)])
-              or [jnp.ones(x_ref.shape, x_ref.dtype)[None][(0, *indexer)]])
-      ]
-  ]))
+  @jtu.sample_product(
+    [dict(ref_shape=ref_shape, ref_bdim=ref_bdim, idx_shape=idx_shape,
+          indexed_dims=indexed_dims, idx_bdims=idx_bdims, out_bdim=out_bdim)
+     for ref_shape in [(1,), (2, 3), (4, 5, 6)]
+     for ref_bdim in range(1 + len(ref_shape))
+     for idx_shape in [(), (1,), (2,), (5, 6)]
+     for indexed_dims in it.product([True, False], repeat=len(ref_shape))
+     for idx_bdims in it.product([None, *range(1 + len(idx_shape))],
+                                 repeat=sum(indexed_dims))
+     for out_bdim in range(1 + len(ref_shape) - sum(indexed_dims)
+                           + len(idx_shape) * any(indexed_dims))
+    ],
+    op=[
+        lambda x_ref, indexer: [x_ref[indexer]],
+        lambda x_ref, indexer: [
+            state.ref_swap(x_ref, indexer,
+                            jnp.ones(x_ref.shape, x_ref.dtype)[None][(0,
+                              *indexer)])],
+        lambda x_ref, indexer: (
+            state.ref_addupdate(x_ref, indexer,
+                                jnp.ones(x_ref.shape, x_ref.dtype)[None][(0,
+                                  *indexer)])
+            or [jnp.ones(x_ref.shape, x_ref.dtype)[None][(0, *indexer)]])
+    ],
+  )
   def test_vmap(self, ref_shape, ref_bdim, idx_shape, indexed_dims,
                     idx_bdims, out_bdim, op):
 
@@ -626,6 +627,26 @@ class StateDischargeTest(jtu.JaxTestCase):
     self.assertTrue((a == inval).all())
     self.assertTrue((b == inval + 1).all())
     self.assertTrue((refval == inval).all())
+
+  def test_partially_discharging_jaxpr_keeps_refs(self):
+    def f(a_ref, b_ref):
+      state.ref_set(a_ref, (), jnp.ones(4, jnp.float32))
+      state.ref_set(b_ref, (), jnp.ones(4, jnp.float32))
+      return []
+    in_avals = [
+        state.ShapedArrayRef((4,), jnp.dtype('float32')),
+        state.ShapedArrayRef((4,), jnp.dtype('float32'))
+        ]
+    stateful_jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(lu.wrap_init(f),
+                                                          in_avals)
+    discharged_jaxpr, _ = state.discharge_state(
+        stateful_jaxpr, consts, should_discharge=[False, True])
+    self.assertLen(discharged_jaxpr.invars, 2)
+    self.assertLen(discharged_jaxpr.outvars, 1)
+    self.assertIsInstance(discharged_jaxpr.invars[0].aval, state.ShapedArrayRef)
+    self.assertIsInstance(discharged_jaxpr.invars[1].aval, core.ShapedArray)
+    self.assertEqual(discharged_jaxpr.effects,
+        {state.WriteEffect(discharged_jaxpr.invars[0].aval)})
 
 
 if CAN_USE_HYPOTHESIS:
@@ -908,6 +929,87 @@ if CAN_USE_HYPOTHESIS:
 
       self.assertAllClose(discharge_of_vmap_ans, vmap_of_discharge_ans,
                           check_dtypes=False)
+
+
+class StateControlFlowTest(jtu.JaxTestCase):
+
+  def test_simple_cond(self):
+    def f(pred):
+      def body(x_ref):
+        def true_fun():
+          x_ref[()] = 1.
+        def false_fun():
+          pass
+        lax.cond(pred, true_fun, false_fun)
+      return for_loop.run_state(body, 0.)
+    jaxpr = jax.make_jaxpr(f)(True).jaxpr
+    self.assertEmpty(jaxpr.effects)
+    self.assertAllClose(jax.jit(f)(True), 1.)
+    self.assertAllClose(jax.jit(f)(False), 0.)
+
+  def test_nested_cond(self):
+    def f(pred):
+      def body(x_ref):
+        def true_fun():
+          def true_fun_inner():
+            x_ref[()] = 1.
+          def false_fun_inner():
+            pass
+          return lax.cond(pred, true_fun_inner, false_fun_inner)
+        def false_fun():
+          pass
+        lax.cond(pred, true_fun, false_fun)
+      return for_loop.run_state(body, 0.)
+    jaxpr = jax.make_jaxpr(f)(True).jaxpr
+    self.assertEmpty(jaxpr.effects)
+    self.assertAllClose(jax.jit(f)(True), 1.)
+    self.assertAllClose(jax.jit(f)(False), 0.)
+
+  def test_cond_jvp_with_state(self):
+    def f(pred, init_value):
+      def body(x_ref):
+        def true_fun():
+          x_ref[()] = x_ref[()] ** 2
+        def false_fun():
+          pass
+        lax.cond(pred, true_fun, false_fun)
+      return for_loop.run_state(body, init_value)
+
+    out_primal, out_tangent = jax.jvp(partial(f, True), (3.,), (1.,))
+    self.assertAllClose(out_primal, 9.)
+    self.assertAllClose(out_tangent, 6.)
+
+    out_primal, out_tangent = jax.jvp(partial(f, False), (3.,), (1.,))
+    self.assertAllClose(out_primal, 3.)
+    self.assertAllClose(out_tangent, 1.)
+
+  def test_cond_vmap_not_implemented(self):
+    @jax.jit
+    def f(init_value):
+      def body(x_ref):
+        def true_fun():
+          x_ref[()] = x_ref[()] ** 2
+        def false_fun():
+          pass
+        lax.cond(x_ref[()] < 1, true_fun, false_fun)
+      return for_loop.run_state(body, init_value)
+
+    with self.assertRaises(NotImplementedError):
+      jax.vmap(f)(jnp.arange(2.))
+
+  def test_cond_grad_not_implemented(self):
+    @jax.jit
+    def f(init_value):
+      def body(x_ref):
+        def true_fun():
+          x_ref[()] = x_ref[()] ** 2
+        def false_fun():
+          pass
+        lax.cond(True, true_fun, false_fun)
+      return for_loop.run_state(body, init_value)
+
+    with self.assertRaises(NotImplementedError):
+      jax.grad(f)(3.)
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

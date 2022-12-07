@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,15 +20,12 @@ XLA. There are also a handful of related casting utilities.
 """
 
 from functools import partial, lru_cache
+import logging
 import os
 import platform as py_platform
 import threading
 from typing import Any, Dict, List, Optional, Union
 import warnings
-
-from absl import logging
-# Disable "WARNING: Logging before flag parsing goes to stderr." message
-logging._warn_preinit_stderr = 0
 
 import jax._src.lib as lib
 from jax._src.config import flags, bool_env, int_env
@@ -51,12 +48,13 @@ traceback_util.register_exclusion(__file__)
 
 XlaBackend = xla_client._xla.Client
 
-use_sharded_buffer = xla_client._version >= 90
-# TODO(chky): Change ShardedBuffer to xla_client.ShardedBuffer when the minimum
-# jaxlib version is updated.
+# TODO(phawkins): replace with xla_client.ShardedBuffer after fixing type
+# errors.
 ShardedBuffer = Any
 
 FLAGS = flags.FLAGS
+
+logger = logging.getLogger(__name__)
 
 # TODO(phawkins): Remove jax_xla_backend.
 flags.DEFINE_string(
@@ -126,8 +124,7 @@ def get_compile_options(
     build_options.auto_spmd_partitioning_mesh_shape = auto_spmd_partitioning_mesh_shape
     build_options.auto_spmd_partitioning_mesh_ids = auto_spmd_partitioning_mesh_ids
   if device_assignment is not None:
-    logging.vlog(
-        2,
+    logger.debug(
         'get_compile_options: num_replicas=%s num_partitions=%s device_assignment=%s',
         num_replicas, num_partitions, device_assignment)
     device_assignment = np.array(device_assignment)
@@ -170,10 +167,10 @@ def get_compile_options(
 
 def _make_tpu_driver_client():
   if tpu_driver_client is None:
-    logging.info("Remote TPU is not linked into jax; skipping remote TPU.")
+    logger.info("Remote TPU is not linked into jax; skipping remote TPU.")
     return None
   if FLAGS.jax_backend_target is None:
-    logging.info("No --jax_backend_target was provided; skipping remote TPU.")
+    logger.info("No --jax_backend_target was provided; skipping remote TPU.")
     return None
   return tpu_driver_client.TpuBackend.create(worker=FLAGS.jax_backend_target)
 
@@ -226,15 +223,14 @@ register_backend_factory('tpu_driver', _make_tpu_driver_client,
 
 def make_gpu_client(*, platform_name, visible_devices_flag):
   visible_devices = getattr(FLAGS, visible_devices_flag, "all")
-  # Pass allowed_devices unconditionally when jaxlib 0.3.15 is the minimum.
-  kwargs = {}
+  allowed_devices = None
   if visible_devices != "all":
-    kwargs["allowed_devices"] = {int(x) for x in visible_devices.split(",")}
+    allowed_devices = {int(x) for x in visible_devices.split(",")}
   return xla_client.make_gpu_client(
     distributed_client=distributed.global_state.client,
     node_id=distributed.global_state.process_id,
     platform_name=platform_name,
-    **kwargs)
+    allowed_devices=allowed_devices)
 
 if hasattr(xla_client, "make_gpu_client"):
   register_backend_factory(
@@ -250,6 +246,13 @@ if hasattr(xla_client, "make_gpu_client"):
 if hasattr(xla_client, "make_tpu_client"):
   register_backend_factory(
     'tpu', partial(tpu_client_timer_callback, timer_secs=60.0), priority=300)
+
+if hasattr(xla_client, "make_plugin_device_client"):
+  # It is assumed that if jax has been built with a plugin client, then the
+  # user wants to use the plugin client by default. Therefore, it gets the
+  # highest priority.
+  register_backend_factory("plugin", xla_client.make_plugin_device_client,
+      priority=400)
 
 if iree is not None:
   register_backend_factory("iree", iree.iree_client_factory, priority=-100)
@@ -325,6 +328,8 @@ def backends():
           (platform, priority) for platform, (_, priority)
           in _backend_factories.items())
     default_priority = -1000
+    if hasattr(xla_client, "maybe_load_pjrt_plugins"):
+      xla_client.maybe_load_pjrt_plugins()
     for platform, priority in platforms_and_priorites:
       try:
         backend = _init_backend(platform)
@@ -343,17 +348,18 @@ def backends():
           # we expect a RuntimeError.
           err_msg = f"Unable to initialize backend '{platform}': {err}"
           if config.jax_platforms:
+            err_msg += " (set JAX_PLATFORMS='' to automatically choose an available backend)"
             raise RuntimeError(err_msg)
           else:
             _backends_errors[platform] = str(err)
-            logging.info(err_msg)
+            logger.info(err_msg)
             continue
     # We don't warn about falling back to CPU on Mac OS, because we don't
     # support anything else there at the moment and warning would be pointless.
     if (py_platform.system() != "Darwin" and
         _default_backend.platform == "cpu" and
         FLAGS.jax_platform_name != 'cpu'):
-      logging.warning('No GPU/TPU found, falling back to CPU. '
+      logger.warning('No GPU/TPU found, falling back to CPU. '
                       '(Set TF_CPP_MIN_LOG_LEVEL=0 and rerun for more info.)')
     return _backends
 
@@ -363,7 +369,7 @@ def _clear_backends():
   global _backends_errors
   global _default_backend
 
-  logging.info("Clearing JAX backend caches.")
+  logger.info("Clearing JAX backend caches.")
   with _backend_lock:
     _backends = {}
     _backends_errors = {}
@@ -377,7 +383,7 @@ def _init_backend(platform):
   if factory is None:
     raise RuntimeError(f"Unknown backend '{platform}'")
 
-  logging.vlog(1, "Initializing backend '%s'" % platform)
+  logger.debug("Initializing backend '%s'", platform)
   backend = factory()
   # TODO(skye): consider raising more descriptive errors directly from backend
   # factories instead of returning None.
@@ -389,7 +395,7 @@ def _init_backend(platform):
                              ("process_index", backend.process_index()),
                              ("device_count", backend.device_count()),
                              ("local_devices", backend.local_devices()))
-  logging.vlog(1, "Backend '%s' initialized" % platform)
+  logger.debug("Backend '%s' initialized", platform)
   return backend
 
 

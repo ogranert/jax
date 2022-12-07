@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ from jax._src.scipy.linalg import (
   eigh_tridiagonal as eigh_tridiagonal,
   expm as expm,
   expm_frechet as expm_frechet,
+  hessenberg as hessenberg,
   inv as inv,
   lu as lu,
   lu_factor as lu_factor,

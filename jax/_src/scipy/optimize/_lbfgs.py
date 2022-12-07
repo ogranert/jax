@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -165,7 +165,7 @@ def _minimize_lbfgs(
     gamma = rho_k_inv / jnp.real(_dot(jnp.conj(y_k), y_k))
 
     # replacements for next iteration
-    status = 0
+    status = jnp.array(0)
     status = jnp.where(state.f_k - f_kp1 < ftol, 4, status)
     status = jnp.where(state.ngev >= maxgrad, 3, status)  # type: ignore
     status = jnp.where(state.nfev >= maxfun, 2, status)  # type: ignore
@@ -187,7 +187,7 @@ def _minimize_lbfgs(
       s_history=_update_history_vectors(history=state.s_history, new=s_k),
       y_history=_update_history_vectors(history=state.y_history, new=y_k),
       rho_history=_update_history_scalars(history=state.rho_history, new=rho_k),
-      gamma=gamma,
+      gamma=gamma.astype(state.g_k.dtype),
       status=jnp.where(converged, 0, status),
       ls_status=ls_results.status,
     )

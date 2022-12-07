@@ -1,4 +1,4 @@
-# Copyright 2019 Google LLC
+# Copyright 2019 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,14 +27,14 @@ from jaxlib import xla_client
 from .mhlo_helpers import custom_call
 
 try:
-  from .cuda import _cublas
+  from .cuda import _blas as _cublas
   for _name, _value in _cublas.registrations().items():
     xla_client.register_custom_call_target(_name, _value, platform="CUDA")
 except ImportError:
   _cublas = None
 
 try:
-  from .cuda import _cusolver
+  from .cuda import _solver as _cusolver
   for _name, _value in _cusolver.registrations().items():
     xla_client.register_custom_call_target(_name, _value, platform="CUDA")
 except ImportError:
@@ -42,14 +42,14 @@ except ImportError:
 
 
 try:
-  from .rocm import _hipblas
+  from .rocm import _blas as _hipblas
   for _name, _value in _hipblas.registrations().items():
     xla_client.register_custom_call_target(_name, _value, platform="ROCM")
 except ImportError:
   _hipblas = None
 
 try:
-  from .rocm import _hipsolver
+  from .rocm import _solver as _hipsolver
   for _name, _value in _hipsolver.registrations().items():
     xla_client.register_custom_call_target(_name, _value, platform="ROCM")
 except ImportError:
@@ -61,83 +61,6 @@ def _real_type(dtype):
   return np.finfo(dtype).dtype
 
 _prod = lambda xs: functools.reduce(operator.mul, xs, 1)
-
-
-def _trsm_mhlo(platform, gpu_blas, dtype, a, b, left_side=False, lower=False,
-               trans_a=False, conj_a=False, diag=False):
-  """Batched triangular solve.
-
-  XLA implements unbatched triangular solve directly, so we need only implement
-  the batched case."""
-  b_type = ir.RankedTensorType(b.type)
-  dims = b_type.shape
-  assert len(dims) >= 2
-  m, n = dims[-2:]
-  batch_dims = tuple(dims[:-2])
-  num_bd = len(batch_dims)
-  batch = _prod(batch_dims)
-  k = m if left_side else n
-
-  a_type = ir.RankedTensorType(a.type)
-  if (batch_dims + (k, k) != tuple(a_type.shape) or
-      a_type.element_type != b_type.element_type):
-    raise ValueError("Argument mismatch for trsm, got {} and {}".format(
-      a_type, b_type))
-
-  if conj_a and not trans_a:
-    raise NotImplementedError("Conjugation without transposition not supported")
-
-  lwork, opaque = gpu_blas.build_trsm_batched_descriptor(
-    np.dtype(dtype), batch, m, n, left_side, lower, trans_a, conj_a, diag)
-  layout = (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))
-  work_type = ir.RankedTensorType.get([lwork], ir.IntegerType.get_signless(8))
-  work_layout = [0]
-  out = custom_call(
-      f"{platform}blas_trsm_batched",
-      [b_type, work_type, work_type],
-      [a, b],
-      backend_config=opaque,
-      operand_layouts=[layout] * 2,
-      result_layouts=[layout, work_layout, work_layout])
-  return out[0]
-
-cuda_trsm = partial(_trsm_mhlo, "cu", _cublas)
-rocm_trsm = partial(_trsm_mhlo, "hip", _hipblas)
-
-
-def _potrf_mhlo(platform, gpu_solver, dtype, a, lower):
-  """Cholesky decomposition."""
-  a_type = ir.RankedTensorType(a.type)
-  dims = a_type.shape
-  m, n = dims[-2:]
-  assert m == n
-  batch_dims = tuple(dims[:-2])
-  num_bd = len(batch_dims)
-  batch = _prod(batch_dims)
-
-  lwork, opaque = gpu_solver.build_potrf_descriptor(
-      np.dtype(dtype), lower, batch, n)
-
-  layout = (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))
-  info_layout = tuple(range(num_bd - 1, -1, -1))
-  i32_type = ir.IntegerType.get_signless(32)
-  info_type = ir.RankedTensorType.get(batch_dims, i32_type)
-  work_layout = [0]
-  out = custom_call(
-      f"{platform}solver_potrf",
-      [
-        a.type,
-        info_type,
-        ir.RankedTensorType.get([lwork], ir.IntegerType.get_signless(8)),
-      ],
-      [a],
-      backend_config=opaque,
-      operand_layouts=[layout],
-      result_layouts=[layout, info_layout, work_layout])
-  return out[:2]
-
-cuda_potrf = partial(_potrf_mhlo, "cu", _cusolver)
-rocm_potrf = partial(_potrf_mhlo, "hip", _hipsolver)
 
 
 def _getrf_mhlo(platform, gpu_blas, gpu_solver, dtype, a):
@@ -179,7 +102,8 @@ def _getrf_mhlo(platform, gpu_blas, gpu_solver, dtype, a):
         tuple(range(num_bd, -1, -1)),
         tuple(range(num_bd - 1, -1, -1)),
         [0],
-      ])
+      ],
+      operand_output_aliases={0: 0})
   return out[:3]
 
 cuda_getrf = partial(_getrf_mhlo, "cu", _cublas, _cusolver)
@@ -217,7 +141,8 @@ def _geqrf_mhlo(platform, gpu_solver, dtype, a):
         tuple(range(num_bd, -1, -1)),
         tuple(range(num_bd - 1, -1, -1)),
         [0],
-      ])
+      ],
+      operand_output_aliases={0: 0})
   return out[:3]
 
 cuda_geqrf = partial(_geqrf_mhlo, "cu", _cusolver)
@@ -253,7 +178,9 @@ def _geqrf_batched_mhlo(platform, gpu_blas, dtype, a):
         tuple(range(num_bd, -1, -1)),
         [0],
         [0],
-      ])
+      ],
+      operand_output_aliases={0: 0}
+  )
   return out[:2]
 
 cuda_geqrf_batched = partial(_geqrf_batched_mhlo, "cu", _cublas)
@@ -321,7 +248,8 @@ def _orgqr_mhlo(platform, gpu_solver, dtype, a, tau):
         layout,
         tuple(range(num_bd - 1, -1, -1)),
         [0],
-      ])
+      ],
+      operand_output_aliases={0: 0})
   return out[:2]
 
 cuda_orgqr = partial(_orgqr_mhlo, "cu", _cusolver)
@@ -372,11 +300,12 @@ def _syevd_mhlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
           tuple(range(num_bd, -1, -1)),
           tuple(range(num_bd - 1, -1, -1)),
           [0],
-      ])
+      ],
+      operand_output_aliases={0: 0})
   return out[:3]
 
 cuda_syevd = partial(_syevd_mhlo, "cu", _cusolver, True)
-rocm_syevd = partial(_syevd_mhlo, "hip", _hipsolver, False)
+rocm_syevd = partial(_syevd_mhlo, "hip", _hipsolver, True)
 
 
 def _gesvd_mhlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
@@ -427,7 +356,8 @@ def _gesvd_mhlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
             matrix_layout,
             scalar_layout,
             [0],
-        ])
+        ],
+        operand_output_aliases={0: 0})
     vt = mhlo.TransposeOp(
         v,
         ir.DenseIntElementsAttr.get(np.array(tuple(range(num_bd)) + (num_bd + 1, num_bd)))).result
@@ -469,7 +399,8 @@ def _gesvd_mhlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
           matrix_layout,
           scalar_layout,
           [0],
-        ])
+        ],
+        operand_output_aliases={0: 0})
   else:
     lwork, opaque = gpu_solver.build_gesvd_descriptor(
         np.dtype(dtype), b, m, n, compute_uv, full_matrices)
@@ -495,8 +426,81 @@ def _gesvd_mhlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
           matrix_layout,
           scalar_layout,
           [0],
-        ])
+        ],
+        operand_output_aliases={0: 0})
   return s, u, vt, info
 
 cuda_gesvd = partial(_gesvd_mhlo, "cu", _cusolver, True)
 rocm_gesvd = partial(_gesvd_mhlo, "hip", _hipsolver, False)
+
+
+def _sytrd_mhlo(platform, gpu_solver, dtype, a, *, lower):
+  """sytrd: Reduction of a symmetric (Hermitian) matrix to tridiagonal form."""
+  a_type = ir.RankedTensorType(a.type)
+  dims = a_type.shape
+  assert len(dims) >= 2
+  m, n = dims[-2:]
+  assert m == n, (m, n)
+  batch_dims = tuple(dims[:-2])
+  num_bd = len(batch_dims)
+  b = 1
+  for d in batch_dims:
+    b *= d
+
+  lwork, opaque = gpu_solver.build_sytrd_descriptor(dtype, lower, b, n)
+  if np.issubdtype(dtype, np.floating):
+    diag_type = a_type.element_type
+  elif dtype == np.complex64:
+    diag_type = ir.F32Type.get()
+  elif dtype == np.complex128:
+    diag_type = ir.F64Type.get()
+  else:
+    raise NotImplementedError(f"Unsupported dtype {dtype}")
+
+  layout = (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))
+  i32_type = ir.IntegerType.get_signless(32)
+  a, d, e, taus, info, _ = custom_call(
+      f"{platform}solver_sytrd",
+      [
+        a.type,
+        ir.RankedTensorType.get(batch_dims + (n,), diag_type),
+        ir.RankedTensorType.get(batch_dims + (n - 1,), diag_type),
+        ir.RankedTensorType.get(batch_dims + (n - 1,), a_type.element_type),
+        ir.RankedTensorType.get(batch_dims, i32_type),
+        ir.RankedTensorType.get([lwork], a_type.element_type),
+      ],
+      [a],
+      backend_config=opaque,
+      operand_layouts=[layout],
+      result_layouts=[
+        layout,
+        (num_bd,) + tuple(range(num_bd - 1, -1, -1)),
+        (num_bd,) + tuple(range(num_bd - 1, -1, -1)),
+        (num_bd,) + tuple(range(num_bd - 1, -1, -1)),
+        tuple(range(num_bd - 1, -1, -1)),
+        [0],
+      ],
+      operand_output_aliases={0: 0},
+  )
+  # Workaround for NVIDIA partners bug #3865118: sytrd returns an incorrect "1"
+  # in the first element of the superdiagonal in the `a` matrix in the
+  # lower=False case. The correct result is returned in the `e` vector so we can
+  # simply copy it back to where it needs to be:
+  intattr = lambda xs: ir.DenseIntElementsAttr.get(np.asarray(xs, np.int64))
+  if not lower and platform == "cu" and m > 1:
+    start = (0,) * len(batch_dims) + (0,)
+    end = batch_dims + (1,)
+    s = mhlo.SliceOp(e, intattr(start), intattr(end), intattr([1] * len(start)))
+    s_type = ir.RankedTensorType.get(batch_dims + (1, 1), diag_type)
+    s = mhlo.BroadcastInDimOp(s_type, s, intattr(range(len(dims) - 1)))
+    # The diagonals are always real; convert to complex if needed.
+    s = mhlo.ConvertOp(
+        ir.RankedTensorType.get(s_type.shape, a_type.element_type), s)
+    offsets = tuple(mhlo.ConstantOp(intattr(i))
+                    for i in ((0,) * len(batch_dims) + (0, 1)))
+    a = mhlo.DynamicUpdateSliceOp(a.type, a, s, offsets).result
+
+  return a, d, e, taus, info
+
+cuda_sytrd = partial(_sytrd_mhlo, "cu", _cusolver)
+rocm_sytrd = partial(_sytrd_mhlo, "hip", _hipsolver)

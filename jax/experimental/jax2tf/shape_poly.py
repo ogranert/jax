@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,15 +41,15 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 import jax
 from jax._src.numpy import lax_numpy
 from jax._src import dtypes
+from jax.interpreters import xla
 from jax._src.lax import lax
+from jax._src.typing import DimSize, Shape
 import opt_einsum
 from jax import config
 from jax import core
 
 import numpy as np
 
-DimSize = core.DimSize
-Shape = core.Shape
 TfVal = Any
 # A dimension environment maps dimension variables to expressions that
 # compute the value of the dimension. These expressions refer to the
@@ -415,8 +415,12 @@ class _DimPolynomial():
                             dtypes.canonicalize_dtype(np.int64),
                             weak_type=True)
 
+  def __jax_array__(self):
+    # Used for implicit coercions of polynomials as JAX arrays
+    return _dim_as_value(self)
 
 core.pytype_aval_mappings[_DimPolynomial] = _DimPolynomial.get_aval
+xla.pytype_aval_mappings[_DimPolynomial] = _DimPolynomial.get_aval
 
 def _ensure_poly(p: DimSize) -> _DimPolynomial:
   if isinstance(p, _DimPolynomial): return p
@@ -519,7 +523,7 @@ def _einsum_contract_path(*operands, **kwargs):
     contract_operands.append(operands[idx[0]])
   return contract_operands, contractions
 
-lax_numpy._polymorphic_einsum_contract_path_handlers[_DimPolynomial] = _einsum_contract_path
+lax_numpy._poly_einsum_handlers[_DimPolynomial] = _einsum_contract_path
 
 # A JAX primitive with no array arguments but with a dimension parameter
 # that is a DimPoly. The value of the primitive is the value of the dimension.

@@ -130,6 +130,31 @@ python .\build\build.py `
 
 To build with debug information, add the flag `--bazel_options='--copt=/Z7'`.
 
+### Additional notes for building a ROCM `jaxlib` for AMD GPUs
+
+You need several ROCM/HIP libraries installed to build for ROCM. For
+example, on a Ubuntu machine with AMD's `apt` repositories available, you need
+a number of packages installed:
+
+```
+sudo apt install miopen-hip hipfft-dev rocrand-dev hipsparse-dev hipsolver-dev \
+    rccl-dev rccl hip-dev rocfft-dev roctracer-dev hipblas-dev rocm-device-libs
+```
+
+AMD's fork of the XLA (TensorFlow) repository may include fixes
+not present in the upstream repository. To use AMD's fork, you should clone
+their repository:
+```
+git clone https://github.com/ROCmSoftwarePlatform/tensorflow-upstream.git
+```
+
+To build jaxlib with ROCM support, you can run the following build command,
+suitably adjusted for your paths and ROCM version.
+```
+python build/build.py --enable_rocm --rocm_path=/opt/rocm-5.3.0 \
+  --bazel_options=--override_repository=org_tensorflow=/path/to/tensorflow-upstream
+```
+
 ## Installing `jax`
 
 Once `jaxlib` has been installed, you can install `jax` by running:
@@ -180,6 +205,22 @@ A number of test behaviors can be controlled using environment variables (see
 below). Environment variables may be passed to JAX tests using the
 `--test_env=FLAG=value` flag to Bazel.
 
+Some of JAX tests are for multiple accelerators (i.e. GPUs, TPUs). When JAX is already installed, you can run GPUs tests like this:
+
+```
+bazel test //tests:gpu_tests --jobs=4 --test_tag_filters=multiaccelerator --//jax:build_jaxlib=false --test_env=XLA_PYTHON_CLIENT_ALLOCATOR=platform
+```
+
+You can speed up single accelerator tests by running them in parallel on multiple accelerators. This also triggers multiple concurrent tests per accelerator. For GPUs, you can do it like this:
+
+```
+NB_GPUS=2
+JOBS_PER_ACC=4
+J=$((NB_GPUS * JOBS_PER_ACC))
+MULTI_GPU="--run_under $PWD/build/parallel_accelerator_execute.sh --test_env=JAX_ACCELERATOR_COUNT=${NB_GPUS} --test_env=JAX_TESTS_PER_ACCELERATOR=${JOBS_PER_ACC} --jobs=$J"
+bazel test //tests:gpu_tests //tests:backend_independent_tests --test_env=XLA_PYTHON_CLIENT_PREALLOCATE=false --test_tag_filters=-multiaccelerator $MULTI_GPU
+```
+
 ## Using pytest
 
 To run all the JAX tests using `pytest`, we recommend using `pytest-xdist`,
@@ -222,7 +263,7 @@ built-in selection mechanisms, or alternatively you can run a specific test
 file directly to see more detailed information about the cases being run:
 
 ```
-python tests/lax_numpy_test.py --num_generated_cases=5
+JAX_NUM_GENERATED_CASES=5 python tests/lax_numpy_test.py
 ```
 
 You can skip a few tests known to be slow, by passing environment variable

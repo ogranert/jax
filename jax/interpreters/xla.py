@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,8 +22,7 @@ import itertools as it
 import operator
 import re
 from typing import (Any, Callable, Dict, List, NamedTuple, Optional,
-                    Sequence, Set, Type, Tuple, Union)
-from typing_extensions import Protocol
+                    Protocol, Sequence, Set, Type, Tuple, Union)
 
 import numpy as np
 
@@ -32,7 +31,7 @@ from jax import core
 from jax._src import device_array
 from jax._src import dtypes
 from jax._src import source_info_util
-from jax._src.abstract_arrays import (make_shaped_array, array_types)
+from jax._src.abstract_arrays import numpy_scalar_types
 from jax.core import (ConcreteArray, ShapedArray, str_eqn_compact)
 import jax._src.pretty_printer as pp
 from jax._src.util import (prod, new_name_stack, safe_zip, safe_map,
@@ -41,9 +40,11 @@ from jax._src.util import (prod, new_name_stack, safe_zip, safe_map,
 # TODO: update callers to refer to new location.
 from jax._src.util import extend_name_stack as extend_name_stack  # noqa: F401
 from jax._src.util import wrap_name as wrap_name  # noqa: F401
+from jax._src.typing import Shape
 
 from jax._src.lib import xla_bridge as xb
 from jax._src.lib import xla_client as xc
+from jax._src.lib import xla_extension_version
 from jax.interpreters import partial_eval as pe
 from jax.interpreters import ad
 
@@ -61,7 +62,11 @@ Buffer = xe.Buffer
 XlaOp = xc.XlaOp
 XlaShape = xc.Shape
 XlaBuilder = xc.XlaBuilder
-XlaExecutable = xc.Executable
+XlaLoadedExecutable = Any
+if xla_extension_version >= 98:
+  XlaLoadedExecutable = xc.LoadedExecutable  # type:ignore
+else:
+  XlaLoadedExecutable = xc.Executable  # type:ignore
 
 # apply_primitive is defined in jax._src.dispatch.
 apply_primitive: Callable
@@ -98,18 +103,15 @@ def make_op_metadata(primitive: core.Primitive,
                      source_info: source_info_util.SourceInfo,
                      name_stack: Union[str, source_info_util.NameStack] = "",
                      ) -> xc.OpMetadata:
-  if config.jax_experimental_name_stack:
-    eqn_str = str(source_info.name_stack) + '/' + str_eqn_compact(primitive.name, params)
-  else:
-    assert isinstance(name_stack, str)
-    eqn_str = name_stack + str_eqn_compact(primitive.name, params)
+  eqn_str = (str(source_info.name_stack) + '/'
+             + str_eqn_compact(primitive.name, params))
   tracebacks[eqn_str] = source_info.traceback
   frame = source_info_util.user_frame(source_info)
   return xc.OpMetadata(
         op_type=primitive.name,
         op_name=eqn_str,
         source_file=_get_canonical_source_file(frame) if frame else None,
-        source_line=frame.line_num if frame else None)
+        source_line=frame.start_line if frame else None)
 
 # Utilities
 
@@ -134,9 +136,9 @@ def parameter(builder, num, shape, name=None, replicated=None):
 # arbitrary tuple nesting, but JAX only uses one level of tupling (and our type
 # checkers don't support recursive types), so we only represent one level of
 # nesting in this type definition.
-SpatialSharding = Union[Tuple[int, ...],
+SpatialSharding = Union[Shape,
                         None,
-                        Tuple[Optional[Tuple[int, ...]], ...]]
+                        Tuple[Optional[Shape], ...]]
 
 def sharding_to_proto(sharding: SpatialSharding):
   """Converts a SpatialSharding to an OpSharding.
@@ -244,8 +246,12 @@ def canonicalize_dtype(x):
     return canonicalize_dtype(x.__jax_array__())
   raise TypeError(f"No canonicalize_dtype handler for type: {type(x)}")
 
+
 def _canonicalize_ndarray_dtype(x):
-  return np.asarray(x, dtypes.canonicalize_dtype(dtypes.result_type(x)))
+  return np.asarray(x, dtypes.canonicalize_dtype(x.dtype))
+
+def _canonicalize_numpy_scalar_dtype(x):
+  return np.asarray(x, dtypes.canonicalize_dtype(np.dtype(x)))
 
 def _canonicalize_python_scalar_dtype(typ, x):
   return np.asarray(
@@ -255,13 +261,12 @@ canonicalize_dtype_handlers: Dict[Any, Callable] = {}
 for t in device_array.device_array_types:
   canonicalize_dtype_handlers[t] = identity
 canonicalize_dtype_handlers.update(
-    (t, _canonicalize_ndarray_dtype) for t in array_types)
+    (t, _canonicalize_ndarray_dtype) for t in numpy_scalar_types)
+canonicalize_dtype_handlers[np.ndarray] = _canonicalize_ndarray_dtype
 canonicalize_dtype_handlers.update(
     (t, partial(_canonicalize_python_scalar_dtype, t)) for t in _scalar_types)
 canonicalize_dtype_handlers[core.Token] = identity
-canonicalize_dtype_handlers[core.PaddedArray] = identity
-canonicalize_dtype_handlers[core.BInt] = \
-    lambda x: core.BInt(_canonicalize_python_scalar_dtype(int, x.val), x.bound)
+canonicalize_dtype_handlers[core.DArray] = identity
 
 def abstractify(x) -> core.AbstractValue:
   typ = type(x)
@@ -280,13 +285,25 @@ def _make_abstract_python_scalar(typ, val):
   return ShapedArray((), dtypes._scalar_type_to_dtype(typ, val),
                      weak_type=typ is not bool)
 
+def _make_shaped_array_for_numpy_scalar(x: np.generic) -> ShapedArray:
+  dtype = np.dtype(x)
+  dtypes.check_valid_dtype(dtype)
+  return ShapedArray(np.shape(x), dtypes.canonicalize_dtype(dtype))
+
+def _make_shaped_array_for_numpy_array(x: np.ndarray) -> ShapedArray:
+  dtype = x.dtype
+  dtypes.check_valid_dtype(dtype)
+  return ShapedArray(x.shape, dtypes.canonicalize_dtype(dtype))
+
+
 pytype_aval_mappings: Dict[Any, Callable[[Any], core.AbstractValue]] = {}
 for t in device_array.device_array_types:
   pytype_aval_mappings[t] = operator.attrgetter('aval')
-pytype_aval_mappings[core.BInt] = lambda x: core.AbstractBInt(x.bound)
-pytype_aval_mappings[core.PaddedArray] = operator.attrgetter('_aval')
+pytype_aval_mappings[core.DArray] = operator.attrgetter('_aval')
 pytype_aval_mappings[core.Token] = lambda _: core.abstract_token
-pytype_aval_mappings.update((t, make_shaped_array) for t in array_types)
+pytype_aval_mappings.update((t, _make_shaped_array_for_numpy_scalar)
+                            for t in numpy_scalar_types)
+pytype_aval_mappings[np.ndarray] = _make_shaped_array_for_numpy_array
 pytype_aval_mappings.update(
     (t, partial(_make_abstract_python_scalar, t)) for t in _scalar_types)
 

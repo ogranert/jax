@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 import inspect
 import functools
 from functools import partial
+from typing import cast, Any, Callable, List, Literal, Optional, Tuple, TypeVar, Union, overload
 import warnings
 
 import numpy as np
@@ -40,6 +41,8 @@ from jax._src.lax import eigh as lax_eigh
 from jax._src.lax import lax as lax_internal
 from jax._src.lax import svd as lax_svd
 from jax._src.lib import lapack
+from jax._src.lib import mlir_api_version
+from jax._src.lib import version as jaxlib_version
 
 from jax._src.lib import gpu_linalg
 from jax._src.lib import gpu_solver
@@ -50,14 +53,16 @@ from jax._src.lib import xla_client
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import chlo
 from jax._src.lib.mlir.dialects import mhlo
+from jax._src.typing import Array, ArrayLike
 
 xops = xla_client.ops
 
+TFun = TypeVar('TFun', bound=Callable[..., Any])
 
 # traceables
 
 # TODO(phawkins): remove backward compatibility shim after 2022/08/11.
-def _warn_on_positional_kwargs(f):
+def _warn_on_positional_kwargs(f: TFun) -> TFun:
   """Decorator used for backward compatibility of keyword-only arguments.
 
   Some functions were changed to mark their keyword arguments as keyword-only.
@@ -98,10 +103,10 @@ def _warn_on_positional_kwargs(f):
       kwargs[name] = value
     return f(*pos_args, **kwargs)
 
-  return wrapped
+  return cast(TFun, wrapped)
 
 @_warn_on_positional_kwargs
-def cholesky(x, *, symmetrize_input: bool = True):
+def cholesky(x: Array, *, symmetrize_input: bool = True) -> Array:
   """Cholesky decomposition.
 
   Computes the Cholesky decomposition
@@ -131,7 +136,8 @@ def cholesky(x, *, symmetrize_input: bool = True):
   return jnp.tril(cholesky_p.bind(x))
 
 @_warn_on_positional_kwargs
-def eig(x, *, compute_left_eigenvectors=True, compute_right_eigenvectors=True):
+def eig(x: ArrayLike, *, compute_left_eigenvectors: bool = True,
+        compute_right_eigenvectors: bool = True) -> List[Array]:
   """Eigendecomposition of a general matrix.
 
   Nonsymmetric eigendecomposition is at present only implemented on CPU.
@@ -140,8 +146,8 @@ def eig(x, *, compute_left_eigenvectors=True, compute_right_eigenvectors=True):
                     compute_right_eigenvectors=compute_right_eigenvectors)
 
 @_warn_on_positional_kwargs
-def eigh(x, *, lower: bool = True, symmetrize_input: bool = True,
-         sort_eigenvalues: bool = True, ):
+def eigh(x: Array, *, lower: bool = True, symmetrize_input: bool = True,
+         sort_eigenvalues: bool = True) -> Tuple[Array, Array]:
   r"""Eigendecomposition of a Hermitian matrix.
 
   Computes the eigenvectors and eigenvalues of a complex Hermitian or real
@@ -176,7 +182,7 @@ def eigh(x, *, lower: bool = True, symmetrize_input: bool = True,
   return v, w
 
 
-def lu_pivots_to_permutation(pivots, permutation_size: int):
+def lu_pivots_to_permutation(pivots: ArrayLike, permutation_size: int) -> Array:
   """Converts the pivots (row swaps) returned by LU to a permutation.
 
   We build a permutation rather than applying `pivots` directly to the rows
@@ -194,7 +200,7 @@ def lu_pivots_to_permutation(pivots, permutation_size: int):
   return permutation
 
 
-def lu(x):
+def lu(x: ArrayLike) -> Tuple[Array, Array, Array]:
   """LU decomposition with partial pivoting.
 
   Computes the matrix decomposition:
@@ -228,7 +234,7 @@ def lu(x):
   return lu, pivots, permutation
 
 @_warn_on_positional_kwargs
-def qr(x, *, full_matrices: bool = True):
+def qr(x: ArrayLike, *, full_matrices: bool = True) -> Tuple[Array, Array]:
   """QR decomposition.
 
   Computes the QR decomposition
@@ -258,9 +264,18 @@ def qr(x, *, full_matrices: bool = True):
   q, r = qr_p.bind(x, full_matrices=full_matrices)
   return q, r
 
+@overload
+def svd(x: ArrayLike, *, full_matrices: bool = True, compute_uv: Literal[True]) -> Tuple[Array, Array, Array]: ...
+
+@overload
+def svd(x: ArrayLike, *, full_matrices: bool = True, compute_uv: Literal[False]) -> Array: ...
+
+@overload
+def svd(x: ArrayLike, *, full_matrices: bool = True, compute_uv: bool = True) -> Union[Array, Tuple[Array, Array, Array]]: ...
+
 # TODO: Add `max_qdwh_iterations` to the function signature for TPU SVD.
 @_warn_on_positional_kwargs
-def svd(x, *, full_matrices=True, compute_uv=True):
+def svd(x: ArrayLike, *, full_matrices: bool = True, compute_uv: bool = True) -> Union[Array, Tuple[Array, Array, Array]]:
   """Singular value decomposition.
 
   Returns the singular values if compute_uv is False, otherwise returns a triple
@@ -276,9 +291,10 @@ def svd(x, *, full_matrices=True, compute_uv=True):
     return s
 
 @_warn_on_positional_kwargs
-def triangular_solve(a, b, *, left_side: bool = False, lower: bool = False,
+def triangular_solve(a: ArrayLike, b: ArrayLike, *,
+                     left_side: bool = False, lower: bool = False,
                      transpose_a: bool = False, conjugate_a: bool = False,
-                     unit_diagonal: bool = False):
+                     unit_diagonal: bool = False) -> Array:
   r"""Triangular solve.
 
   Solves either the matrix equation
@@ -327,17 +343,17 @@ def triangular_solve(a, b, *, left_side: bool = False, lower: bool = False,
 
 # utilities
 @partial(vectorize, signature='(n,m),(m)->(n)')
-def _matvec_multiply(a, b):
+def _matvec_multiply(a: Array, b: Array) -> Array:
   return lax.dot(a, b, precision=lax.Precision.HIGHEST)
 
-def _check_solve_shapes(a, b):
+def _check_solve_shapes(a: Array, b: Array):
   if not (a.ndim >= 2 and b.ndim in [a.ndim, a.ndim - 1] and
           a.shape[-1] == a.shape[-2] == b.shape[a.ndim - 2]):
     raise ValueError(
         "The arguments to solve must have shapes a=[..., m, m] and "
         f"b=[..., m, k] or b=[..., m]; got a={a.shape} and b={b.shape}")
 
-def _solve(a, b):
+def _solve(a: Array, b: Array) -> Array:
   _check_solve_shapes(a, b)
 
   # Broadcast leading dimensions of b to the shape of a, as is required by
@@ -361,15 +377,9 @@ def _solve(a, b):
     # b.shape == [..., m, k]
     return api.vmap(custom_solve, b.ndim - 1, max(a.ndim, b.ndim) - 1)(b)
 
-def _T(x): return jnp.swapaxes(x, -1, -2)
-def _H(x): return jnp.conj(_T(x))
-def symmetrize(x): return (x + _H(x)) / 2
-
-def _unpack_tuple(f, n):
-  def g(c, *args, **kwargs):
-    t = f(c, *args, **kwargs)
-    return (xops.GetTupleElement(t, i) for i in range(n))
-  return g
+def _T(x: Array) -> Array: return jnp.swapaxes(x, -1, -2)
+def _H(x: Array) -> Array: return jnp.conj(_T(x))
+def symmetrize(x: Array) -> Array: return (x + _H(x)) / 2
 
 # primitives
 
@@ -431,14 +441,6 @@ mlir.register_lowering(
     cholesky_p,
     partial(_cholesky_cpu_gpu_lowering, lapack.potrf_mhlo),
     platform='cpu')
-mlir.register_lowering(
-  cholesky_p,
-  partial(_cholesky_cpu_gpu_lowering, gpu_solver.cuda_potrf),
-  platform='cuda')
-mlir.register_lowering(
-  cholesky_p,
-  partial(_cholesky_cpu_gpu_lowering, gpu_solver.rocm_potrf),
-  platform='rocm')
 
 # Asymmetric eigendecomposition
 
@@ -558,7 +560,8 @@ ad.primitive_jvps[eig_p] = eig_jvp_rule
 # Symmetric/Hermitian eigendecomposition
 
 
-def eigh_jacobi(x, *, lower: bool = True, sort_eigenvalues: bool = True):
+def eigh_jacobi(x: ArrayLike, *, lower: bool = True,
+                sort_eigenvalues: bool = True) -> Tuple[Array, Array]:
   """Helper Jacobi eigendecomposition implemented by XLA.
 
   Used as a subroutine of QDWH-eig on TPU."""
@@ -742,11 +745,11 @@ mlir.register_lowering(
     platform='tpu')
 
 
-triangular_solve_dtype_rule = partial(
+_triangular_solve_dtype_rule = partial(
     naryop_dtype_rule, _input_dtype, (_float | _complex, _float | _complex),
     'triangular_solve')
 
-def triangular_solve_shape_rule(a, b, *, left_side=False, **unused_kwargs):
+def _triangular_solve_shape_rule(a, b, *, left_side=False, **unused_kwargs):
   if a.ndim < 2:
     msg = "triangular_solve requires a.ndim to be at least 2, got {}."
     raise TypeError(msg.format(a.ndim))
@@ -767,7 +770,7 @@ def triangular_solve_shape_rule(a, b, *, left_side=False, **unused_kwargs):
     raise TypeError(msg.format(a.shape, b.shape))
   return b.shape
 
-def triangular_solve_jvp_rule_a(
+def _triangular_solve_jvp_rule_a(
     g_a, ans, a, b, *, left_side, lower, transpose_a, conjugate_a,
     unit_diagonal):
   m, n = b.shape[-2:]
@@ -800,7 +803,7 @@ def triangular_solve_jvp_rule_a(
     else:
       return dot(ans, a_inverse(g_a))  # X (∂A A^{-1})
 
-def triangular_solve_transpose_rule(
+def _triangular_solve_transpose_rule(
     cotangent, a, b, *, left_side, lower, transpose_a, conjugate_a,
     unit_diagonal):
   # Triangular solve is nonlinear in its first argument and linear in its second
@@ -816,7 +819,7 @@ def triangular_solve_transpose_rule(
   return [None, cotangent_b]
 
 
-def triangular_solve_batching_rule(batched_args, batch_dims, *, left_side,
+def _triangular_solve_batching_rule(batched_args, batch_dims, *, left_side,
                                    lower, transpose_a, conjugate_a,
                                    unit_diagonal):
   x, y = batched_args
@@ -845,13 +848,13 @@ def triangular_solve_batching_rule(batched_args, batch_dims, *, left_side,
                             unit_diagonal=unit_diagonal), 0
 
 triangular_solve_p = standard_primitive(
-    triangular_solve_shape_rule, triangular_solve_dtype_rule,
+    _triangular_solve_shape_rule, _triangular_solve_dtype_rule,
     'triangular_solve')
 ad.defjvp2(triangular_solve_p,
-           triangular_solve_jvp_rule_a,
+           _triangular_solve_jvp_rule_a,
            lambda g_b, _, a, b, **kws: triangular_solve(a, g_b, **kws))
-ad.primitive_transposes[triangular_solve_p] = triangular_solve_transpose_rule
-batching.primitive_batchers[triangular_solve_p] = triangular_solve_batching_rule
+ad.primitive_transposes[triangular_solve_p] = _triangular_solve_transpose_rule
+batching.primitive_batchers[triangular_solve_p] = _triangular_solve_batching_rule
 
 
 def _triangular_solve_lowering(
@@ -864,10 +867,16 @@ def _triangular_solve_lowering(
     transpose = "NO_TRANSPOSE"
   else:
     transpose = "ADJOINT" if conjugate_a else "TRANSPOSE"
-  return mhlo.TriangularSolveOp(
-      mlir.aval_to_ir_type(out_aval), a, b, ir.BoolAttr.get(left_side),
-      ir.BoolAttr.get(lower), ir.BoolAttr.get(unit_diagonal),
-      mhlo.TransposeAttr.get(transpose)).results
+  if mlir_api_version < 36:
+    return mhlo.TriangularSolveOp(
+        mlir.aval_to_ir_type(out_aval), a, b, ir.BoolAttr.get(left_side),
+        ir.BoolAttr.get(lower), ir.BoolAttr.get(unit_diagonal),
+        mhlo.TransposeAttr.get(transpose)).results
+  else:
+    return mhlo.TriangularSolveOp(
+        a, b, ir.BoolAttr.get(left_side),
+        ir.BoolAttr.get(lower), ir.BoolAttr.get(unit_diagonal),
+        mhlo.TransposeAttr.get(transpose)).results
 
 mlir.register_lowering(triangular_solve_p, _triangular_solve_lowering)
 
@@ -891,46 +900,19 @@ def _triangular_solve_cpu_lower(
       transpose = "ADJOINT" if conjugate_a else "TRANSPOSE"
     else:
       transpose = "NO_TRANSPOSE"
-    return mhlo.TriangularSolveOp(b.type, a, b, ir.BoolAttr.get(left_side),
-                                  ir.BoolAttr.get(lower),
-                                  ir.BoolAttr.get(unit_diagonal),
-                                  mhlo.TransposeAttr.get(transpose)).results
+    if mlir_api_version < 36:
+      return mhlo.TriangularSolveOp(b.type, a, b, ir.BoolAttr.get(left_side),
+                                    ir.BoolAttr.get(lower),
+                                    ir.BoolAttr.get(unit_diagonal),
+                                    mhlo.TransposeAttr.get(transpose)).results
+    else:
+      return mhlo.TriangularSolveOp(a, b, ir.BoolAttr.get(left_side),
+                                    ir.BoolAttr.get(lower),
+                                    ir.BoolAttr.get(unit_diagonal),
+                                    mhlo.TransposeAttr.get(transpose)).results
 
 mlir.register_lowering(triangular_solve_p, _triangular_solve_cpu_lower,
                        platform='cpu')
-
-
-def _triangular_solve_gpu_lower(
-    trsm_impl, ctx, a, b, *, left_side, lower, transpose_a, conjugate_a,
-    unit_diagonal):
-  a_aval, _ = ctx.avals_in
-  m, n = a_aval.shape[-2:]
-  batch = prod(a_aval.shape[:-2])
-  if conjugate_a and not transpose_a:
-    a = chlo.ConjOp(a).result
-    conjugate_a = False
-  if batch > 1 and m <= 256 and n <= 256:
-    return [trsm_impl(a_aval.dtype, a, b, left_side, lower, transpose_a,
-                      conjugate_a, unit_diagonal)]
-  else:
-    # Use the XLA implementation for unbatched triangular_solve.
-    if transpose_a:
-      transpose = "ADJOINT" if conjugate_a else "TRANSPOSE"
-    else:
-      transpose = "NO_TRANSPOSE"
-    return mhlo.TriangularSolveOp(b.type, a, b, ir.BoolAttr.get(left_side),
-                                  ir.BoolAttr.get(lower),
-                                  ir.BoolAttr.get(unit_diagonal),
-                                  mhlo.TransposeAttr.get(transpose)).results
-
-mlir.register_lowering(
-    triangular_solve_p,
-    partial(_triangular_solve_gpu_lower, gpu_solver.cuda_trsm),
-    platform='cuda')
-mlir.register_lowering(
-    triangular_solve_p,
-    partial(_triangular_solve_gpu_lower, gpu_solver.rocm_trsm),
-    platform='rocm')
 
 
 # Support operation for LU decomposition: Transformation of the pivots returned
@@ -1168,8 +1150,8 @@ def _lu_jvp_rule(primals, tangents):
   lau = triangular_solve(u, la, left_side=False, transpose_a=False,
                          lower=False)
 
-  l_dot = jnp.matmul(l, jnp.tril(lau, -1))
-  u_dot = jnp.matmul(jnp.triu(lau), u)
+  l_dot = jnp.matmul(l, jnp.tril(lau, -1), precision=lax.Precision.HIGHEST)
+  u_dot = jnp.matmul(jnp.triu(lau), u, precision=lax.Precision.HIGHEST)
   lu_dot = l_dot + u_dot
   return (lu, pivots, permutation), (lu_dot, ad_util.Zero.from_value(pivots),
                                      ad_util.Zero.from_value(permutation))
@@ -1232,7 +1214,7 @@ xla.register_translation(lu_p, _lu_tpu_translation_rule, platform='tpu')
 
 
 @partial(vectorize, excluded={3}, signature='(n,n),(n),(n,k)->(n,k)')
-def _lu_solve_core(lu, permutation, b, trans):
+def _lu_solve_core(lu: Array, permutation: Array, b: Array, trans: int) -> Array:
   m = lu.shape[0]
   x = jnp.reshape(b, (m, np.prod(b.shape[1:])))
   if trans == 0:
@@ -1252,7 +1234,7 @@ def _lu_solve_core(lu, permutation, b, trans):
 
 
 @partial(api.jit, static_argnums=(3,))
-def _lu_solve(lu, permutation, b, trans):
+def _lu_solve(lu: Array, permutation: Array, b: Array, trans: int) -> Array:
   if len(lu.shape) < 2 or lu.shape[-1] != lu.shape[-2]:
     raise ValueError("last two dimensions of LU decomposition must be equal, "
                      "got shape {}".format(lu.shape))
@@ -1281,7 +1263,8 @@ def _lu_solve(lu, permutation, b, trans):
   return x[..., 0] if rhs_vector else x
 
 
-def lu_solve(lu, permutation, b, trans=0):
+def lu_solve(lu: ArrayLike, permutation: ArrayLike, b: ArrayLike,
+             trans: int = 0) -> Array:
   """LU solve with broadcasting."""
   return _lu_solve(lu, permutation, b, trans)
 
@@ -1292,7 +1275,7 @@ def lu_solve(lu, permutation, b, trans=0):
 # geqrf and orgqr. The names, while cryptic Fortran alphabet soup, are LAPACK's
 # names for the primitives, and we stick with them for consistency.
 
-def geqrf(a):
+def geqrf(a: ArrayLike) -> Tuple[Array, Array]:
   """Computes the QR decomposition of a matrix.
 
   Args:
@@ -1372,9 +1355,9 @@ mlir.register_lowering(
     platform='rocm')
 
 
-# orgqr: product of elementary Householder reflectors
+# householder_product: product of elementary Householder reflectors
 
-def orgqr(a, taus):
+def householder_product(a: ArrayLike, taus: ArrayLike) -> Array:
   """Product of elementary Householder reflectors.
 
   Args:
@@ -1387,31 +1370,34 @@ def orgqr(a, taus):
     A batch of orthogonal (unitary) matrices with the same shape as ``a``,
     containing the products of the elementary Householder reflectors.
   """
-  return orgqr_p.bind(a, taus)
+  return householder_product_p.bind(a, taus)
 
 
-def _orgqr_abstract_eval(a, taus):
+def _householder_product_abstract_eval(a, taus):
   if not isinstance(a, ShapedArray) or not isinstance(taus, ShapedArray):
-    raise NotImplementedError("Unsupported aval in orgqr_abstract_eval: "
+    raise NotImplementedError("Unsupported aval in householder_product_abstract_eval: "
                               f"{a.aval} {taus.aval}")
   if a.ndim < 2:
-    raise ValueError("Argument to QR decomposition must have ndims >= 2")
+    raise ValueError("Argument to Householder product must have ndims >= 2")
   *batch_dims, m, n = a.shape
   *taus_batch_dims, k = taus.shape
   if a.dtype != taus.dtype or batch_dims != taus_batch_dims or k > min(m, n):
-    raise ValueError(f"Type mismatch for orgqr: a={a} taus={taus}")
+    raise ValueError(f"Type mismatch for Householder product: {a=} {taus=}")
+  if m < n:
+    raise ValueError("Householder product inputs must have at least as many "
+                     f"rows as columns, got shape {a.shape}")
   return a
 
-def _orgqr_batching_rule(batched_args, batch_dims):
+def _householder_product_batching_rule(batched_args, batch_dims):
   a, taus = batched_args
   b_a, b_taus, = batch_dims
-  return orgqr(batching.moveaxis(a, b_a, 0),
+  return householder_product(batching.moveaxis(a, b_a, 0),
                batching.moveaxis(taus, b_taus, 0)), (0,)
 
-def _orgqr_translation_rule(ctx, avals_in, avals_out, a, taus):
+def _householder_product_translation_rule(ctx, avals_in, avals_out, a, taus):
   return [xops.ProductOfElementaryHouseholderReflectors(a, taus)]
 
-def _orgqr_cpu_gpu_lowering(orgqr_impl, ctx, a, taus):
+def _householder_product_cpu_gpu_lowering(orgqr_impl, ctx, a, taus):
   a_aval, _ = ctx.avals_in
   *batch_dims, m, n = a_aval.shape
 
@@ -1429,37 +1415,29 @@ def _orgqr_cpu_gpu_lowering(orgqr_impl, ctx, a, taus):
   return [a]
 
 
-orgqr_p = Primitive('orgqr')
-orgqr_p.def_impl(partial(xla.apply_primitive, orgqr_p))
-orgqr_p.def_abstract_eval(_orgqr_abstract_eval)
-batching.primitive_batchers[orgqr_p] = _orgqr_batching_rule
-xla.register_translation(orgqr_p, _orgqr_translation_rule)
+householder_product_p = Primitive('householder_product')
+householder_product_p.def_impl(partial(xla.apply_primitive, householder_product_p))
+householder_product_p.def_abstract_eval(_householder_product_abstract_eval)
+batching.primitive_batchers[householder_product_p] = _householder_product_batching_rule
+xla.register_translation(householder_product_p, _householder_product_translation_rule)
 
 mlir.register_lowering(
-    orgqr_p, partial(_orgqr_cpu_gpu_lowering, lapack.orgqr_mhlo),
+    householder_product_p,
+    partial(_householder_product_cpu_gpu_lowering, lapack.orgqr_mhlo),
     platform='cpu')
 mlir.register_lowering(
-    orgqr_p,
-    partial(_orgqr_cpu_gpu_lowering, gpu_solver.cuda_orgqr),
+    householder_product_p,
+    partial(_householder_product_cpu_gpu_lowering, gpu_solver.cuda_orgqr),
     platform='cuda')
 mlir.register_lowering(
-    orgqr_p,
-    partial(_orgqr_cpu_gpu_lowering, gpu_solver.rocm_orgqr),
+    householder_product_p,
+    partial(_householder_product_cpu_gpu_lowering, gpu_solver.rocm_orgqr),
     platform='rocm')
 
 
 def _qr_impl(operand, *, full_matrices):
   q, r = xla.apply_primitive(qr_p, operand, full_matrices=full_matrices)
   return q, r
-
-def _qr_translation_rule(ctx, avals_in, avals_out, operand, *, full_matrices):
-  operand_aval, = avals_in
-  shape = operand_aval.shape
-  m, n = shape[-2:]
-  if m == 0 or n == 0:
-    return [_eye_like_xla(ctx.builder, avals_out[0]),
-            _zeros_like_xla(ctx.builder, avals_out[1])]
-  return xops.QR(operand, full_matrices)
 
 def _qr_abstract_eval(operand, *, full_matrices):
   if isinstance(operand, ShapedArray):
@@ -1510,13 +1488,13 @@ def _qr_lowering(a, *, full_matrices):
 
   r, taus = geqrf(a)
   if m < n:
-    q = orgqr(r[..., :m, :m], taus)
+    q = householder_product(r[..., :m, :m], taus)
   elif full_matrices:
     pads = [(0, 0, 0)] * (len(batch_dims) + 1) + [(0, m - n, 0)]
     q = lax.pad(r, lax_internal._zero(r), pads)
-    q = orgqr(q, taus)
+    q = householder_product(q, taus)
   else:
-    q = orgqr(r, taus)
+    q = householder_product(r, taus)
     r = r[..., :n, :n]
   r = jnp.triu(r)
   return q, r
@@ -1570,6 +1548,7 @@ def _svd_abstract_eval(operand, *, full_matrices, compute_uv):
   else:
     raise NotImplementedError
 
+@jax.default_matmul_precision("float32")
 def _svd_jvp_rule(primals, tangents, *, full_matrices, compute_uv):
   A, = primals
   dA, = tangents
@@ -1582,7 +1561,7 @@ def _svd_jvp_rule(primals, tangents, *, full_matrices, compute_uv):
 
   Ut, V = _H(U), _H(Vt)
   s_dim = s[..., None, :]
-  dS = jnp.matmul(jnp.matmul(Ut, dA), V)
+  dS = Ut @ dA @ V
   ds = jnp.real(jnp.diagonal(dS, 0, -2, -1))
 
   if not compute_uv:
@@ -1599,16 +1578,16 @@ def _svd_jvp_rule(primals, tangents, *, full_matrices, compute_uv):
   s_inv = 1 / (s + s_zeros) - s_zeros
   s_inv_mat = jnp.vectorize(jnp.diag, signature='(k)->(k,k)')(s_inv)
   dUdV_diag = .5 * (dS - _H(dS)) * s_inv_mat.astype(A.dtype)
-  dU = jnp.matmul(U, F.astype(A.dtype) * (dSS + _H(dSS)) + dUdV_diag)
-  dV = jnp.matmul(V, F.astype(A.dtype) * (SdS + _H(SdS)))
+  dU = U @ (F.astype(A.dtype) * (dSS + _H(dSS)) + dUdV_diag)
+  dV = V @ (F.astype(A.dtype) * (SdS + _H(SdS)))
 
   m, n = A.shape[-2:]
   if m > n:
-    I = lax.expand_dims(jnp.eye(m, dtype=A.dtype), range(U.ndim - 2))
-    dU = dU + jnp.matmul(I - jnp.matmul(U, Ut), jnp.matmul(dA, V)) / s_dim.astype(A.dtype)
+    dAV = dA @ V
+    dU = dU + (dAV - U @ (Ut @ dAV)) / s_dim.astype(A.dtype)
   if n > m:
-    I = lax.expand_dims(jnp.eye(n, dtype=A.dtype), range(V.ndim - 2))
-    dV = dV + jnp.matmul(I - jnp.matmul(V, Vt), jnp.matmul(_H(dA), U)) / s_dim.astype(A.dtype)
+    dAHU = _H(dA) @ U
+    dV = dV + (dAHU - V @ (Vt @ dAHU)) / s_dim.astype(A.dtype)
 
   return (s, U, Vt), (ds, dU, _H(dV))
 
@@ -1778,7 +1757,7 @@ mlir.register_lowering(tridiagonal_solve_p, mlir.lower_fun(
     _tridiagonal_solve_jax, multiple_results=False))
 
 
-def tridiagonal_solve(dl, d, du, b):
+def tridiagonal_solve(dl: Array, d: Array, du: Array, b: Array) -> Array:
   r"""Computes the solution of a tridiagonal linear system.
 
   This function computes the solution of a tridiagonal linear system:
@@ -1830,10 +1809,10 @@ def tridiagonal_solve(dl, d, du, b):
 
 
 @_warn_on_positional_kwargs
-def schur(x, *,
-          compute_schur_vectors=True,
-          sort_eig_vals=False,
-          select_callable=None):
+def schur(x: ArrayLike, *,
+          compute_schur_vectors: bool = True,
+          sort_eig_vals: bool = False,
+          select_callable: Optional[Callable[..., Any]] = None) -> Tuple[Array, Array]:
   return schur_p.bind(
       x,
       compute_schur_vectors=compute_schur_vectors,
@@ -1935,6 +1914,168 @@ mlir.register_lowering(schur_p, _schur_lowering)
 mlir.register_lowering(schur_p, _schur_cpu_lowering, platform='cpu')
 batching.primitive_batchers[schur_p] = _schur_batching_rule
 ad.primitive_jvps[schur_p] = _schur_jvp_rule
+
+
+# hessenberg: Upper Hessenberg reduction
+
+def hessenberg(a: ArrayLike) -> Tuple[Array, Array]:
+  """Reduces a square matrix to upper Hessenberg form.
+
+  Currently implemented on CPU only.
+
+  Args:
+    a: A floating point or complex square matrix or batch of matrices.
+
+  Returns:
+  A ``(a, taus)`` pair, where the upper triangle and first subdiagonal of ``a``
+  contain the upper Hessenberg matrix, and the elements below the first
+  subdiagonal contain the Householder reflectors. For each Householder
+  reflector ``taus`` contains the scalar factors of the elementary Householder
+  reflectors.
+  """
+  return hessenberg_p.bind(a)
+
+def _hessenberg_abstract_eval(a):
+  if a.dtype not in (jnp.float32, jnp.float64, jnp.complex64, jnp.complex128):
+    raise TypeError("hessenberg requires a.dtype to be float32, float64, "
+                    f"complex64, or complex128, got {a.dtype}.")
+  if a.ndim < 2:
+    raise TypeError("hessenberg requires a.ndim to be at least 2, got "
+                    f"{a.ndim}.")
+  if a.shape[-1] != a.shape[-2]:
+    raise TypeError("hessenberg requires the last two dimensions of a to be "
+                    f"equal in size, got a.shape of {a.shape}.")
+  return [a, ShapedArray(a.shape[:-2] + (a.shape[-1] - 1,), a.dtype)]
+
+hessenberg_p = Primitive("hessenberg")
+hessenberg_p.def_impl(partial(xla.apply_primitive, hessenberg_p))
+hessenberg_p.def_abstract_eval(_hessenberg_abstract_eval)
+hessenberg_p.multiple_results = True
+
+def _hessenberg_batching_rule(batched_args, batch_dims):
+  x, = batched_args
+  bd, = batch_dims
+  x = batching.moveaxis(x, bd, 0)
+  return hessenberg(x), 0
+
+batching.primitive_batchers[hessenberg_p] = _hessenberg_batching_rule
+
+def _hessenberg_cpu_mhlo(ctx, a):
+  # TODO(phawkins): remove this test after jaxlib 0.3.25 is the minimum.
+  if not hasattr(lapack, "gehrd_mhlo"):
+    raise RuntimeError("Hessenberg reduction on CPU requires jaxlib 0.3.25 or "
+                       "newer")
+  a_aval, = ctx.avals_in
+  batch_dims = a_aval.shape[:-2]
+  a, taus, info = lapack.gehrd_mhlo(a_aval.dtype, a)
+  ok = mlir.compare_mhlo(
+      info, mlir.full_like_aval(0, ShapedArray(batch_dims, np.dtype(np.int32))),
+      "EQ", "SIGNED")
+  return [
+    _broadcasting_select_mhlo(
+      mhlo.BroadcastInDimOp(
+          ir.RankedTensorType.get(batch_dims + (1, 1),
+                                  ir.IntegerType.get_signless(1)),
+          ok, mlir.dense_int_elements(range(len(batch_dims)))).result,
+      a, _nan_like_mhlo(ctx.avals_out[0])),
+    _broadcasting_select_mhlo(
+      mhlo.BroadcastInDimOp(
+          ir.RankedTensorType.get(batch_dims + (1,),
+                                  ir.IntegerType.get_signless(1)),
+          ok, mlir.dense_int_elements(range(len(batch_dims)))).result,
+      taus, _nan_like_mhlo(ctx.avals_out[1])),
+    ]
+
+mlir.register_lowering(hessenberg_p, _hessenberg_cpu_mhlo, platform='cpu')
+
+
+# tridiagonal: Upper Hessenberg reduction
+
+def tridiagonal(a: ArrayLike, *, lower=True
+               ) -> Tuple[Array, Array, Array, Array]:
+  """Reduces a symmetric/Hermitian matrix to tridiagonal form.
+
+  Currently implemented on CPU and GPU only.
+
+  Args:
+    a: A floating point or complex matrix or batch of matrices.
+    lower: Describes which triangle of the input matrices to use.
+      The other triangle is ignored and not accessed.
+
+  Returns:
+  A ``(a, d, e, taus)`` pair. If ``lower=True``, the diagonal and first subdiagonal of
+  matrix (or batch of matrices) ``a`` contain the tridiagonal representation,
+  and elements below the first subdiagonal contain the elementary Householder
+  reflectors, where additionally ``d`` contains the diagonal of the matrix and ``e`` contains
+  the first subdiagonal.If ``lower=False`` the diagonal and first superdiagonal of the
+  matrix contains the tridiagonal representation, and elements above the first
+  superdiagonal contain the elementary Householder reflectors, where
+  additionally ``d`` contains the diagonal of the matrix and ``e`` contains the
+  first superdiagonal. ``taus`` contains the scalar factors of the elementary
+  Householder reflectors.
+  """
+  arr, d, e, taus, info = tridiagonal_p.bind(jnp.asarray(a), lower=lower)
+  nan = arr.dtype.type(jnp.nan)
+  if jnp.issubdtype(arr.dtype, np.complexfloating):
+    nan = nan + arr.dtype.type(jnp.nan * 1j)
+  arr = jnp.where((info == 0)[..., None, None], arr, nan)
+  real_type = jnp.finfo(arr.dtype).dtype.type
+  d = jnp.where((info == 0)[..., None], d, real_type(jnp.nan))
+  e = jnp.where((info == 0)[..., None], e, real_type(jnp.nan))
+  taus = jnp.where((info == 0)[..., None], taus, nan)
+  return arr, d, e, taus
+
+def _tridiagonal_abstract_eval(a, *, lower):
+  if a.dtype not in (jnp.float32, jnp.float64, jnp.complex64, jnp.complex128):
+    raise TypeError("tridiagonal requires a.dtype to be float32, float64, "
+                    f"complex64, or complex128, got {a.dtype}.")
+  if a.ndim < 2:
+    raise TypeError("tridiagonal requires a.ndim to be at least 2, got "
+                    f"{a.ndim}.")
+  if a.shape[-1] != a.shape[-2]:
+    raise TypeError("tridiagonal requires the last two dimensions of a to be "
+                    f"equal in size, got a.shape of {a.shape}.")
+  if a.shape[-1] == 0:
+    raise TypeError("tridiagonal requires the last two dimensions of a to be "
+                    f"non-zero, got a.shape of {a.shape}.")
+  real_dtype = jnp.finfo(a.dtype).dtype
+  return [
+      a,
+      ShapedArray(a.shape[:-2] + (a.shape[-1],), real_dtype),
+      ShapedArray(a.shape[:-2] + (a.shape[-1] - 1,), real_dtype),
+      ShapedArray(a.shape[:-2] + (a.shape[-1] - 1,), a.dtype),
+      ShapedArray(a.shape[:-2], np.int32)
+  ]
+
+tridiagonal_p = Primitive("tridiagonal")
+tridiagonal_p.def_impl(partial(xla.apply_primitive, tridiagonal_p))
+tridiagonal_p.def_abstract_eval(_tridiagonal_abstract_eval)
+tridiagonal_p.multiple_results = True
+
+def _tridiagonal_batching_rule(batched_args, batch_dims, *, lower):
+  x, = batched_args
+  bd, = batch_dims
+  x = batching.moveaxis(x, bd, 0)
+  return tridiagonal(x), 0
+
+batching.primitive_batchers[tridiagonal_p] = _tridiagonal_batching_rule
+
+def _tridiagonal_cpu_gpu_mhlo(sytrd_impl, ctx, a, *, lower):
+  a_aval, = ctx.avals_in
+  a, d, e, taus, info = sytrd_impl(a_aval.dtype, a, lower=lower)
+  return a, d, e, taus, info
+
+if jaxlib_version >= (0, 3, 25):
+  mlir.register_lowering(
+      tridiagonal_p, partial(_tridiagonal_cpu_gpu_mhlo, lapack.sytrd_mhlo),
+      platform='cpu')
+  mlir.register_lowering(
+      tridiagonal_p, partial(_tridiagonal_cpu_gpu_mhlo, gpu_solver.cuda_sytrd),
+      platform='cuda')
+  mlir.register_lowering(
+      tridiagonal_p, partial(_tridiagonal_cpu_gpu_mhlo, gpu_solver.rocm_sytrd),
+      platform='rocm')
+
 
 
 # Utilities

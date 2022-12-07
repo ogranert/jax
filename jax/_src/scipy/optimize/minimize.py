@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -66,7 +66,7 @@ def minimize(
   - Optimization results may differ from SciPy due to differences in the line
     search implementation.
 
-  ``minimize`` supports ``jit`` compilation. It does not yet support
+  ``minimize`` supports :func:`~jax.jit` compilation. It does not yet support
   differentiation or arguments in the form of multi-dimensional arrays, but
   support for both is planned.
 

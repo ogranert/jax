@@ -1,4 +1,4 @@
-# Copyright 2022 Google LLC
+# Copyright 2022 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,4 +14,7 @@
 from jax._src.debugging import debug_callback as callback
 from jax._src.debugging import debug_print as print
 from jax._src.debugging import DebugEffect
+from jax._src.debugging import visualize_array_sharding
+from jax._src.debugging import inspect_array_sharding
+from jax._src.debugging import visualize_sharding
 from jax._src.debugger import breakpoint

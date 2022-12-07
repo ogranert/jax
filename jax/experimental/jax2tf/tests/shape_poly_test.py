@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -53,6 +53,11 @@ PS = jax2tf.PolyShape
 
 
 class DimPolynomialTest(tf_test_util.JaxToTfTestCase):
+  def setUp(self):
+    super().setUp()
+    if config.jax2tf_default_experimental_native_lowering and not config.jax_dynamic_shapes:
+      self.skipTest("shape polymorphism but --jax_dynamic_shapes is not set.")
+
 
   def test_parse_poly_spec(self):
     self.assertEqual((2, 3), shape_poly._parse_spec(None, (2, 3)))
@@ -69,7 +74,7 @@ class DimPolynomialTest(tf_test_util.JaxToTfTestCase):
 
   a, b = shape_poly._parse_spec("a, b", (2, 3))
   @parameterized.named_parameters(
-      dict(testcase_name=f"_dim_spec={dim_spec}",
+      dict(testcase_name=f"_{dim_spec=}",
            dim_spec=dim_spec, dim_poly=dim_poly)
       for dim_spec, dim_poly in [
           ("2*a*b", 2 * a * b),
@@ -88,7 +93,7 @@ class DimPolynomialTest(tf_test_util.JaxToTfTestCase):
     self.assertEqual((dim_poly,), shape_poly._parse_spec(str(dim_poly), (2,)))
 
   @parameterized.named_parameters(
-      dict(testcase_name=f"_dim_spec={dim_spec}",
+      dict(testcase_name=f"_{dim_spec=}",
            dim_spec=dim_spec, dim_poly=dim_poly)
       for dim_spec, dim_poly in [
           ("2*a*b", 2 * a * b),
@@ -333,6 +338,11 @@ class DimPolynomialTest(tf_test_util.JaxToTfTestCase):
 
 
 class ShapePolyTest(tf_test_util.JaxToTfTestCase):
+
+  def setUp(self):
+    super().setUp()
+    if config.jax2tf_default_experimental_native_lowering and not config.jax_dynamic_shapes:
+      self.skipTest("shape polymorphism but --jax_dynamic_shapes is not set.")
 
   def test_simple_unary(self):
     """Test shape polymorphism for a simple case, unary function."""
@@ -696,6 +706,16 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
                             dict(a="(_,)", b="(4,)")],
         expected_output_signature=tf.TensorSpec([4]))
 
+  def test_with_nested_jit(self):
+    @jax.jit
+    def f_jax(x):
+      return jnp.sin(x)
+
+    self.CheckShapePolymorphism(
+        f_jax,
+        input_signature=[tf.TensorSpec([1, None])],
+        polymorphic_shapes=["1, b"])
+
   def test_with_custom_vjp(self):
     """Shape-polymorphic custom VJP."""
 
@@ -824,10 +844,7 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
         res_jax,
         jax2tf.convert(f, polymorphic_shapes=["(b, h)", "h"])(x, y))
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-      dict(testcase_name=f"function={with_function}",
-           with_function=with_function)
-      for with_function in [False, True]))
+  @jtu.sample_product(with_function=[False, True])
   def test_grad_int(self, with_function=True):
     # https://github.com/google/jax/issues/7093
     # Also issue #6975.
@@ -898,16 +915,8 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
     self.assertAllClose(3., restored_f(x))
     self.assertAllClose(np.array([0., 0.], dtype=np.float32), jax.grad(f_jax)(x))
 
-  def test_readme_example(self):
+  def test_readme_examples(self):
     """Some of the examples from the README."""
-    def image_mask_jax(images, mask):
-      # images: f32[B, W, W]  and mask: f32[W, W]
-      return images * mask
-
-    print(jax.make_jaxpr(image_mask_jax)(np.ones((1024, 28, 28)), np.ones((28, 28))))
-
-    # will invoke broadcast_in_dim with shape=(1, w, w)
-    jax2tf.convert(image_mask_jax, polymorphic_shapes=["(b, w, w)", "(w, w)"])
 
     jax2tf.convert(lambda x: jnp.reshape(x, (x.shape[0] * x.shape[1],)),
                    polymorphic_shapes=["(b, 4)"])(np.ones((3, 4)))
@@ -915,13 +924,23 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
     jax2tf.convert(lambda x: jnp.reshape(x, (np.prod(x.shape),)),
                    polymorphic_shapes=["(b, 4)"])(np.ones((3, 4)))
 
+    jax2tf.convert(lambda x: x + x.shape[0] + jnp.sin(x.shape[0]),
+                   polymorphic_shapes=["b"])(np.ones(3))
+
+    jax2tf.convert(lambda x: jnp.sum(x, axis=0) / x.shape[0],
+                   polymorphic_shapes=["(v, _)"])(np.ones((3, 4)))
+
+    jax2tf.convert(lambda x: jnp.array(x.shape[0]),
+                   polymorphic_shapes=["(v, _)"])(np.ones((4, 4)))
+
     with self.assertRaisesRegex(TypeError,
-                                "Argument 'b' .*DimPoly.*not a valid JAX type"):
+                                "prod requires ndarray or scalar arguments"):
       jax2tf.convert(lambda x: jnp.prod(x.shape),
                      polymorphic_shapes=["(b, 4)"])(np.ones((3, 4)))
 
-  def test_readme_shape_error(self):
-    """Some of the examples from the README."""
+    jax2tf.convert(lambda x: jnp.prod(jnp.array(x.shape)),
+                   polymorphic_shapes=["(b, 4)"])(np.ones((3, 4)))
+
     with self.assertRaisesRegex(
         TypeError,
         re.escape("add got incompatible shapes for broadcasting: (v,), (4,)")):
@@ -959,13 +978,6 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
 
     jax2tf.convert(lambda x: jnp.reshape(x, (2, -1)),
                    polymorphic_shapes=["(2*b, ...)"])(np.ones((4, 5, 7)))
-
-    with self.assertRaisesRegex(
-        core.InconclusiveDimensionOperation,
-        re.compile("Cannot divide .* by 'v'.*Dividend must be a polynomial.",
-                   re.DOTALL)):
-      jax2tf.convert(lambda x: jnp.sum(x, axis=0) / x.shape[0],
-                     polymorphic_shapes=["(v, _)"])(np.ones((4, 4)))
 
     with self.assertRaisesRegex(
         core.InconclusiveDimensionOperation,
@@ -1014,32 +1026,16 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
 
 
 class DimAsValueTest(tf_test_util.JaxToTfTestCase):
-
-  def test_concrete_shapes(self):
-    # Test dim_as_value with concrete shapes.
-    def f(x):
-      return jnp.sum(x, axis=0) * core.dimension_as_value(x.shape[0])
-
-    x = np.arange(3.)
-    self.assertAllClose(9., f(x))
-    self.assertAllClose(9., jax.jit(f)(x))
-
-    res_primal, res_tangent = jax.jvp(f, (x,), (np.array([0.1, 0.2, 0.3]),))
-    self.assertAllClose((9., 1.8), (res_primal, res_tangent))
-
-    self.assertAllClose(np.array([3., 3., 3.]), jax.grad(f)(x))
-
-    xv = np.arange(24.).reshape((2, 3, 4))
-    res_vmap = jax.vmap(f, in_axes=1)(xv)
-    # Implement by iteration
-    res_iter = jnp.stack([f(xv[:, i, :]) for i in range(xv.shape[1])])
-    self.assertAllClose(res_iter, res_vmap)
-
+  """Dimension polynomials used as values in the JAX computation."""
+  def setUp(self):
+    super().setUp()
+    if config.jax2tf_default_experimental_native_lowering and not config.jax_dynamic_shapes:
+      self.skipTest("shape polymorphism but --jax_dynamic_shapes is not set.")
 
   def test_dynamic_shapes(self):
     # Test dim_as_value with dynamic shapes.
     def f(x):
-      return jnp.sum(x, axis=0) * core.dimension_as_value(x.shape[0])
+      return jnp.sum(x, axis=0) * x.shape[0]
 
     x = np.arange(3.)
     self.assertAllClose(9., jax2tf.convert(f, polymorphic_shapes=["(b,)"])(x))
@@ -1072,7 +1068,7 @@ class DimAsValueTest(tf_test_util.JaxToTfTestCase):
   def test_mean0(self):
 
     def f_jax(x):
-      return jnp.sum(x, axis=0) / core.dimension_as_value(x.shape[0])
+      return jnp.sum(x, axis=0) / x.shape[0]
 
     x = np.arange(12.).reshape((3, 4))
     f_tf = self.CheckShapePolymorphism(
@@ -1082,51 +1078,46 @@ class DimAsValueTest(tf_test_util.JaxToTfTestCase):
         expected_output_signature=tf.TensorSpec([4]))
     self.assertAllClose(np.array([4., 5., 6., 7.]), f_tf(x))
 
-  def test_mean_all_axes(self):
-
+  def test_dimension_used_as_value(self):
     def f_jax(x):
-      return jnp.sum(x) / core.dimension_as_value(np.prod(x.shape))
+      poly = x.shape[0]
+      x1 = jnp.array(poly)  # Try explicit jnp.array on poly
+      x2 = x1 + poly  # And implicit in binary operation
+      x3 = x2 + jnp.sin(poly)  # In jnp operations # A list or tuple of poly in jnp operations
+      return x3.astype(np.float32)
 
-    x = np.arange(12.).reshape((3, 4))
+    x = np.arange(3, dtype=np.int32)
+    f_tf = self.CheckShapePolymorphism(
+        f_jax,
+        input_signature=[tf.TensorSpec([None], dtype=x.dtype)],
+        polymorphic_shapes=["b"],
+        expected_output_signature=tf.TensorSpec([]))
+    self.assertAllClose(np.float32(3 + 3 + np.sin(3)), f_tf(x))
+
+  def test_dimension_used_as_result(self):
+    def f_jax(x):
+      return 2 * x.shape[0]
+
+    x = np.arange(3, dtype=np.int32)
+    f_tf = self.CheckShapePolymorphism(
+        f_jax,
+        input_signature=[tf.TensorSpec([None], dtype=x.dtype)],
+        polymorphic_shapes=["b"],
+        expected_output_signature=tf.TensorSpec([]))
+    self.assertAllClose(np.array(2 * 3, dtype=x.dtype), f_tf(x))
+
+  def test_shape_as_array(self):
+    def f_jax(x):
+      # The entire x.shape is passed to jnp.array
+      return jnp.sum(jnp.array(x.shape)).astype(np.int32)
+
+    x = np.arange(12, dtype=np.int32).reshape((3, 4))
     f_tf = self.CheckShapePolymorphism(
         f_jax,
         input_signature=[tf.TensorSpec([None, 4], dtype=x.dtype)],
-        polymorphic_shapes=[("b, _")],
+        polymorphic_shapes=["b, _"],
         expected_output_signature=tf.TensorSpec([]))
-
-    self.assertAllClose(jnp.mean(x), f_tf(x))
-
-  def test_errors(self):
-
-    with self.assertRaisesRegex(
-        TypeError,
-        "Shapes must be 1D sequences of concrete values of integer type"):
-      core.dimension_as_value(np.array([1, 2], dtype=np.int32))
-    with self.assertRaisesRegex(
-        TypeError,
-        "Shapes must be 1D sequences of concrete values of integer type"):
-      core.dimension_as_value(np.float32(1))
-
-  def test_error_jax_value(self):
-
-    x = np.ones([3, 5], dtype=np.float32)
-
-    with self.assertRaisesRegex(
-        core.InconclusiveDimensionOperation,
-        "Dimension polynomial 'b' used in a context that requires a constant"):
-      self.CheckShapePolymorphism(
-          # Cannot use dimension variable as a JAX value
-          lambda x: jnp.array(x.shape[0]),
-          input_signature=[tf.TensorSpec([None, 5], dtype=x.dtype)],
-          polymorphic_shapes=[("b, _")],
-          expected_output_signature=tf.TensorSpec([]))
-
-    self.CheckShapePolymorphism(
-        # We can convert a dimension variable to a JAX value
-        lambda x: jnp.array(core.dimension_as_value(x.shape[0])),
-        input_signature=[tf.TensorSpec([None, 5], dtype=x.dtype)],
-        polymorphic_shapes=[("b, _")],
-        expected_output_signature=tf.TensorSpec([]))
+    self.assertAllClose(np.int32(3 + 4), f_tf(x))
 
 ###
 ### We define primitive harnesses for which we will test shape-polymorphic
@@ -1202,7 +1193,7 @@ _POLY_SHAPE_TEST_HARNESSES = [
                   [RandArg((3, 4), _f32), RandArg((2, 3, 4), _f32)],
                   poly_axes=[0, 1]),
     _make_harness("add_transpose", "",
-                  jax.grad(lambda x: jnp.sum(jnp.sum(x, axis=0, keepdims=0) + x)),
+                  jax.grad(lambda x: jnp.sum(jnp.sum(x, axis=0, keepdims=False) + x)),
                   [RandArg((3, 4), _f32)],
                   poly_axes=[0]),
     _make_harness("arange", "start",
@@ -1243,7 +1234,7 @@ _POLY_SHAPE_TEST_HARNESSES = [
                   enable_and_disable_xla=True),
     [
         _make_harness("average",
-                      f"axis={axis}_weights=None",
+                      f"{axis=}_weights=None",
                       lambda x, axis: jnp.average(x, axis=axis, returned=False, weights=None),
                       [RandArg((7, 8, 4), _f32), StaticArg(axis)],
                       poly_axes=[0])
@@ -1251,7 +1242,7 @@ _POLY_SHAPE_TEST_HARNESSES = [
     ],
     [
         _make_harness("average",
-                      f"axis={axis}_weights=Some",
+                      f"{axis=}_weights=Some",
                       lambda x, weights, axis: jnp.average(x, axis=axis, returned=False, weights=weights),
                       [RandArg((7, 8, 4), _f32), RandArg((7, 8, 4), _f32), StaticArg(axis)],
                       poly_axes=[0, 0])
@@ -1504,7 +1495,7 @@ _POLY_SHAPE_TEST_HARNESSES = [
                   poly_axes=[0], enable_and_disable_xla=True),
     # operand is poly, index is dim poly
     _make_harness("getitem", "op=poly_idx=dim",
-                  lambda a: a[jax.core.dimension_as_value(a.shape[0] - 2)],
+                  lambda a: a[jnp.array(a.shape[0] - 2)],
                   [RandArg((3, 4), _f32)],
                   poly_axes=[0], enable_and_disable_xla=True),
     # Both the operand and the index are poly
@@ -1579,7 +1570,7 @@ _POLY_SHAPE_TEST_HARNESSES = [
                   tol=1e-5),
     [
         _make_harness("mean",
-                      f"axis={axis}_keepdims={keepdims}_where=None",
+                      f"{axis=}_{keepdims=}_where=None",
                       lambda x, axis, keepdims: jnp.mean(x, axis=axis, keepdims=keepdims, where=None),
                       [RandArg((7, 8, 4), _f32), StaticArg(axis), StaticArg(keepdims)],
                       poly_axes=[0])
@@ -1588,7 +1579,7 @@ _POLY_SHAPE_TEST_HARNESSES = [
     ],
     [
         _make_harness("mean",
-                      f"axis={axis}_keepdims={keepdims}_where=Some",
+                      f"{axis=}_{keepdims=}_where=Some",
                       lambda x, where, axis, keepdims: jnp.mean(x, axis=axis, keepdims=keepdims, where=where),
                       [RandArg((7, 8, 4), _f32), RandArg((7, 8, 4), np.bool_), StaticArg(axis), StaticArg(keepdims)],
                       poly_axes=[0, 0])
@@ -1725,7 +1716,14 @@ _POLY_SHAPE_TEST_HARNESSES = [
                   expect_error=(core.InconclusiveDimensionOperation,
                                 re.escape(
                                   "Cannot divide evenly the sizes of shapes (b0, 2, 4) and (b0, -1, 3)"))),
-
+    _make_harness("roll", "axis=0",
+                  lambda x: jnp.roll(x, 2, axis=0),
+                  [RandArg((3, 4), _f32)],
+                  poly_axes=[0]),
+    _make_harness("roll", "axis=None",
+                  lambda x: jnp.roll(x, 2),
+                  [RandArg((3, 4), _f32)],
+                  poly_axes=[0]),
     _make_harness("scatter_add", "",
                   partial(lax.scatter_add, indices_are_sorted=False, unique_indices=True),
                   [RandArg((7, 4), _f32),
@@ -1825,7 +1823,7 @@ _POLY_SHAPE_TEST_HARNESSES = [
                   poly_axes=[0]),
     [
         _make_harness("var",
-                      f"axis={axis}_keepdims={keepdims}_where=None",
+                      f"{axis=}_{keepdims=}_where=None",
                       lambda x, axis, keepdims: jnp.var(x, axis=axis, keepdims=keepdims, where=None),
                       [RandArg((7, 8, 4), _f32), StaticArg(axis), StaticArg(keepdims)],
                       poly_axes=[0])
@@ -1834,7 +1832,7 @@ _POLY_SHAPE_TEST_HARNESSES = [
     ],
     [
         _make_harness("var",
-                      f"axis={axis}_keepdims={keepdims}_where=Some",
+                      f"{axis=}_{keepdims=}_where=Some",
                       lambda x, where, axis, keepdims: jnp.var(x, axis=axis, keepdims=keepdims, where=where),
                       [RandArg((7, 8, 4), _f32), RandArg((7, 8, 4), np.bool_), StaticArg(axis), StaticArg(keepdims)],
                       poly_axes=[0, 0])
@@ -1928,6 +1926,11 @@ def _flatten_harnesses(harnesses):
 class ShapePolyPrimitivesTest(tf_test_util.JaxToTfTestCase):
   """Tests for primitives that take shape values as parameters."""
 
+  def setUp(self):
+    super().setUp()
+    if config.jax2tf_default_experimental_native_lowering and not config.jax_dynamic_shapes:
+      self.skipTest("shape polymorphism but --jax_dynamic_shapes is not set.")
+
   # This test runs for all _POLY_SHAPE_PRIMITIVE_HARNESSES.
 
   # For each primitive "xxx" the test will be called "test_prim_xxx_...".
@@ -1936,7 +1939,7 @@ class ShapePolyPrimitivesTest(tf_test_util.JaxToTfTestCase):
   # to parameterized below.
   @primitive_harness.parameterized(
       _flatten_harnesses(_POLY_SHAPE_TEST_HARNESSES),
-      #one_containing="repeat_repeats=poly_axis=None_scalar_poly_axes=[None, 0]",
+      #one_containing="roll_axis=None",
   )
   def test_prim(self, harness: Harness):
     _test_one_harness(self, harness)

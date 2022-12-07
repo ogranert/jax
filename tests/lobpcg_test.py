@@ -1,4 +1,4 @@
-# Copyright 2022 Google LLC
+# Copyright 2022 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -295,7 +295,7 @@ class LobpcgTest(jtu.JaxTestCase):
     plt.switch_backend('Agg')
 
     fig, (ax0, ax1, ax2, ax3) = plt.subplots(1, 4, figsize=(24, 4))
-    fig.suptitle(fr'{matrix_name} $n={n},k={k}$, {dt}')
+    fig.suptitle(fr'{matrix_name} ${n=},{k=}$, {dt}')
     line_styles = [':', '--', '-.', '-']
 
     for key, ls in zip(['X orth', 'P orth', 'P.X'], line_styles):
@@ -384,7 +384,6 @@ class F32LobpcgTest(LobpcgTest):
     self.checkLobpcgConsistency(matrix_name, n, k, m, tol, jnp.float32)
 
   @parameterized.named_parameters(_make_concrete_cases(f64=False))
-  @jtu.skip_on_devices("rocm") # see SWDEV-321073
   def testLobpcgMonotonicityF32(self, matrix_name, n, k, m, tol):
     self.checkLobpcgMonotonicity(matrix_name, n, k, m, tol, jnp.float32)
 

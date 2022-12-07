@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,6 +30,7 @@ from jax._src import dtypes
 from jax._src import profiler
 from jax._src.lib import xla_client as xc
 import jax._src.util as util
+from jax._src.typing import Array
 
 ### device-persistent data
 
@@ -177,6 +178,10 @@ class _DeviceArray(DeviceArray):  # type: ignore
     if self._npy_value is None:
       self.device_buffer.copy_to_host_async()  # pytype: disable=attribute-error
 
+  def unsafe_buffer_pointer(self):
+    self._check_if_deleted()
+    return self.device_buffer.unsafe_buffer_pointer()  # pytype: disable=attribute-error
+
   def delete(self):
     """Deletes the device array and any cached copy on the host.
 
@@ -290,6 +295,18 @@ for device_array in [DeviceArray]:
 
   setattr(device_array, "__reduce__", __reduce__)
 
+  def sharding(self):
+    return jax.sharding.SingleDeviceSharding(self.device())
+
+  setattr(device_array, "sharding", property(sharding))
+
+  def addressable_shards(self):
+    from jax._src import array
+    return [array.Shard(self.device(), self.sharding, self.shape,
+                        self.device_buffer)]
+
+  setattr(device_array, "addressable_shards", property(addressable_shards))
+
   setattr(device_array, "__str__", partialmethod(_forward_to_value, str))
   setattr(device_array, "__bool__", partialmethod(_forward_to_value, bool))
   setattr(device_array, "__nonzero__", partialmethod(_forward_to_value, bool))
@@ -332,7 +349,9 @@ class DeletedBuffer(object): pass
 deleted_buffer = DeletedBuffer()
 
 
+Array.register(DeviceArray)
 device_array_types: List[type] = [xc.Buffer, _DeviceArray]
 for _device_array in device_array_types:
   core.literalable_types.add(_device_array)
   core.pytype_aval_mappings[_device_array] = abstract_arrays.canonical_concrete_aval
+  Array.register(_device_array)

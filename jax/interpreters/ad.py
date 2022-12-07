@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,15 +42,17 @@ def identity(x): return x
 def _update_annotation(
     f: lu.WrappedFun,
     orig_type: Optional[Tuple[Tuple[core.AbstractValue, bool], ...]],
-    nonzeros: List[bool]
+    explicit_nonzeros: List[bool]
   ) -> lu.WrappedFun:
   if orig_type is None:
     return f
+  # By convention, `explicit_nonzeros` only accounts for explicit arguments.
+  assert len(explicit_nonzeros) == sum(explicit for _, explicit in orig_type)
   # Implicit arguments never have tangents, so generate the tangent part of the
   # type annotation from explicit arguments only.
-  orig_avals = [aval for aval, explicit in orig_type if explicit]
+  explicit_avals = [aval for aval, explicit in orig_type if explicit]
   tan_types = [(aval.at_least_vspace(), True)
-               for nz, aval in zip(nonzeros, orig_avals) if nz]
+               for nz, aval in zip(explicit_nonzeros, explicit_avals) if nz]
   return lu.annotate(f, (*orig_type, *tan_types))
 
 def jvp(fun: lu.WrappedFun, has_aux=False, instantiate=True,
@@ -317,8 +319,6 @@ class JVPTrace(Trace):
     which_nz = [     type(t) is not Zero           for t in tangents]
     tangents = [t if type(t) is not Zero else None for t in tangents]
     args, in_tree = tree_flatten((primals, tangents))
-    if 'name' in params and not config.jax_experimental_name_stack:
-      params = dict(params, name=wrap_name(params['name'], 'jvp'))
     f_jvp = jvp_subtrace(f, self.main)
     f_jvp, which_nz_out = nonzero_tangent_outputs(f_jvp)
     if isinstance(call_primitive, core.MapPrimitive):
@@ -607,8 +607,6 @@ def call_transpose(primitive, params, call_jaxpr, args, ct, _, reduce_axes):
   fun = lu.hashable_partial(lu.wrap_init(backward_pass), call_jaxpr,
                             reduce_axes, False)
   fun, out_tree = flatten_fun_nokwargs(fun, in_tree_def)
-  if 'name' in params and not config.jax_experimental_name_stack:
-    params = dict(params, name=wrap_name(params['name'], 'transpose'))
   update_params = call_transpose_param_updaters.get(primitive)
   if update_params:
     params = update_params(params, map(is_undefined_primal, args),
@@ -625,8 +623,6 @@ def call_transpose(primitive, params, call_jaxpr, args, ct, _, reduce_axes):
   out_flat = primitive.bind(fun, *all_args, **params)
   return tree_unflatten(out_tree(), out_flat)
 primitive_transposes[core.call_p] = partial(call_transpose, call_p)
-primitive_transposes[core.named_call_p] = \
-    partial(call_transpose, core.named_call_p)
 
 
 def _closed_call_transpose(params, jaxpr, args, ct, cts_in_avals, reduce_axes):

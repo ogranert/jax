@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -84,22 +84,23 @@ class GDATest(jtu.JaxTestCase):
     self.assertEqual(gda.ndim, 2)
     self.assertEqual(gda.size, 16)
     self.assertEqual(gda.mesh_axes, mesh_axes)
-    self.assertEqual(gda.local_shards[0].index, expected_index[0])
-    self.assertArraysEqual(gda.local_data(0),
+    self.assertEqual(gda.addressable_shards[0].index, expected_index[0])
+    self.assertArraysEqual(gda.addressable_data(0),
                            global_input_data[expected_index[0]])
-    self.assertEqual(gda.local_shards[1].index, expected_index[1])
-    self.assertArraysEqual(gda.local_data(1),
+    self.assertEqual(gda.addressable_shards[1].index, expected_index[1])
+    self.assertIsInstance(gda.sharding, jax.sharding.NamedSharding)
+    self.assertArraysEqual(gda.addressable_data(1),
                            global_input_data[expected_index[1]])
-    self.assertEqual(gda.local_data(0).shape, expected_shard_shape)
-    replica_ids = [i.replica_id for i in gda.local_shards]
+    self.assertEqual(gda.addressable_data(0).shape, expected_shard_shape)
+    replica_ids = [i.replica_id for i in gda.addressable_shards]
     self.assertListEqual(replica_ids, expected_replica_ids)
-    self.assertListEqual([i.device.id for i in gda.local_shards],
+    self.assertListEqual([i.device.id for i in gda.addressable_shards],
                          [0, 1, 2, 3, 4, 5, 6, 7])
     self.assertEqual(gda.is_fully_replicated, expected_is_fully_replicated)
-    for s in gda.local_shards:
+    for s in gda.addressable_shards:
       self.assertEqual(s.data.aval,
                        core.ShapedArray(expected_shard_shape, s.data.dtype))
-    for g, l in safe_zip(gda.global_shards, gda.local_shards):
+    for g, l in safe_zip(gda.global_shards, gda.addressable_shards):
       self.assertEqual(g.device, l.device)
       self.assertEqual(g.index, l.index)
       self.assertEqual(g.replica_id, l.replica_id)
@@ -136,15 +137,15 @@ class GDATest(jtu.JaxTestCase):
                                           mesh_axes, cb)
     self.assertEqual(gda.ndim, 3)
     self.assertEqual(gda.size, 64)
-    self.assertEqual(gda.local_shards[0].index, expected_index[0])
-    self.assertArraysEqual(gda.local_data(0),
+    self.assertEqual(gda.addressable_shards[0].index, expected_index[0])
+    self.assertArraysEqual(gda.addressable_data(0),
                            global_input_data[expected_index[0]])
-    self.assertEqual(gda.local_shards[1].index, expected_index[1])
-    self.assertArraysEqual(gda.local_data(1),
+    self.assertEqual(gda.addressable_shards[1].index, expected_index[1])
+    self.assertArraysEqual(gda.addressable_data(1),
                            global_input_data[expected_index[1]])
-    self.assertEqual(gda.local_data(0).shape, expected_shard_shape)
+    self.assertEqual(gda.addressable_data(0).shape, expected_shard_shape)
 
-    replica_ids = [i.replica_id for i in gda.local_shards]
+    replica_ids = [i.replica_id for i in gda.addressable_shards]
     self.assertListEqual(replica_ids, expected_replica_ids)
 
   @parameterized.named_parameters(
@@ -171,14 +172,14 @@ class GDATest(jtu.JaxTestCase):
                                           mesh_axes, cb)
     self.assertEqual(gda.ndim, 1)
     self.assertEqual(gda.size, 16)
-    self.assertEqual(gda.local_shards[0].index, expected_index[0])
-    self.assertArraysEqual(gda.local_data(0),
+    self.assertEqual(gda.addressable_shards[0].index, expected_index[0])
+    self.assertArraysEqual(gda.addressable_data(0),
                            global_input_data[expected_index[0]])
-    self.assertEqual(gda.local_shards[1].index, expected_index[1])
-    self.assertArraysEqual(gda.local_data(1),
+    self.assertEqual(gda.addressable_shards[1].index, expected_index[1])
+    self.assertArraysEqual(gda.addressable_data(1),
                            global_input_data[expected_index[1]])
-    self.assertEqual(gda.local_data(0).shape, expected_shard_shape)
-    replica_ids = [i.replica_id for i in gda.local_shards]
+    self.assertEqual(gda.addressable_data(0).shape, expected_shard_shape)
+    replica_ids = [i.replica_id for i in gda.addressable_shards]
     self.assertListEqual(replica_ids, expected_replica_ids)
 
   def test_gda_shape_0_1d_mesh(self):
@@ -191,7 +192,7 @@ class GDATest(jtu.JaxTestCase):
                                           mesh_axes, cb)
     self.assertEqual(gda.ndim, 1)
     self.assertEqual(gda.size, 0)
-    for i, s in enumerate(gda.local_shards):
+    for i, s in enumerate(gda.addressable_shards):
       self.assertEqual(s.index, (slice(None),))
       self.assertEqual(s.replica_id, i)
       self.assertArraysEqual(np.asarray(s.data), np.array([]))
@@ -220,16 +221,16 @@ class GDATest(jtu.JaxTestCase):
 
     gda = GlobalDeviceArray.from_callback(global_input_shape, global_mesh,
                                           mesh_axes, cb)
-    self.assertEqual(gda.local_shards[0].index, expected_index[0])
-    self.assertArraysEqual(gda.local_data(0),
+    self.assertEqual(gda.addressable_shards[0].index, expected_index[0])
+    self.assertArraysEqual(gda.addressable_data(0),
                            global_input_data[expected_index[0]])
-    self.assertEqual(gda.local_shards[1].index, expected_index[1])
-    self.assertArraysEqual(gda.local_data(1),
+    self.assertEqual(gda.addressable_shards[1].index, expected_index[1])
+    self.assertArraysEqual(gda.addressable_data(1),
                            global_input_data[expected_index[1]])
-    self.assertEqual(gda.local_data(0).shape, expected_shard_shape)
-    replica_ids = [i.replica_id for i in gda.local_shards]
+    self.assertEqual(gda.addressable_data(0).shape, expected_shard_shape)
+    replica_ids = [i.replica_id for i in gda.addressable_shards]
     self.assertListEqual(replica_ids, expected_replica_ids)
-    for g, l in safe_zip(gda.global_shards, gda.local_shards):
+    for g, l in safe_zip(gda.global_shards, gda.addressable_shards):
       self.assertEqual(g.device, l.device)
       self.assertEqual(g.index, l.index)
       self.assertEqual(g.replica_id, l.replica_id)
@@ -249,10 +250,10 @@ class GDATest(jtu.JaxTestCase):
     gda = GlobalDeviceArray.from_batched_callback(
         global_input_shape, global_mesh, mesh_axes, cb)
     expected_first_shard_value = np.array([[0, 1]])
-    self.assertArraysEqual(np.asarray(gda.local_data(0)),
+    self.assertArraysEqual(np.asarray(gda.addressable_data(0)),
                            expected_first_shard_value)
     expected_second_shard_value = np.array([[2, 3]])
-    self.assertArraysEqual(np.asarray(gda.local_data(1)),
+    self.assertArraysEqual(np.asarray(gda.addressable_data(1)),
                            expected_second_shard_value)
 
   def test_gda_batched_callback_with_devices(self):
@@ -275,10 +276,10 @@ class GDATest(jtu.JaxTestCase):
     gda = GlobalDeviceArray.from_batched_callback_with_devices(
         global_input_shape, global_mesh, mesh_axes, cb)
     expected_first_shard_value = np.array([[0, 1], [2, 3]], dtype=np.float32)
-    self.assertArraysEqual(np.asarray(gda.local_data(0)),
+    self.assertArraysEqual(np.asarray(gda.addressable_data(0)),
                            expected_first_shard_value)
     expected_second_shard_value = np.array([[0, 1], [2, 3]], dtype=np.float32)
-    self.assertArraysEqual(np.asarray(gda.local_data(1)),
+    self.assertArraysEqual(np.asarray(gda.addressable_data(1)),
                            expected_second_shard_value)
 
   def test_gda_str_repr(self):
@@ -377,6 +378,16 @@ class GDATest(jtu.JaxTestCase):
     input_shape = (8, 2)
     gda, global_data = create_gda(input_shape, global_mesh, mesh_axes)
     self.assertArraysEqual(gda._value, global_data)
+
+  def test_gda_delete(self):
+    global_mesh = jtu.create_global_mesh((4, 2), ('x', 'y'))
+    input_shape = (8, 2)
+    gda, _ = create_gda(input_shape, global_mesh, P("x", "y"))
+    gda._check_if_deleted()
+    gda.delete()
+    with self.assertRaisesRegex(RuntimeError,
+                                "GlobalDeviceArray has been deleted."):
+      gda._check_if_deleted()
 
 
 if __name__ == '__main__':

@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -191,8 +191,10 @@ from jax._src.numpy.lax_numpy import (
     percentile as percentile,
     pi as pi,
     piecewise as piecewise,
+    place as place,
     printoptions as printoptions,
     promote_types as promote_types,
+    put as put,
     quantile as quantile,
     ravel as ravel,
     ravel_multi_index as ravel_multi_index,

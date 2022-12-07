@@ -30,6 +30,7 @@ jax.scipy.linalg
    expm
    expm_frechet
    funm
+   hessenberg
    inv
    lu
    lu_factor
@@ -106,6 +107,7 @@ jax.scipy.special
   :toctree: _autosummary
 
    betainc
+   betaln
    digamma
    entr
    erf
@@ -139,6 +141,13 @@ jax.scipy.special
 
 jax.scipy.stats
 ---------------
+
+.. automodule:: jax.scipy.stats
+
+.. autosummary::
+  :toctree: _autosummary
+
+   mode
 
 jax.scipy.stats.bernoulli
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -310,6 +319,19 @@ jax.scipy.stats.t
 
    logpdf
    pdf
+
+jax.scipy.stats.truncnorm
+~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: jax.scipy.stats.truncnorm
+.. autosummary::
+  :toctree: _autosummary
+
+   cdf
+   logcdf
+   logpdf
+   logsf
+   pdf
+   sf
 
 jax.scipy.stats.uniform
 ~~~~~~~~~~~~~~~~~~~~~~~

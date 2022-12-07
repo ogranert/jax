@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 
 import abc
-from functools import partial
+from functools import partial, reduce
 import operator as op
 from typing import Any, Callable, Hashable, Iterator, NamedTuple, Sequence
 
@@ -31,8 +31,9 @@ from jax.interpreters import batching
 from jax.interpreters import mlir
 from jax.interpreters import pxla
 from jax.interpreters import xla
-from jax.experimental.sharding import (
-    MeshPspecSharding, PmapSharding, OpShardingSharding)
+from jax._src import basearray
+from jax._src.sharding import (
+    NamedSharding, PmapSharding, OpShardingSharding)
 
 from jax._src import dispatch
 from jax._src import dtypes
@@ -43,7 +44,6 @@ from jax._src.lib.mlir.dialects import mhlo
 from jax._src.numpy import lax_numpy
 import jax._src.pretty_printer as pp
 from jax._src.util import canonicalize_axis, prod, safe_map, safe_zip
-
 from jax._src.lib import gpu_prng
 
 map, unsafe_map = safe_map, map
@@ -104,7 +104,7 @@ def _check_prng_key_data(impl, key_data: jnp.ndarray):
                     f"key_data.ndim >= 1; got ndim={key_data.ndim}")
   if key_data.shape[-ndim:] != impl.key_shape:
     raise TypeError("JAX encountered invalid PRNG key data: expected key_data.shape to "
-                    f"end with {impl.key_shape}; got shape={key_data.shape} for impl={impl}")
+                    f"end with {impl.key_shape}; got shape={key_data.shape} for {impl=}")
   if key_data.dtype not in [np.uint32, float0]:
     raise TypeError("JAX encountered invalid PRNG key data: expected key_data.dtype = uint32; "
                     f"got dtype={key_data.dtype}")
@@ -259,6 +259,7 @@ lax_numpy._set_device_array_base_attributes(PRNGKeyArray, include=[
     '__getitem__', 'ravel', 'squeeze', 'swapaxes', 'take', 'reshape',
     'transpose', 'flatten', 'T'])
 lax_numpy._register_stackable(PRNGKeyArray)
+basearray.Array.register(PRNGKeyArray)
 
 
 # TODO(frostig): remove, rerouting callers directly to random_seed
@@ -331,9 +332,9 @@ class KeyTyRules:
           mesh_mapping=sharding.sharding_spec.mesh_mapping)
       phys_sharding = PmapSharding(devices=sharding.devices,
                                    sharding_spec=phys_sharding_spec)
-    elif isinstance(sharding, MeshPspecSharding):
+    elif isinstance(sharding, NamedSharding):
       trailing_spec = [None] * len(key_shape)
-      phys_sharding = MeshPspecSharding(
+      phys_sharding = NamedSharding(
           sharding.mesh,
           pxla.PartitionSpec(*sharding.spec, *trailing_spec))
     else:
@@ -370,9 +371,9 @@ class KeyTyRules:
 
     if dispatch.is_single_device_sharding(out_sharding):
       phys_sharding = out_sharding
-    elif isinstance(out_sharding, MeshPspecSharding):
+    elif isinstance(out_sharding, NamedSharding):
       trailing_spec = [None] * len(key_shape)
-      phys_sharding = MeshPspecSharding(
+      phys_sharding = NamedSharding(
           out_sharding.mesh,
           pxla.PartitionSpec(*out_sharding.spec, *trailing_spec))
     else:
@@ -981,6 +982,97 @@ mlir.register_lowering(
     platform='rocm')
 
 
+def iota_2x32_shape(shape):
+  """Reshaped ``uint64`` iota, as two parallel ``uint32`` arrays.
+
+  Setting aside representation, this function essentially computes the
+  equivalent of::
+
+    jax.lax.iota(dtype=np.uint64, size=np.prod(shape)).reshape(shape)
+
+  However:
+
+  * It returns two parallel ``uint32`` arrays instead of one
+    ``uint64`` array. This renders it invariant under either setting of
+    the system-wide ``jax_enable_x64`` configuration flag.
+
+  * It lowers in a way such that the compiler's automatic SPMD
+    partitioner recognizes its partitionability.
+
+  For example::
+
+    >>> import numpy as np
+    >>> from jax import lax
+    >>> from jax._src import prng
+
+    >>> prng.iota_2x32_shape((3, 4))
+    [Array([[0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0]], dtype=uint32),
+     Array([[ 0,  1,  2,  3],
+            [ 4,  5,  6,  7],
+            [ 8,  9, 10, 11]], dtype=uint32)]
+
+    >>> def reshaped_iota(shape):
+    ...   return lax.iota(size=np.prod(shape), dtype=np.uint32).reshape(shape)
+    ...
+    >>> reshaped_iota((3, 4))
+    Array([[ 0,  1,  2,  3],
+           [ 4,  5,  6,  7],
+           [ 8,  9, 10, 11]], dtype=uint32)
+
+  Args:
+    shape: the output shape
+
+  Returns:
+    A pair of ``uint32`` arrays ``(counts_hi, counts_lo)``, both of
+    shape ``shape``, representing the higher-order and lower-order 32
+    bits of the 64 bit unsigned iota.
+  """
+  if len(shape) == 0:
+    return (jnp.zeros((), np.dtype('uint32')),) * 2
+  return iota_2x32_shape_p.bind(shape=shape)
+
+iota_2x32_shape_p = core.Primitive('iota_2x32_shape')
+iota_2x32_shape_p.multiple_results = True
+iota_2x32_shape_p.def_impl(partial(xla.apply_primitive, iota_2x32_shape_p))
+
+@iota_2x32_shape_p.def_abstract_eval
+def iota_2x32_shape_abstract_eval(*, shape):
+  return (core.ShapedArray(shape, np.dtype('uint32')),) * 2
+
+def bcast_iotas_to_reshaped_iota(add, mul, shape, iotas):
+  strides = (*map(int, np.cumprod(shape[1:][::-1])[::-1]), 1)
+  return reduce(add, [mul(s, i) for i, s in zip(iotas, strides)])  # type: ignore
+
+def iota_2x32_shape_lowering(ctx, *, shape):
+  def _add(x, y):
+    return mlir.mhlo.AddOp(x, y).result
+
+  def _mul(x, y):
+    x_const = mlir.ir_constant(np.array(x, np.dtype('uint64')),
+                               canonicalize_types=False)
+    x_bcast = mlir.mhlo.BroadcastOp(x_const, mlir.dense_int_elements(shape))
+    return mlir.mhlo.MulOp(x_bcast, y).result
+
+  assert len(shape) > 0
+  aval_out, _ = ctx.avals_out
+  aval_u64 = core.ShapedArray(shape, np.dtype('uint64'))
+  iotas = [mlir.mhlo.IotaOp(mlir.aval_to_ir_type(aval_u64),
+                            mlir.i64_attr(dimension)).result
+           for dimension in range(len(shape))]
+  counts = bcast_iotas_to_reshaped_iota(_add, _mul, shape, iotas)
+  shift = mlir.ir_constant(np.array(32, np.dtype('uint64')),
+                           canonicalize_types=False)
+  shift = mlir.mhlo.BroadcastOp(shift, mlir.dense_int_elements(shape)).result
+  counts_shifted = mlir.mhlo.ShiftRightLogicalOp(counts, shift).result
+  counts_lo = mlir.mhlo.ConvertOp(mlir.aval_to_ir_type(aval_out), counts).result
+  counts_hi = mlir.mhlo.ConvertOp(mlir.aval_to_ir_type(aval_out),
+                                  counts_shifted).result
+  return counts_hi, counts_lo
+mlir.register_lowering(iota_2x32_shape_p, iota_2x32_shape_lowering)
+
+
 @partial(jit, inline=True)
 def threefry_2x32(keypair, count):
   """Apply the Threefry 2x32 hash.
@@ -1016,12 +1108,22 @@ def threefry_2x32(keypair, count):
 
 
 def threefry_split(key: jnp.ndarray, num: int) -> jnp.ndarray:
-  return _threefry_split(key, int(num))  # type: ignore
+  if config.jax_threefry_partitionable:
+    return _threefry_split_foldlike(key, int(num))  # type: ignore
+  else:
+    return _threefry_split_original(key, int(num))  # type: ignore
 
 @partial(jit, static_argnums=(1,), inline=True)
-def _threefry_split(key, num) -> jnp.ndarray:
+def _threefry_split_original(key, num) -> jnp.ndarray:
   counts = lax.iota(np.uint32, num * 2)
   return lax.reshape(threefry_2x32(key, counts), (num, 2))
+
+@partial(jit, static_argnums=(1,), inline=True)
+def _threefry_split_foldlike(key, num) -> jnp.ndarray:
+  k1, k2 = key
+  counts1, counts2 = iota_2x32_shape((num,))
+  bits1, bits2 = threefry2x32_p.bind(k1, k2, counts1, counts2)
+  return jnp.stack([bits1, bits2], axis=1)
 
 
 def threefry_fold_in(key: jnp.ndarray, data: jnp.ndarray) -> jnp.ndarray:
@@ -1035,14 +1137,37 @@ def _threefry_fold_in(key, data):
 
 def threefry_random_bits(key: jnp.ndarray, bit_width, shape):
   """Sample uniform random bits of given width and shape using PRNG key."""
-  return _threefry_random_bits(key, bit_width, shape)
-
-@partial(jit, static_argnums=(1, 2), inline=True)
-def _threefry_random_bits(key: jnp.ndarray, bit_width, shape):
   if not _is_threefry_prng_key(key):
     raise TypeError("threefry_random_bits got invalid prng key.")
   if bit_width not in (8, 16, 32, 64):
     raise TypeError("requires 8-, 16-, 32- or 64-bit field width.")
+
+  if (config.jax_threefry_partitionable and
+      not any(core.is_special_dim_size(d) for d in shape)):
+    return _threefry_random_bits_partitionable(key, bit_width, shape)
+  else:
+    return _threefry_random_bits_original(key, bit_width, shape)
+
+def _threefry_random_bits_partitionable(key: jnp.ndarray, bit_width, shape):
+  if all(core.is_constant_dim(d) for d in shape) and prod(shape) > 2 ** 64:
+    raise NotImplementedError('random bits array of size exceeding 2 ** 64')
+
+  k1, k2 = key
+  counts1, counts2 = iota_2x32_shape(shape)
+  bits1, bits2 = threefry2x32_p.bind(k1, k2, counts1, counts2)
+
+  dtype = UINT_DTYPES[bit_width]
+  if bit_width == 64:
+    bits_hi = lax.convert_element_type(bits1, dtype)
+    bits_lo = lax.convert_element_type(bits2, dtype)
+    return lax.shift_left(bits_hi, dtype(32)) | bits_lo
+  elif bit_width == 32:
+    return bits1 ^ bits2
+  else:
+    return lax.convert_element_type(bits1 ^ bits2, dtype)
+
+@partial(jit, static_argnums=(1, 2), inline=True)
+def _threefry_random_bits_original(key: jnp.ndarray, bit_width, shape):
   size = prod(shape)
   # Compute ceil(bit_width * size / 32) in a way that is friendly to shape
   # polymorphism
@@ -1108,7 +1233,12 @@ def _rbg_seed(seed: jnp.ndarray) -> jnp.ndarray:
   return jnp.concatenate([halfkey, halfkey])
 
 def _rbg_split(key: jnp.ndarray, num: int) -> jnp.ndarray:
-  return vmap(_threefry_split, (0, None), 1)(key.reshape(2, 2), num).reshape(num, 4)
+  if config.jax_threefry_partitionable:
+    _threefry_split = _threefry_split_foldlike
+  else:
+    _threefry_split = _threefry_split_original
+  return vmap(
+      _threefry_split, (0, None), 1)(key.reshape(2, 2), num).reshape(num, 4)
 
 def _rbg_fold_in(key: jnp.ndarray, data: jnp.ndarray) -> jnp.ndarray:
   assert not data.shape

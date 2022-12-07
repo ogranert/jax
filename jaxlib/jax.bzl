@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,18 +19,22 @@ load("@org_tensorflow//tensorflow:tensorflow.bzl", _if_windows = "if_windows", _
 load("@local_config_cuda//cuda:build_defs.bzl", _cuda_library = "cuda_library", _if_cuda_is_configured = "if_cuda_is_configured")
 load("@local_config_rocm//rocm:build_defs.bzl", _if_rocm_is_configured = "if_rocm_is_configured", _rocm_library = "rocm_library")
 load("@flatbuffers//:build_defs.bzl", _flatbuffer_cc_library = "flatbuffer_cc_library")
+load("@org_tensorflow//tensorflow/core/platform:build_config_root.bzl", _tf_cuda_tests_tags = "tf_cuda_tests_tags", _tf_exec_properties = "tf_exec_properties")
 
 # Explicitly re-exports names to avoid "unused variable" warnings from .bzl
 # lint tools.
 cuda_library = _cuda_library
 rocm_library = _rocm_library
 pytype_library = native.py_library
+pytype_test = native.py_test
 pyx_library = _pyx_library
 pybind_extension = _pybind_extension
 if_cuda_is_configured = _if_cuda_is_configured
 if_rocm_is_configured = _if_rocm_is_configured
 if_windows = _if_windows
 flatbuffer_cc_library = _flatbuffer_cc_library
+tf_exec_properties = _tf_exec_properties
+tf_cuda_tests_tags = _tf_cuda_tests_tags
 
 jax_internal_packages = []
 jax_test_util_visibility = []
@@ -47,13 +51,13 @@ def py_deps(_package):
 jax_extra_deps = []
 jax2tf_deps = []
 
-def py_library_providing_imports_info(*, name, lib_rule = native.py_library, **kwargs):
+def py_library_providing_imports_info(*, name, lib_rule = native.py_library, pytype_srcs = [], **kwargs):
     lib_rule(name = name, **kwargs)
 
 def py_extension(name, srcs, copts, deps):
     pybind_extension(name, srcs = srcs, copts = copts, deps = deps, module_name = name)
 
-def windows_cc_shared_mlir_library(name, out, deps = [], srcs = []):
+def windows_cc_shared_mlir_library(name, out, deps = [], srcs = [], exported_symbol_prefixes = []):
     """Workaround DLL building issue.
 
     1. cc_binary with linkshared enabled cannot produce DLL with symbol
@@ -87,6 +91,10 @@ def windows_cc_shared_mlir_library(name, out, deps = [], srcs = []):
         target_compatible_with = ["@platforms//os:windows"],
     )
 
+    # say filtered_symbol_prefixes == ["mlir", "chlo"], then construct the regex
+    # pattern as "^\\s*(mlir|clho)" to use grep
+    pattern = "^\\s*(" + "|".join(exported_symbol_prefixes) + ")"
+
     # filtered def_file, only the needed symbols are included
     filtered_def_name = name + ".filtered.def"
     filtered_def_file = out + ".def"
@@ -94,7 +102,7 @@ def windows_cc_shared_mlir_library(name, out, deps = [], srcs = []):
         name = filtered_def_name,
         srcs = [full_def_name],
         outs = [filtered_def_file],
-        cmd = """echo 'LIBRARY {}\nEXPORTS ' > $@ && grep '^\\W*mlir' $(location :{}) >> $@""".format(out, full_def_name),
+        cmd = """echo 'LIBRARY {}\nEXPORTS ' > $@ && grep -E '{}' $(location :{}) >> $@""".format(out, pattern, full_def_name),
         target_compatible_with = ["@platforms//os:windows"],
     )
 
@@ -159,6 +167,8 @@ def jax_test(
         test_tags = list(tags) + ["jax_test_%s" % backend] + backend_tags.get(backend, [])
         if disable_backends and backend in disable_backends:
             test_tags += ["manual"]
+        if backend == "gpu":
+            test_tags += tf_cuda_tests_tags()
         native.py_test(
             name = name + "_" + backend,
             srcs = srcs,
@@ -167,10 +177,14 @@ def jax_test(
             deps = [
                 "//jax",
                 "//jax:test_util",
-            ] + deps,
+            ] + deps + select({
+                "//jax:enable_jaxlib_build": ["//jaxlib/cuda:gpu_only_test_deps"],
+                "//conditions:default": [],
+            }),
             shard_count = test_shards,
             tags = test_tags,
             main = main,
+            exec_properties = tf_exec_properties({"tags": test_tags}),
         )
 
 def jax_generate_backend_suites(backends = []):

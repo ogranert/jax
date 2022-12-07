@@ -15,11 +15,13 @@
 """Utils for building a device mesh."""
 
 import itertools
+import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from absl import logging
 import jax
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 _TPU_V2 = 'TPU v2'
 _TPU_V3 = 'TPU v3'
@@ -184,14 +186,14 @@ def _get_physical_tpu_mesh(jax_devices: Sequence[Any]) -> np.ndarray:
   def sort_key(device):
     x, y, z = device.coords
     core = device.core_on_chip
-    if device_kind == _TPU_V4:
-      if core != 0:
-        raise ValueError(
-            'Creating meshes for TPU v4 requires one device per chip')
-      return (x, y, z)
-    elif device_kind in (_TPU_V2, _TPU_V3):
+    if device_kind in (_TPU_V2, _TPU_V3):
       assert z == 0
       return (x, y, core)
+    else:
+      if core != 0:
+        raise ValueError(
+            'Creating meshes for TPU >v3 requires one device per chip')
+      return (x, y, z)
   sorted_devices = sorted(jax_devices, key=sort_key)
   x, y, *_ = _bounds_from_last_device(sorted_devices[-1])
   return np.array(sorted_devices).reshape((x, y, -1))
@@ -245,17 +247,17 @@ def create_device_mesh(
   if np.prod(mesh_shape) != len(devices):
     raise ValueError(f'Number of devices {len(devices)} must equal the product '
                      f'of mesh_shape {mesh_shape}')
-  device_kind = devices[-1].device_kind
-  if device_kind in (_TPU_V2, _TPU_V3):
+  last_device = devices[-1]
+  if last_device.device_kind in (_TPU_V2, _TPU_V3):
     if len(devices) == 8:
-      logging.info('Reordering mesh to physical ring order on single-tray TPU v2/v3.')
+      logger.info('Reordering mesh to physical ring order on single-tray TPU v2/v3.')
       device_mesh = np.asarray(devices)
       device_mesh = device_mesh[np.array(_TRAY_RING_ORDER)]
       device_mesh = device_mesh.reshape(mesh_shape)
       return device_mesh
     elif mesh_shape[-1] == 8:
       device_mesh = np.asarray(devices).reshape(mesh_shape)
-      logging.info('Reordering mesh to physical ring order on each TPU v2/v3 tray.')
+      logger.info('Reordering mesh to physical ring order on each TPU v2/v3 tray.')
       perm = np.array(_TRAY_RING_ORDER)
       device_mesh = device_mesh[..., perm]
       return device_mesh
@@ -264,13 +266,13 @@ def create_device_mesh(
       # https://github.com/tensorflow/lingvo/blob/0df40cf604dfcd14e28f7087d73687a0bd2fe5c6/lingvo/core/gshard_utils.py#L187
       # (possibly replaces above mesh_shape[-1] == 8 case)
       return np.asarray(devices).reshape(mesh_shape)
-  elif device_kind == _TPU_V4:
+  elif last_device.platform == 'tpu':
     physical_mesh = _get_physical_tpu_mesh(devices)
     if contiguous_submeshes:
       physical_mesh = _transpose_trick(physical_mesh, mesh_shape)
     device_mesh, assignment = _create_device_mesh_for_nd_torus(
         physical_mesh, mesh_shape)
-    logging.info('_create_device_mesh_for_nd_torus assignment: %s', assignment)
+    logger.info('_create_device_mesh_for_nd_torus assignment: %s', assignment)
     return device_mesh
   else:
     device_mesh = np.asarray(devices).reshape(mesh_shape)

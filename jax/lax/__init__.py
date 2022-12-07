@@ -1,4 +1,4 @@
-# Copyright 2019 Google LLC
+# Copyright 2019 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -143,7 +143,6 @@ from jax._src.lax.lax import (
   logistic_p as logistic_p,
   lt as lt,
   lt_p as lt_p,
-  make_bint as make_bint,
   max as max,
   max_p as max_p,
   min as min,
@@ -305,6 +304,8 @@ from jax._src.lax.control_flow import (
   associative_scan as associative_scan,
   cond as cond,
   cond_p as cond_p,
+  cumlogsumexp as cumlogsumexp,
+  cumlogsumexp_p as cumlogsumexp_p,
   cummax as cummax,
   cummax_p as cummax_p,
   cummin as cummin,

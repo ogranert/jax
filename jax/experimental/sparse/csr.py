@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -65,7 +65,7 @@ class CSR(JAXSparse):
     """Create an empty CSR instance. Public method is sparse.empty()."""
     shape = tuple(shape)
     if len(shape) != 2:
-      raise ValueError(f"CSR must have ndim=2; got shape={shape}")
+      raise ValueError(f"CSR must have ndim=2; got {shape=}")
     data = jnp.empty(0, dtype)
     indices = jnp.empty(0, index_dtype)
     indptr = jnp.zeros(shape[0] + 1, index_dtype)
@@ -82,7 +82,6 @@ class CSR(JAXSparse):
       # if k is out of range, return an empty matrix.
       return cls._empty((N, M), dtype=dtype, index_dtype=index_dtype)
 
-    k = jnp.asarray(k)
     data = jnp.ones(diag_size, dtype=dtype)
     idx = jnp.arange(diag_size, dtype=index_dtype)
     zero = _const(idx, 0)
@@ -143,7 +142,7 @@ class CSC(JAXSparse):
     """Create an empty CSC instance. Public method is sparse.empty()."""
     shape = tuple(shape)
     if len(shape) != 2:
-      raise ValueError(f"CSC must have ndim=2; got shape={shape}")
+      raise ValueError(f"CSC must have ndim=2; got {shape=}")
     data = jnp.empty(0, dtype)
     indices = jnp.empty(0, index_dtype)
     indptr = jnp.zeros(shape[1] + 1, index_dtype)
@@ -215,7 +214,7 @@ def _csr_todense_gpu_lowering(csr_todense_mhlo, ctx, data, indices, indptr, *,
   data_aval, indices_aval, _ = ctx.avals_in
   dtype = data_aval.dtype
   if not (np.issubdtype(dtype, np.floating) or np.issubdtype(dtype, np.complexfloating)):
-    warnings.warn(f"csr_todense cusparse/hipsparse lowering not available for dtype={dtype}. "
+    warnings.warn(f"csr_todense cusparse/hipsparse lowering not available for {dtype=}. "
                   "Falling back to default implementation.", CuSparseEfficiencyWarning)
     return _csr_todense_lowering(ctx, data, indices, indptr, shape=shape)
   return [csr_todense_mhlo(
@@ -305,7 +304,7 @@ _csr_fromdense_lowering = mlir.lower_fun(_csr_fromdense_impl,
 def _csr_fromdense_gpu_lowering(csr_fromdense_mhlo, ctx, mat, *, nse, index_dtype):
   dtype = ctx.avals_in[0].dtype
   if not (np.issubdtype(dtype, np.floating) or np.issubdtype(dtype, np.complexfloating)):
-    warnings.warn(f"csr_fromdense cusparse/hipsparse lowering not available for dtype={dtype}. "
+    warnings.warn(f"csr_fromdense cusparse/hipsparse lowering not available for {dtype=}. "
                   "Falling back to default implementation.", CuSparseEfficiencyWarning)
     return _csr_fromdense_lowering(ctx, mat, nse=nse, index_dtype=index_dtype)
   data, indices, indptr = csr_fromdense_mhlo(
@@ -400,7 +399,7 @@ def _csr_matvec_gpu_lowering(csr_matvec_mhlo, ctx, data, indices, indptr, v, *,
   data_aval, indices_aval, _, v_aval = ctx.avals_in
   dtype = data_aval.dtype
   if dtype not in [np.float32, np.float64, np.complex64, np.complex128]:
-    warnings.warn(f"csr_matvec cusparse/hipsparse lowering not available for dtype={dtype}. "
+    warnings.warn(f"csr_matvec cusparse/hipsparse lowering not available for {dtype=}. "
                   "Falling back to default implementation.", CuSparseEfficiencyWarning)
     return _csr_matvec_lowering(ctx, data, indices, indptr, v, shape=shape,
                                 transpose=transpose)
@@ -492,7 +491,7 @@ def _csr_matmat_gpu_lowering(csr_matmat_mhlo, ctx, data, indices, indptr, B, *,
   data_aval, indices_aval, _, B_aval = ctx.avals_in
   dtype = data_aval.dtype
   if dtype not in [np.float32, np.float64, np.complex64, np.complex128]:
-    warnings.warn(f"csr_matmat cusparse/hipsparse lowering not available for dtype={dtype}. "
+    warnings.warn(f"csr_matmat cusparse/hipsparse lowering not available for {dtype=}. "
                   "Falling back to default implementation.", CuSparseEfficiencyWarning)
     return _csr_matmat_lowering(ctx, data, indices, indptr, B, shape=shape,
                                 transpose=transpose)

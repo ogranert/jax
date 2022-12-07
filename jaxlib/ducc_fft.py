@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ import jaxlib.mlir.dialects.mhlo as mhlo
 
 
 from .mhlo_helpers import custom_call
-from . import _ducc_fft
+from .cpu import _ducc_fft
 import numpy as np
 
 from jaxlib import xla_client

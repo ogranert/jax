@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ from jax import core
 from jax import numpy as jnp
 from jax._src import device_array
 from jax._src import dispatch
+from jax._src import array
 from jax._src.lib import xla_client
 from jax._src.lib import xla_bridge
 
@@ -39,11 +40,10 @@ def to_dlpack(x: device_array.DeviceArrayProtocol, take_ownership: bool = False)
       undefined behavior if the DLPack consumer writes to a buffer that JAX
       owns.
   """
-  from jax.experimental import array
-  if not isinstance(x, (device_array.DeviceArray, array.Array)):
+  if not isinstance(x, (device_array.DeviceArray, array.ArrayImpl)):
     raise TypeError("Argument to to_dlpack must be a DeviceArray or Array, got {}"
                     .format(type(x)))
-  if isinstance(x, array.Array):
+  if isinstance(x, array.ArrayImpl):
     assert len(x._arrays) == 1
     buf = x._arrays[0]
   else:
@@ -64,10 +64,19 @@ def from_dlpack(dlpack):
     gpu_backend = xla_bridge.get_backend("cuda")
   except RuntimeError:
     gpu_backend = None
+
+  # Try ROCm if CUDA backend not found
+  if gpu_backend is None:
+    try:
+      gpu_backend = xla_bridge.get_backend("rocm")
+    except RuntimeError:
+      gpu_backend = None
+
   buf = xla_client._xla.dlpack_managed_tensor_to_buffer(
       dlpack, cpu_backend, gpu_backend)
 
   xla_shape = buf.xla_shape()
   assert not xla_shape.is_tuple()
   aval = core.ShapedArray(xla_shape.dimensions(), xla_shape.numpy_dtype())
-  return dispatch.maybe_create_array_from_da(buf, aval, buf.device())
+  return jnp.asarray(           # asarray ensures dtype canonicalization
+      dispatch.maybe_create_array_from_da(buf, aval, buf.device()))

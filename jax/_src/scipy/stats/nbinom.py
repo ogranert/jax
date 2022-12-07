@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,10 +20,11 @@ from jax._src.lax.lax import _const as _lax_const
 from jax._src.numpy.lax_numpy import _promote_args_inexact, where, inf
 from jax._src.numpy.util import _wraps
 from jax._src.scipy.special import gammaln, xlogy
+from jax._src.typing import Array, ArrayLike
 
 
 @_wraps(osp_stats.nbinom.logpmf, update_doc=False)
-def logpmf(k, n, p, loc=0):
+def logpmf(k: ArrayLike, n: ArrayLike, p: ArrayLike, loc: ArrayLike = 0) -> Array:
     """JAX implementation of scipy.stats.nbinom.logpmf."""
     k, n, p, loc = _promote_args_inexact("nbinom.logpmf", k, n, p, loc)
     one = _lax_const(k, 1)
@@ -37,6 +38,6 @@ def logpmf(k, n, p, loc=0):
 
 
 @_wraps(osp_stats.nbinom.pmf, update_doc=False)
-def pmf(k, n, p, loc=0):
+def pmf(k: ArrayLike, n: ArrayLike, p: ArrayLike, loc: ArrayLike = 0) -> Array:
     """JAX implementation of scipy.stats.nbinom.pmf."""
     return lax.exp(logpmf(k, n, p, loc))

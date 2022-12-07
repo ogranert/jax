@@ -55,6 +55,8 @@ For details on saving a batch-polymorphic SavedModel see [below](#shape-polymorp
 
 See also some internal ongoing design discussions at `go/jax2tf-doc`.
 
+[TOC]
+
 ## Usage: basic functions.
 
 As a rule of thumb, if you can `jax.jit` your function then you should be able
@@ -76,7 +78,7 @@ def f_jax(x):
 f_tf = jax2tf.convert(f_jax)
 
 # For example you execute f_tf eagerly with valid TensorFlow inputs:
-f_tf(np.random(...))
+f_tf(np.random.random(...))
 
 # Additionally you can use tools like `tf.function` to improve the execution
 # time of your function, or to stage it out to a SavedModel:
@@ -147,6 +149,7 @@ GraphDef part of the SavedModel, or you may want to fine-tune the
 model and change the value of the parameters.
 
 For example, consider the following function:
+
 ```python
 def model_jax(inputs):
   return param0 + param1 * inputs
@@ -193,7 +196,6 @@ subject to the 2GB limitation).
 
 For examples of how to save a Flax model as a SavedModel see the
 [examples directory](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/examples/README.md).
-
 
 ### Saved model and differentiation
 
@@ -260,10 +262,23 @@ you will not be able to compute the gradients of the function loaded from the Sa
 
 ## Support for partitioning
 
-jax2tf supports JAX functions that use `jax.pjit`, for single-host meshes.
+jax2tf supports JAX functions that use `jax.pjit` and `jax.jit` with sharded
+arguments and results, for single-host meshes.
 The lowering is actually similar as for a `jax.jit`, except that the
 arguments and results will be wrapped with
-`tensorflow.compiler.xla.experimental.xla_sharding.XlaSharding` TensorFlow ops.
+`tensorflow.python.compiler.xla.experimental.xla_sharding.XlaSharding` TensorFlow ops.
+The `XlaSharding` ops are omitted if the arguments or
+results are replicated.
+
+A limitation of `XlaSharding` is that it cannot be used in TensorFlow eager
+mode. Therefore, `jax2tf` will give an error when lowering a function that
+requires sharded (not replicated) arguments or results and the lowered
+function is used outside a `tf.function` context (see b/255511660).
+
+Another limitation is that today only TPUs have integrated with XLA SPMD
+support in serving, while CPUs and GPUs don't have e2e XLA SPMD support yet in
+TensorFlow. Executing a jax2tf converted tf.function with `XlaSharding` ops on
+CPUs and GPUs will simply ignore all the `XlaSharding` ops.
 
 Note that when saving a model, the parameters to the model are wrapped with
 `tf.Variable` before calling the lowered function (see [above](#saved_model_with_parameters)),
@@ -436,27 +451,15 @@ The dimension polynomials have the following behavior for arithmetic operations:
     These arise, e.g., in `jax.numpy.concatenate` or `jax.numpy.reshape`.
 
 For example, in the following code to flatten a 2D array, the computation
-`x.shape[0] * x.shape[1]` computes the dimension polynomial `4 * b`:
+`x.shape[0] * x.shape[1]` computes the dimension polynomial `4 * b` as the
+new shape:
 
 ```python
 jax2tf.convert(lambda x: jnp.reshape(x, (x.shape[0] * x.shape[1],)),
-                polymorphic_shapes=["(b, 4)"])(np.ones((3, 4))
+                polymorphic_shapes=["(b, 4)"])(np.ones((3, 4)))
 ```
 
-Replacing the multiplication with `np.prod(x.shape)` would also
-work. Note that the dimension polynomials can be used only as shape arguments
-to JAX functions. If you try to use them in place of array arguments you will get
-an error:
-
-```python
-jax2tf.convert(lambda x: jnp.prod(x.shape),
-                polymorphic_shapes=["(b, 4)"])(np.ones((3, 4))
-Uncaught exception TypeError: "Argument 'b' of type <class 'jax.experimental.jax2tf.shape_poly._DimPolynomial'> is not a valid JAX type"
-```
-
-See below for how you can turn a dimension polynomial into a JAX value.
-
-More operations are partially supported for dimension polynomials:
+Other operations are partially supported for dimension polynomials:
 
   * division is a special case. It is also overloaded, but it is only partially
     supported, when either (a) there is no remainder, or (b) the divisor is a constant
@@ -489,49 +492,50 @@ as `False` and produce a lowered function that returns `1` just because the dime
 are not identical: there are some concrete input shapes for which the function
 should return `0`.
 
-### Dimension variables appearing in the numeric computation
-
-There are some situations when dimension variables arise in the lowered computation itself.
-You can see in the following example how elements from the input shapes
-`(1024, 28, 28)` and `(28, 28)` appear in the computation and specifically
-in the `shape` parameter of the `broadcast_in_dim` JAX primitive.
-
-```python
-def image_mask_jax(images, mask):
-  # images: f32[B, W, W]  and mask: f32[W, W]
-  return images * mask
-
-print(jax.make_jaxpr(image_mask_jax)(np.ones((1024, 28, 28)), np.ones((28, 28))))
->> { lambda  ; a b.
->>   let c = broadcast_in_dim[ broadcast_dimensions=(1, 2)
->>                            shape=(1, 28, 28) ] b
->>      d = mul a c
->>   in (d,) }
-
-# The following will invoke broadcast_in_dim with shape=(1, w, w)
-jax2tf.convert(image_mask_jax, polymorphic_shapes=["(b, w, w)", "(w, w)"])
-```
-
-When tracing and lowering with abstract shapes some primitive parameters will be dimension variables
-instead of just constants, e.g., the `shape` parameter of `broadcast_in_dim` will be `(1, w, w)`.
-Note that JAX primitives distinguish the inputs, which are array values,
-e.g., `b` for `broadcast_in_dim` above, and the parameters, e.g., `broadcast_dimensions` and `shape`.
-
-The lowering of `image_mask_jax` would use `tf.shape` to compute the
-values of the dimension variables `b` and `w`:
-
-```python
-def image_mask_tf(images, mask):
-  b, w, _ = tf.shape(images) # Compute the dynamic values for the dimension variables "b" and "w"
-  return tf.math.multiply(images,
-                          tf.broadcast_to(tf.reshape(mask, [1, w, w]),
-                                          [b, w, w]))
-```
-
-To achieve this, when we start lowering a function we construct a shape environment,
+It may be useful to understand how dimension polynomials are lowered to TensorFlow.
+When we start lowering a function we construct a shape environment,
 mapping the dimension variables in the `polymorphic_shapes` specification to TensorFlow expressions
-using `tf.shape` on the input parameters.
+using `tf.shape` on the input parameters. When we emit TensorFlow ops that
+involve dimension polynomials, we convert the polynomial to a TensorFlow
+expression. Consider again the reshape example from above:
 
+```python
+jax2tf.convert(lambda x: jnp.reshape(x, (x.shape[0] * x.shape[1],)),
+                polymorphic_shapes=["(b, 4)"])(np.ones((3, 4)))
+```
+
+The internal shape environment would map `b` to `tf.shape(x)[0]`, and
+the lowered function would be:
+
+```python
+def reshape_tf(x):
+  b = tf.shape(x)[0] # Compute the dynamic values for the dimension variable "b"
+  return tf.reshape(x, [tf.math.multiply(4, b)])
+```
+
+While operations among dimension polynomials and constants are handled
+by the overloading described above, a different mechanism is used
+for operations between JAX arrays and dimension polynomials.
+In these cases,
+`jax2tf` will try to convert dimension polynomials implicitly.
+In the function below the two occurrences of `x.shape[0]`
+are converted implicitly to `jnp.array(x.shape[0])` because
+they are involved in JAX array operations:
+
+```python
+jax2tf.convert(lambda x: x + x.shape[0] + jnp.sin(x.shape[0]),
+               polymorphic_shapes=["b"])(np.ones(3))
+```
+
+Another typical example is when computing averages:
+
+```python
+jax2tf.convert(lambda x: jnp.sum(x, axis=0) / x.shape[0],
+               polymorphic_shapes=["(v, _)"])(np.ones((3, 4)))
+```
+
+It is also possible to convert dimension polynomials explicitly
+to JAX arrays, with `jnp.array(x.shape[0])` or even `jnp.array(x.shape)`.
 
 ### Errors in presence of shape polymorphism
 
@@ -551,10 +555,9 @@ because the shape abstraction is given by the `polymorphic_shapes`, even though 
 actual arguments are more specific and would actually work.
 
 Also,
-
 ```python
 jax2tf.convert(lambda x: jnp.matmul(x, x),
-             polymorphic_shapes=["(v, 4)"])(np.ones((4, 4)))
+               polymorphic_shapes=["(v, 4)"])(np.ones((4, 4)))
 ```
 
 will result in the error `dot_general requires contracting dimensions to have the same shape, got [4] and [v]`. What is
@@ -565,16 +568,6 @@ equality expression can be true or false. Since it is not always true
 that `v == 4`, the shape checking rules fail with the above error.
 Since the lowered function works only for square matrices, the correct
 `polymorphic_shapes` is `["(v, v)"]`.
-
-
-Certain codes that use shapes in the actual computation may not yet work
-if those shapes are polymorphic. In the code below, the expression `x.shape[0]`
-will have the value of the dimension variable `v`. This case is not yet implemented:
-
-```python
-jax2tf.convert(lambda x: jnp.sum(x, axis=0) / x.shape[0],
-               polymorphic_shapes=["(v, _)"])(np.ones((4, 4)))
-```
 
 ### Division of shape polynomials is partially supported
 
@@ -656,7 +649,7 @@ jax2tf.convert(jnp.sin)(3.14)  # Has type float32
 jax2tf.convert(jnp.sin)(np.float64(3.14))  # Has type float32
 
 # The following will still compute `sin` in float32 (with a tf.cast on the argument).
-tf.function(jax2tf.convert(jnp.sin))(tf.Variable(3.14, tf.float64))
+tf.function(jax2tf.convert(jnp.sin))(tf.Variable(3.14, dtype=tf.float64))
 ```
 
 When the `JAX_ENABLE_X64` flas is set, JAX uses 64-bit types
@@ -671,7 +664,7 @@ tf.math.sin(3.14)  # Has type float32
 jax2tf.convert(jnp.sin)(3.14)  # Has type float64
 
 # The following will compute `sin` in float64.
-tf.function(jax2tf.convert(jnp.sin))(tf.Variable(3.14, tf.float64))
+tf.function(jax2tf.convert(jnp.sin))(tf.Variable(3.14, dtype=tf.float64))
 
 # The following will compute `sin` in float32.
 tf.function(jax2tf.convert(jnp.sin))(tf.Variable(3.14))
@@ -688,7 +681,7 @@ same dtype, you should use `jax2tf.dtype_of_val`:
 # The following two calls will lower jax_fun at the same dtypes
 # independently of the value of JAX_ENABLE_X64.
 jax2tf.convert(jax_fun)(3.14)
-jax2tf.convert(jax_fun)(tf.Variable(3.14, dtype=jax2tf.dtype_of_val(3.14))
+jax2tf.convert(jax_fun)(tf.Variable(3.14, dtype=jax2tf.dtype_of_val(3.14)))
 ```
 
 ### Incomplete TensorFlow data type coverage
@@ -826,7 +819,7 @@ def f_jax(x):  # x: int16
 jax.grad(f_jax, allow_int=True)(x)
 # returns a special `float0`: array((b'',), dtype=[('float0', 'V')])
 
-jax2tf.convert(jax.grad(f_jax, allow_int=True))(x))
+jax2tf.convert(jax.grad(f_jax, allow_int=True))(x)
 # returns a tf.Tensor(0, shape=(), dtype=int32)
 ```
 
@@ -916,6 +909,25 @@ Later the user can use `tree_unflatten` for the reverse process:
 input_data = jax.tree_util.tree_unflatten(m.input_data['tree_def'], m.input_data['flat'])
 ```
 
+### Large saved_model.pb due too many PRNG operations
+
+The default `threefry2x32` PRNG is implemented in JAX with dozens
+of additions and bitwise operations. This means that a single PRNG
+operation in JAX will result in dozens of TF ops after jax2tf.
+If the number of RPNG operations
+is large, the generated TF graph will be very large.
+
+To reduce the TF graph size and the compilation time
+one can use the `unsafe_rbg` PRNG implementation by
+setting `jax.config.update('jax_default_prng_impl', 'unsafe_rbg')`.
+The `unsafe_rbg` implementation will be lowered to a TF op and several
+casts and reshapes, thus significantly reducing the number of TF ops
+per PRNG operation. The "unsafe" part is that it doesn't guarantee
+determinism across JAX/XLA versions, and the quality of random
+streams it generates from different keys is less well understood.
+Nevertheless, this should be fine for most inference/serving cases.
+See more details in the [JAX PRNG documentation](https://jax.readthedocs.io/en/latest/jax.random.html?highlight=unsafe_rbg#advanced-rng-configuration).
+
 ### Unimplemented jax2tf features
 
 There is currently no support for `pmap` or`xmap`, nor for the collective
@@ -951,8 +963,8 @@ of shape polymorphism.
 ### TensorFlow XLA ops
 
 For most JAX primitives there is a natural TensorFlow op that fits the needed semantics.
-There are a few (listed below) JAX primitives for which there is no
-single TensorFlow op with matching semantics.
+There are a few (listed in [no_xla_limitations.md](g3doc/no_xla_limitations.md)) JAX primitives
+for which there is no single TensorFlow op with matching semantics.
 This is not so surprising, because JAX primitives have been designed
 to be compiled to [HLO ops](https://www.tensorflow.org/xla/operation_semantics),
 while the corresponding TensorFlow ops are sometimes higher-level.
@@ -975,7 +987,7 @@ There are several drawbacks of using XLA TensorFlow ops:
 
 As an experimental feature we implemented alternative conversions to avoid the XLA TensorFlow ops.
 You can enable this with the `enable_xla=False` parameter to `jax2tf.convert`.
-For more details see  [no_xla_limitations.md](g3doc/no_xla_limitations.md).
+For more details see [no_xla_limitations.md](g3doc/no_xla_limitations.md).
 
 ### Different performance characteristics
 
@@ -1035,7 +1047,7 @@ self.assertEqual(0, f_jax(x0))  # JAX sees that the x.shape[0] == 0
 # jax2tf catches the broken assumption b >= 1 if the lowered function is executed
 # eagerly.
 # Raises: ValueError: Dimension variable b must have integer value >= 1. Found value 0 when solving b == 0
-jax2tf.convert(f_jax, polymorphic_shapes=["b"])(x0))
+jax2tf.convert(f_jax, polymorphic_shapes=["b"])(x0)
 
 # However, if we first trace to a TensorFlow graph, we may miss the broken assumption:
 f_tf = tf.function(
@@ -1162,7 +1174,8 @@ The zero-copy does not yet work on TPU.
 The TF function must be compileable (`tf.function(func, jit_compile=True)`)
 and must have static output shapes
 when used in a JAX staging context, e.g., `jax.jit`, `lax.scan`, `lax.cond`,
-but not when used in a JAX op-by-op mode. For example, the following
+but may have unknown output shapes when used in a JAX op-by-op mode.
+For example, the following
 function uses strings operations that are not supported by XLA:
 
 ```python
@@ -1235,6 +1248,14 @@ def pure_func_tf(x, var1)
 
 This use case is likely to be revisited.
 
+Note that when the TF function captures a variable from the context, the
+TF function must be lowered for the same TF device that hosts the variable.
+By default, the lowering will use the first TF device on the same platform
+as the embedding JAX computation, e.g., "/device:TPU:0" if the embedding
+JAX computation runs on TPU. This will fail if the computation captures
+variables on some other devices. It is best to use ``call_tf``
+with TF functions that do not capture variables.
+
 A TF function wrapped with `call_tf` cannot be applied to inputs whose
 shapes are not constants. The may arise when you try to apply
 `jax2tf.convert` with polymorphic shapes on the result of
@@ -1252,6 +1273,7 @@ This is unsatisfying, because the result of the above conversion
 could be simply `tf.math.sin`, which is batch polymorphic. But
 JAX cannot keep track of shapes through a `call_tf` call, and it
 cannot be sure that the shape-polymorphic conversion is safe.
+
 
 # Misc notes
 

@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -227,7 +227,6 @@ class CustomLinearSolveTest(jtu.JaxTestCase):
         order=2,
         rtol={jnp.float32: 6e-2, jnp.float64: 2e-3})
 
-  @jtu.skip_on_devices("rocm")  # rtol and atol needs to be adjusted for ROCm
   def test_custom_linear_solve_cholesky(self):
 
     def positive_definite_solve(a, b):
@@ -393,6 +392,33 @@ class CustomLinearSolveTest(jtu.JaxTestCase):
             in_axes=(mat_axis_tree, None),
             out_axes=[0, 0, 0, 0, 0, None, None]), (mat, b),
         order=2)
+
+
+
+  def test_custom_linear_solve_pytree_with_aux(self):
+    # Check that lax.custom_linear_solve handles
+    # pytree inputs + has_aux=True
+    # https://github.com/google/jax/pull/13093
+
+    aux_orig = {'a': 1, 'b': 2}
+    b = {'c': jnp.ones(2), 'd': jnp.ones(3)}
+
+    def solve_with_aux(matvec, b):
+      return b, aux_orig
+
+    sol, aux = lax.custom_linear_solve(
+          lambda x:x,
+          b,
+          solve_with_aux,
+          solve_with_aux,
+          has_aux=True)
+
+    assert len(aux.keys()) == 2
+    assert 'a' in aux
+    assert 'b' in aux
+    self.assertAllClose(aux['a'], aux_orig['a'], check_dtypes=False)
+    self.assertAllClose(aux['b'], aux_orig['b'], check_dtypes=False)
+
 
   def test_custom_linear_solve_errors(self):
 

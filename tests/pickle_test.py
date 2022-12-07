@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,9 +29,34 @@ from jax import core
 from jax import numpy as jnp
 from jax.config import config
 from jax.interpreters import pxla
+from jax.interpreters import xla
+from jax._src import sharding
 from jax._src import test_util as jtu
+from jax._src.lib import xla_client as xc
+from jax._src.lib import xla_extension_version
+
+import numpy as np
 
 config.parse_flags_with_absl()
+
+
+def _get_device_by_id(device_id: int) -> xc.Device:
+  for device in jax.devices():
+    if device.id == device_id:
+      return device
+  raise ValueError(f'Device {device_id} was not found')
+
+
+xc.Device.__reduce__ = lambda d: (_get_device_by_id, (d.id,))
+
+
+if cloudpickle is not None:
+  def _reduce_mesh(mesh):
+    # Avoid including mesh._hash in the serialized bytes for Mesh. Without this
+    # the Mesh would be different among the workers.
+    return jax.pxla.Mesh, (mesh.devices, mesh.axis_names)
+
+  cloudpickle.CloudPickler.dispatch_table[jax.pxla.Mesh] = _reduce_mesh
 
 
 class CloudpickleTest(jtu.JaxTestCase):
@@ -94,9 +119,7 @@ class PickleTest(jtu.JaxTestCase):
     self.assertIsInstance(y, type(x))
     self.assertEqual(x.aval, y.aval)
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-      {'testcase_name': '_' + name, 'prng_name': name}
-      for name in ['threefry2x32', 'rbg', 'unsafe_rbg']))
+  @jtu.sample_product(prng_name=['threefry2x32', 'rbg', 'unsafe_rbg'])
   def testPickleOfKeyArray(self, prng_name):
     with jax.default_prng_impl(prng_name):
       k1 = jax.random.PRNGKey(72)
@@ -136,6 +159,55 @@ class PickleTest(jtu.JaxTestCase):
   def testPickleTracerError(self):
     with self.assertRaises(core.ConcretizationTypeError):
       jax.jit(pickle.dumps)(0)
+
+  def testPickleSharding(self):
+    if xla_extension_version < 104:
+      raise unittest.SkipTest('CPU buffer donation requires jaxlib > 0.3.22')
+    sharding = pxla.ShardingSpec((pxla.NoSharding(), pxla.Chunked(
+        (2, 2)), pxla.Unstacked(3)), (pxla.ShardedAxis(0), pxla.ShardedAxis(1),
+                                      pxla.ShardedAxis(2), pxla.Replicated(4)))
+    self.assertEqual(pickle.loads(pickle.dumps(sharding)), sharding)
+
+  def testPickleOpSharding(self):
+    if xla_extension_version < 104:
+      raise unittest.SkipTest('CPU buffer donation requires jaxlib > 0.3.22')
+    sharding = pxla.ShardingSpec((pxla.NoSharding(), pxla.Chunked((2, 2))),
+                                 (pxla.ShardedAxis(0), pxla.ShardedAxis(1)))
+    op_sharding = sharding.sharding_proto()
+    self.assertTrue(
+        xc.HloSharding.from_proto(pickle.loads(pickle.dumps(op_sharding))),
+        xc.HloSharding.from_proto(op_sharding))
+
+  def test_pickle_single_device_sharding(self):
+    s = sharding.SingleDeviceSharding(jax.devices()[0])
+    self.assertEqual(s, pickle.loads(pickle.dumps(s)))
+
+  @unittest.skipIf(xla_extension_version < 104,
+                   'ShardingSpec pickling requires newer jaxlib.')
+  def test_pickle_pmap_sharding(self):
+    ss = pxla.ShardingSpec(
+        sharding=(pxla.Unstacked(8),),
+        mesh_mapping=(pxla.ShardedAxis(0),))
+    s = sharding.PmapSharding(jax.devices(), ss)
+    self.assertEqual(s, pickle.loads(pickle.dumps(s)))
+
+  @unittest.skipIf(xla_extension_version < 104,
+                   'OpSharding pickling requires newer jaxlib.')
+  def test_pickle_op_sharding_sharding(self):
+    op_sharding = xla.xc.OpSharding()
+    op_sharding.type = xla.xc.OpSharding.Type.REPLICATED
+    s = sharding.OpShardingSharding(jax.devices(), op_sharding)
+    self.assertEqual(s, pickle.loads(pickle.dumps(s)))
+
+  @unittest.skipIf(xla_extension_version < 104,
+                   'NamedSharding pickling requires newer jaxlib.')
+  @unittest.skipIf(cloudpickle is None, "Requires cloudpickle")
+  def test_pickle_named_sharding(self):
+    s = jax.sharding.NamedSharding(
+        mesh=pxla.Mesh(np.array(jax.devices()), 'd'),
+        spec=pxla.PartitionSpec('d'))
+    self.assertEqual(s, pickle.loads(pickle.dumps(s)))
+
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

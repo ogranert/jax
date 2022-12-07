@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +18,9 @@ import functools
 import numpy as np
 from typing import Callable, Sequence, Tuple, Union, Mapping, Optional, List, Dict, NamedTuple
 
+import jax
 from jax import core
+from jax._src import dispatch
 from jax._src import api_util
 from jax._src.lib import xla_bridge as xb
 from jax._src.lib import xla_client as xc
@@ -26,6 +28,7 @@ from jax._src.config import config
 from jax.interpreters import pxla, xla, mlir
 from jax._src.util import prod, safe_zip
 from jax._src.api import device_put
+from jax._src.lib import xla_extension_version
 from jax.interpreters.pxla import PartitionSpec
 
 Shape = Tuple[int, ...]
@@ -231,13 +234,13 @@ class GlobalDeviceArray:
     ...        global_input_shape, global_mesh, mesh_axes, get_local_data_slice)
     >>> print(gda.shape)
     (8, 2)
-    >>> print(gda.local_shards[0].data)  # Access the data on a single local device
+    >>> print(gda.addressable_shards[0].data)  # Access the data on a single local device
     [[0]
      [2]]
-    >>> print(gda.local_shards[0].data.shape)
+    >>> print(gda.addressable_shards[0].data.shape)
     (2, 1)
     >>> # Numpy-style index into the global array that this data shard corresponds to
-    >>> print(gda.local_shards[0].index)
+    >>> print(gda.addressable_shards[0].index)
     (slice(0, 2, None), slice(0, 1, None))
 
   GDAs can also be given as an input to pjit and you can get GDAs as output from pjit::
@@ -249,7 +252,7 @@ class GlobalDeviceArray:
     with global_mesh:
       out = f(gda)
 
-    # `out` can be passed to another pjit call, out.local_shards can be used to
+    # `out` can be passed to another pjit call, out.addressable_shards can be used to
     # export the data to non-jax systems (e.g. for checkpointing or logging), etc.
 
   """
@@ -268,7 +271,6 @@ class GlobalDeviceArray:
 
     # Optionally precomputed for performance.
     self._gda_fast_path_args = _gda_fast_path_args
-    self._current_process = xb.process_index()
 
     if self._gda_fast_path_args is None:
       self._local_devices = self._global_mesh.local_devices
@@ -287,7 +289,7 @@ class GlobalDeviceArray:
       ss = get_shard_shape(self._global_shape, self._global_mesh, self.mesh_axes)
       assert all(db.shape == ss for db in self._device_buffers), (
           f"Expected shard shape {ss} doesn't match the device buffer "
-          f"shape, got: {[db.shape for db in device_buffers]}")
+          f"shape, got: {[db.shape for db in self._device_buffers]}")
 
     if self._sharded_buffer is None:
       dtype = device_buffers[0].dtype  # type: ignore
@@ -296,36 +298,36 @@ class GlobalDeviceArray:
     if _enable_checks or config.jax_enable_checks:
       assert all(db.dtype == dtype for db in self._device_buffers), (
           "Input arrays to GlobalDeviceArray must have matching dtypes, "
-          f"got: {[db.dtype for db in device_buffers]}")
+          f"got: {[db.dtype for db in self._device_buffers]}")
     self.dtype = dtype
 
   def _init_buffers(self, device_buffers):
+    from jax._src.array import ArrayImpl
+
     self._maybe_device_buffers = None
 
     # ShardedBuffer is the fast path for managing sharded buffers that avoids
     # creating python objects for every device.
-    if xb.use_sharded_buffer:
-      if isinstance(device_buffers, xb.xla_client.ShardedBuffer):
-        # if ShardedBuffer is provided, we don't need to use `_device_buffers`
-        self._sharded_buffer = device_buffers  # type: ignore
-      elif isinstance(device_buffers[0], DeviceArray):  # type: ignore
-        # if xla_client.Buffer is provided, we convert it to ShardedBuffer.
-        self._sharded_buffer = xb.xla_client.ShardedBuffer.create_sharded_buffer(
-            device_buffers)
-      else:
-        # if `device_buffers` is any other types that cannot
-        # be converted to ShardedBuffer, then we use `device_buffers`.
-        # TODO(yashkatariya,chky): Remove this branch once everyone is using
-        # sharded_buffer
-        self._sharded_buffer = None
-        self._maybe_device_buffers = device_buffers
+    if isinstance(device_buffers, xc.ShardedBuffer):
+      # if ShardedBuffer is provided, we don't need to use `_device_buffers`
+      self._sharded_buffer = device_buffers  # type: ignore
+    elif isinstance(device_buffers[0], DeviceArray):  # type: ignore
+      # if xla_client.Buffer is provided, we convert it to ShardedBuffer.
+      self._sharded_buffer = xc.ShardedBuffer.create_sharded_buffer(device_buffers)
+    elif isinstance(device_buffers[0], ArrayImpl):
+      self._sharded_buffer = None
+      self._maybe_device_buffers = [db._arrays[0] for db in device_buffers]
     else:
-      # TODO: Remove this after bumping the minimum jaxlib version.
+      # if `device_buffers` is any other types that cannot
+      # be converted to ShardedBuffer, then we use `device_buffers`.
+      # TODO(yashkatariya,chky): Remove this branch once everyone is using
+      # sharded_buffer
       self._sharded_buffer = None
       self._maybe_device_buffers = device_buffers
 
   @property
   def _device_buffers(self):
+    self._check_if_deleted()
     if self._maybe_device_buffers is None:
       self._maybe_device_buffers = self._sharded_buffer.get_device_buffers()  # type: ignore
     return self._maybe_device_buffers
@@ -369,7 +371,7 @@ class GlobalDeviceArray:
 
   @property
   def is_fully_replicated(self) -> bool:
-    return self.shape == self.local_data(0).shape
+    return self.shape == self.addressable_data(0).shape
 
   def _create_local_shards(self) -> Sequence[Shard]:
     if self._gda_fast_path_args is not None:
@@ -380,20 +382,27 @@ class GlobalDeviceArray:
 
     out = []
     for db in self._device_buffers:
-      db = pxla._set_aval(db)
+      db = dispatch._set_aval(db)
       device = db.device()
       index, rid = global_indices_rid[device]
       out.append(Shard(device, index, rid, db))
     return out
 
-  @pxla.maybe_cached_property
+  @functools.cached_property
   def local_shards(self) -> Sequence[Shard]:
+    self._check_if_deleted()
     return self._create_local_shards()
+
+  @functools.cached_property
+  def addressable_shards(self) -> Sequence[Shard]:
+    self._check_if_deleted()
+    return self.local_shards
 
   @property
   def global_shards(self) -> Sequence[Shard]:
+    self._check_if_deleted()
     if self.mesh.size == len(self._local_devices):
-      return self.local_shards
+      return self.addressable_shards
 
     # Populating global_shards lazily (i.e. when requested) because populating
     # sthem eagerly leads to a performance regression when training on large
@@ -405,7 +414,7 @@ class GlobalDeviceArray:
     device_to_buffer = {db.device(): db for db in self._device_buffers}
     global_shards = []
     for device, (index, rid) in global_indices_rid.items():
-      local_shard = device.process_index == self._current_process
+      local_shard = device.process_index == device.client.process_index()
       buf = device_to_buffer[device] if local_shard else None
       if buf is not None and buf.aval is None:
         buf.aval = core.ShapedArray(buf.shape, buf.dtype)
@@ -415,6 +424,7 @@ class GlobalDeviceArray:
 
   @property
   def _value(self):
+    self._check_if_deleted()
     if self.is_fully_replicated:
       return np.asarray(self._device_buffers[0])
 
@@ -424,27 +434,57 @@ class GlobalDeviceArray:
                          "`jax.experimental.multihost_utils.process_allgather` "
                          "for this use case.")
     unique_shards = [s.data.copy_to_host_async() or s
-                     for s in self.local_shards if s.replica_id == 0]
+                     for s in self.addressable_shards if s.replica_id == 0]
     npy_value = np.empty(self.shape, self.dtype)
     for s in unique_shards:
       npy_value[s.index] = np.asarray(s.data)
     return npy_value
 
   def __array__(self, dtype=None, context=None):
+    self._check_if_deleted()
     return self._value if dtype is None else self._value.astype(dtype)
 
   def local_data(self, index) -> DeviceArray:
-    return pxla._set_aval(self._device_buffers[index])
+    self._check_if_deleted()
+    return dispatch._set_aval(self._device_buffers[index])
+
+  def addressable_data(self, index) -> DeviceArray:
+    self._check_if_deleted()
+    return self.local_data(index)
 
   def block_until_ready(self):
-    # self._sharded_buffer can be None if xla_extension_version < 90 or
-    # _DeviceArray is used.
+    self._check_if_deleted()
+    # self._sharded_buffer can be None if _DeviceArray is used.
     if self._sharded_buffer is None:
       for db in self._device_buffers:
         db.block_until_ready()
     else:
-      self._sharded_buffer.block_until_ready() # type: ignore
+      self._sharded_buffer.block_until_ready()  # type: ignore
     return self
+
+  def _check_if_deleted(self):
+    if self.is_deleted():
+      raise RuntimeError("GlobalDeviceArray has been deleted.")
+
+  def is_deleted(self):
+    return self._sharded_buffer is None and self._maybe_device_buffers is None
+
+  def delete(self):
+    if self._sharded_buffer:
+      if xla_extension_version >= 101:
+        self._sharded_buffer.delete()
+      else:
+        for b in self._sharded_buffer.get_device_buffers():
+          b.delete()
+      self._sharded_buffer = None
+    if self._maybe_device_buffers:
+      for b in self._maybe_device_buffers:
+        b.delete()
+      self._maybe_device_buffers = None
+
+  @property
+  def sharding(self):
+    return jax.sharding.NamedSharding(self._global_mesh, self.mesh_axes)
 
   @classmethod
   def from_callback(cls, global_shape: Shape, global_mesh: pxla.Mesh,
@@ -462,14 +502,14 @@ class GlobalDeviceArray:
       ...
       >>> global_input_shape = (8, 8)
       >>> mesh_axes = P('x', 'y')
-      >>> global_mesh = global_mesh = Mesh(np.array(jax.devices()).reshape(2, 4), ('x', 'y'))
+      >>> global_mesh = Mesh(np.array(jax.devices()).reshape(2, 4), ('x', 'y'))
       >>> global_input_data = np.arange(prod(global_input_shape)).reshape(global_input_shape)
       ...
       >>> def cb(index):
       ...  return global_input_data[index]
       ...
       >>> gda = GlobalDeviceArray.from_callback(global_input_shape, global_mesh, mesh_axes, cb)
-      >>> gda.local_data(0).shape
+      >>> gda.addressable_data(0).shape
       (4, 2)
 
     Args:
@@ -509,7 +549,7 @@ class GlobalDeviceArray:
       ...
       >>> global_input_shape = (8, 2)
       >>> mesh_axes = P('x')
-      >>> global_mesh = global_mesh = Mesh(np.array(jax.devices()).reshape(4, 2), ('x', 'y'))
+      >>> global_mesh = Mesh(np.array(jax.devices()).reshape(4, 2), ('x', 'y'))
       >>> global_input_data = np.arange(prod(global_input_shape)).reshape(global_input_shape)
       ...
       >>> def batched_cb(indices):
@@ -517,7 +557,7 @@ class GlobalDeviceArray:
       ...   return [global_input_data[index] for index in indices]
       ...
       >>> gda = GlobalDeviceArray.from_batched_callback(global_input_shape, global_mesh, mesh_axes, batched_cb)
-      >>> gda.local_data(0).shape
+      >>> gda.addressable_data(0).shape
       (2, 2)
 
     Args:
@@ -528,7 +568,7 @@ class GlobalDeviceArray:
       data_callback : Callback that takes a batch of indices into the global array value with
         length equal to the number of local devices as input and returns the corresponding data for each index.
         The data can be returned as any array-like objects, e.g. ``numpy.ndarray``
-"""
+    """
     global_indices_rid = get_shard_indices_replica_ids(
         global_shape, global_mesh, mesh_axes)
     local_devices = global_mesh.local_devices
@@ -556,7 +596,7 @@ class GlobalDeviceArray:
       ...
       >>> global_input_shape = (8, 2)
       >>> mesh_axes = P(('x', 'y'))
-      >>> global_mesh = global_mesh = Mesh(np.array(jax.devices()).reshape(4, 2), ('x', 'y'))
+      >>> global_mesh = Mesh(np.array(jax.devices()).reshape(4, 2), ('x', 'y'))
       >>> global_input_data = np.arange(prod(global_input_shape)).reshape(global_input_shape)
       ...
       >>> def cb(cb_inp):
@@ -569,7 +609,7 @@ class GlobalDeviceArray:
       ...
       >>> gda = GlobalDeviceArray.from_batched_callback_with_devices(
       ...   global_input_shape, global_mesh, mesh_axes, cb)
-      >>> gda.local_data(0).shape
+      >>> gda.addressable_data(0).shape
       (1, 2)
 
     Args:
@@ -580,7 +620,7 @@ class GlobalDeviceArray:
       data_callback : Callback that takes agets batch of indices into the global array value with
         length equal to the number of local devices as input and returns the corresponding data for
         each index. The data must be returned as jax DeviceArrays.
-"""
+    """
     global_indices_rid = get_shard_indices_replica_ids(
         global_shape, global_mesh, mesh_axes)
     local_devices = global_mesh.local_devices
@@ -619,10 +659,10 @@ mlir.register_constant_handler(GlobalDeviceArray, _gda_mlir_constant_handler)
 
 
 def _gda_shard_arg(x, devices, indices, mode):
+  x._check_if_deleted()
   if mode == pxla.InputsHandlerMode.pmap:
     raise RuntimeError('GDA is not supported with pmap.')
-  # self._sharded_buffer can be None if xla_extension_version < 90 or
-  # _DeviceArray is used.
+  # self._sharded_buffer can be None if _DeviceArray is used.
   if x._sharded_buffer is None:
     return x._device_buffers
   return x._sharded_buffer

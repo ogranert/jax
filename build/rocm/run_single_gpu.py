@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright 2022 Google LLC
+# Copyright 2022 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -106,6 +106,7 @@ def main(args):
 
 
 if __name__ == '__main__':
+  os.environ['HSA_TOOLS_LIB'] = "libroctracer64.so"
   parser = argparse.ArgumentParser()
   parser.add_argument("-p",
                       "--parallel",

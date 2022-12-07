@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 """Tests for cross host device transfer."""
 
 from absl.testing import absltest
+import contextlib
 import unittest
 import numpy as np
 
@@ -24,6 +25,10 @@ from jax.config import config
 
 config.parse_flags_with_absl()
 
+with contextlib.suppress(ImportError):
+  import pytest
+  pytestmark = pytest.mark.multiaccelerator
+
 
 class RemoteTransferTest(jtu.JaxTestCase):
 
@@ -31,7 +36,10 @@ class RemoteTransferTest(jtu.JaxTestCase):
   @jtu.skip_on_devices("gpu")
   def test_remote_transfer(self):
     if jax.device_count() < 2:
-      raise unittest.SkipTest("Remote transfer requires at lest 2 devices")
+      raise unittest.SkipTest("Remote transfer requires at least 2 devices")
+    if config.jax_array:
+      raise unittest.SkipTest("Array does not have xla_shape method since "
+                              "it is deprecated.")
     dev_a, dev_b = jax.local_devices()[:2]
     if "libtpu" in jax.local_devices()[0].client.platform_version:
       raise unittest.SkipTest("Test does not yet work on cloud TPU")

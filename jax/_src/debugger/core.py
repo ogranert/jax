@@ -1,4 +1,4 @@
-# Copyright 2022 Google LLC
+# Copyright 2022 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,8 +17,7 @@ import dataclasses
 import inspect
 import threading
 
-from typing import Any, Dict, Hashable, List, Optional, Tuple
-from typing_extensions import Protocol
+from typing import Any, Dict, Hashable, List, Optional, Protocol, Tuple
 
 import jax.numpy as jnp
 from jax import core

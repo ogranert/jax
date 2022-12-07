@@ -1,4 +1,4 @@
-# Copyright 2019 Google LLC
+# Copyright 2019 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 """Tests for --debug_nans."""
 
-from absl.testing import absltest, parameterized
+from absl.testing import absltest
 
 import jax
 import numpy as np
@@ -24,11 +24,12 @@ from jax._src import api
 from jax._src import test_util as jtu
 from jax import numpy as jnp
 from jax.experimental import pjit
-import jax._src.lib
+from jax._src.lib import xla_client
 
 from jax.config import config
 config.parse_flags_with_absl()
 
+xla_extension_version = getattr(xla_client, "_version", 0)
 
 class DebugNaNsTest(jtu.JaxTestCase):
 
@@ -81,9 +82,7 @@ class DebugNaNsTest(jtu.JaxTestCase):
       ans = 0. / A
       ans.block_until_ready()
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-    {"testcase_name": f"_jit={jit._name}", "jit": jit}
-    for jit in jtu.JIT_IMPLEMENTATION))
+  @jtu.sample_product(jit=jtu.JIT_IMPLEMENTATION)
   def testCallDeoptimized(self, jit):
     @jit
     def f(x):
@@ -94,7 +93,7 @@ class DebugNaNsTest(jtu.JaxTestCase):
     # run to compile, and the next call won't go through `cache_miss`.
     f(2)
     # 'cond' not 'xla_call'
-    msg = r"invalid value \(nan\) encountered in cond"
+    msg = r"invalid value \(nan\) encountered in .*cond.*"
     with self.assertRaisesRegex(FloatingPointError, msg):
       f(1)
 
@@ -135,7 +134,7 @@ class DebugNaNsTest(jtu.JaxTestCase):
     with jax.experimental.maps.Mesh(np.array(jax.local_devices()[:1]), ('x',)):
       with self.assertRaisesRegex(
           FloatingPointError,
-          r"invalid value \(nan\) encountered in parallel computation"):
+          r"invalid value \(nan\) encountered in xmap"):
         ans = f(jnp.array([0.]))
         ans.block_until_ready()
 
@@ -150,10 +149,48 @@ class DebugNaNsTest(jtu.JaxTestCase):
     if jax.device_count() < 2:
       raise SkipTest("test requires >=2 devices")
 
-    p = jax.experimental.PartitionSpec('x')
+    p = pjit.PartitionSpec('x')
     f = pjit.pjit(lambda x: 0. / x,
                   in_axis_resources=p,
                   out_axis_resources=p)
+
+    with jax.experimental.maps.Mesh(np.array(jax.local_devices()[:2]), ('x',)):
+      with self.assertRaises(FloatingPointError):
+        ans = f(jnp.array([0., 1.]))
+        ans.block_until_ready()
+
+  def testDebugNansJitWithDonation(self):
+    # https://github.com/google/jax/issues/12514
+    if jtu.device_under_test() == "cpu" and xla_extension_version < 102:
+      raise SkipTest("CPU buffer donation requires jaxlib > 0.3.22")
+
+    a = jnp.array(0.)
+    with self.assertRaises(FloatingPointError):
+      ans = jax.jit(lambda x: 0. / x, donate_argnums=(0,))(a)
+      ans.block_until_ready()
+
+  def testDebugNansPmapWithDonation(self):
+    if jtu.device_under_test() == "cpu" and xla_extension_version < 102:
+      raise SkipTest("CPU buffer donation requires jaxlib > 0.3.22")
+
+    a = jnp.zeros((1,))
+    with self.assertRaises(FloatingPointError):
+      ans = jax.pmap(lambda x: 0. / x, donate_argnums=(0,))(a)
+      ans.block_until_ready()
+
+  @jtu.ignore_warning(message=".*is an experimental.*")
+  def testDebugNansPjitWithDonation(self):
+    if jtu.device_under_test() == "cpu" and xla_extension_version < 102:
+      raise SkipTest("CPU buffer donation requires jaxlib > 0.3.22")
+
+    if jax.device_count() < 2:
+      raise SkipTest("test requires >=2 devices")
+
+    p = pjit.PartitionSpec('x')
+    f = pjit.pjit(lambda x: 0. / x,
+                  in_axis_resources=p,
+                  out_axis_resources=p,
+                  donate_argnums=(0,))
 
     with jax.experimental.maps.Mesh(np.array(jax.local_devices()[:2]), ('x',)):
       with self.assertRaises(FloatingPointError):
@@ -192,9 +229,7 @@ class DebugInfsTest(jtu.JaxTestCase):
       ans = 1. / A
       ans.block_until_ready()
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-      {"testcase_name": f"_jit={jit._name}", "jit": jit}
-      for jit in jtu.JIT_IMPLEMENTATION))
+  @jtu.sample_product(jit=jtu.JIT_IMPLEMENTATION)
   def testCallDeoptimized(self, jit):
     @jit
     def f(x):
@@ -205,7 +240,7 @@ class DebugInfsTest(jtu.JaxTestCase):
     # run to compile, and the next call won't go through `cache_miss`.
     f(2)
     # 'cond' not 'xla_call'
-    msg = r"invalid value \(inf\) encountered in cond"
+    msg = r"invalid value \(inf\) encountered in .*cond.*"
     with self.assertRaisesRegex(FloatingPointError, msg):
       f(1)
 

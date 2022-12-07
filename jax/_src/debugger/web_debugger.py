@@ -1,4 +1,4 @@
-# Copyright 2022 Google LLC
+# Copyright 2022 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -92,4 +92,4 @@ def run_debugger(frames: List[debugger_core.DebuggerFrame],
   WebDebugger(frames, thread_id, **kwargs).run()
 
 if WEB_PDB_ENABLED:
-  debugger_core.register_debugger("web", run_debugger, 0)
+  debugger_core.register_debugger("web", run_debugger, -2)

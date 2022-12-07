@@ -1,4 +1,4 @@
-/* Copyright 2021 Google LLC
+/* Copyright 2021 The JAX Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -42,8 +42,8 @@ limitations under the License.
 
 #include "tensorflow/compiler/xla/literal.h"
 #include "tensorflow/compiler/xla/literal_util.h"
-#include "tensorflow/compiler/xla/pjrt/cpu_device.h"
 #include "tensorflow/compiler/xla/pjrt/pjrt_client.h"
+#include "tensorflow/compiler/xla/pjrt/tfrt_cpu_pjrt_client.h"
 #include "tensorflow/compiler/xla/status.h"
 #include "tensorflow/compiler/xla/statusor.h"
 #include "tensorflow/compiler/xla/tools/hlo_module_loader.h"
@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
 
   // Get a CPU client.
   std::unique_ptr<xla::PjRtClient> client =
-      xla::GetCpuClient(/*asynchronous=*/true).value();
+      xla::GetTfrtCpuClient(/*asynchronous=*/true).value();
 
   // Compile XlaComputation to PjRtExecutable.
   xla::XlaComputation xla_computation(test_module_proto);

@@ -1,4 +1,4 @@
-# Copyright 2019 Google LLC
+# Copyright 2019 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,7 +16,6 @@ import collections
 import functools
 import pickle
 import re
-import unittest
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -25,12 +24,9 @@ import jax
 from jax import tree_util
 from jax import flatten_util
 from jax._src import test_util as jtu
-from jax._src.lib import pytree as pytree
 from jax._src.tree_util import prefix_errors
 import jax.numpy as jnp
 
-
-pytree_version = getattr(pytree, "version", 0)
 
 def _dummy_func(*args, **kwargs):
   return
@@ -361,7 +357,6 @@ class TreeTest(jtu.JaxTestCase):
     self.assertEqual(expected, actual)
 
   @parameterized.parameters([(*t, s) for t, s in zip(TREES, TREE_STRINGS)])
-  @unittest.skipIf(pytree_version < 2, "Requires jaxlib 0.3.15")
   def testStringRepresentation(self, tree, correct_string):
     """Checks that the string representation of a tree works."""
     treedef = tree_util.tree_structure(tree)
@@ -371,7 +366,6 @@ class TreeTest(jtu.JaxTestCase):
     self.assertEqual(str(tree_util.tree_structure({})), "PyTreeDef({})")
 
   @parameterized.parameters(*TREES)
-  @unittest.skipIf(pytree_version < 3, "Requires jaxlib 0.3.16")
   def testPickleRoundTrip(self, tree):
     treedef = tree_util.tree_structure(tree)
     treedef_restored = pickle.loads(pickle.dumps(treedef))
@@ -504,6 +498,13 @@ class TreePrefixErrorsTest(jtu.JaxTestCase):
                 r"    in_axes\[1\]")
     with self.assertRaisesRegex(ValueError, expected):
       raise e2('in_axes')
+
+  def test_different_num_children_print_key_diff(self):
+    e, = prefix_errors({'a': 1}, {'a': 2, 'b': 3})
+    expected = ("so the symmetric difference on key sets is\n"
+                "    b")
+    with self.assertRaisesRegex(ValueError, expected):
+      raise e('in_axes')
 
   def test_different_metadata(self):
     e, = prefix_errors({1: 2}, {3: 4})

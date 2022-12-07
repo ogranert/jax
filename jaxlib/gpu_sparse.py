@@ -1,4 +1,4 @@
-# Copyright 2019 Google LLC
+# Copyright 2019 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ from jaxlib import xla_client
 from .mhlo_helpers import custom_call
 
 try:
-  from .cuda import _cusparse
+  from .cuda import _sparse as _cusparse
 except ImportError:
   _cusparse = None
 else:
@@ -34,7 +34,7 @@ else:
     xla_client.register_custom_call_target(_name, _value, platform="CUDA")
 
 try:
-  from .rocm import _hipsparse
+  from .rocm import _sparse as _hipsparse
 except ImportError:
   _hipsparse = None
 else:
@@ -42,8 +42,8 @@ else:
     xla_client.register_custom_call_target(_name, _value, platform="ROCM")
 
 
-cuda_is_supported : bool = _cusparse and _cusparse.cusparse_supported
-rocm_is_supported : bool = _hipsparse and _hipsparse.hipsparse_supported
+cuda_is_supported : bool = _cusparse and _cusparse.sparse_supported
+rocm_is_supported : bool = _hipsparse and _hipsparse.sparse_supported
 
 
 def _validate_csr_mhlo(data, indices, indptr, shape):
@@ -356,7 +356,8 @@ def _gtsv2_mhlo(platform, gpu_sparse, dl, d, du, B, *, m, n, ldb, t):
       [dl, d, du, B],
       backend_config=gpu_sparse.build_gtsv2_descriptor(m, n, ldb),
       operand_layouts=[[0]] * 3 + [[1, 0]],
-      result_layouts=[[1, 0], [0]])
+      result_layouts=[[1, 0], [0]],
+      operand_output_aliases={3: 0})
   return out[0]
 
 cuda_gtsv2 = partial(_gtsv2_mhlo, "cu", _cusparse)

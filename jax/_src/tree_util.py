@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@ import difflib
 import functools
 from functools import partial
 import operator as op
-from typing import (Any, Callable, Hashable, Iterable, Optional, Tuple, List,
-                    Dict, Type, TypeVar, overload, TYPE_CHECKING, NamedTuple)
+from typing import (Any, Callable, Dict, Hashable, Iterable, List, NamedTuple,
+                    Optional, Sequence, Tuple, Type, TypeVar, overload)
 import textwrap
 import warnings
 
@@ -30,12 +30,15 @@ from jax._src import traceback_util
 traceback_util.register_exclusion(__file__)
 
 T = TypeVar("T")
-U = TypeVar("U")
+U = TypeVar("U", bound=Type[Any])
 
+Leaf = Any
 PyTreeDef = pytree.PyTreeDef
 
 
-def tree_flatten(tree, is_leaf: Optional[Callable[[Any], bool]] = None):
+def tree_flatten(tree: Any,
+                 is_leaf: Optional[Callable[[Any], bool]] = None
+                 ) -> Tuple[List[Leaf], PyTreeDef]:
   """Flattens a pytree.
 
   The flattening order (i.e. the order of elements in the output list)
@@ -55,15 +58,15 @@ def tree_flatten(tree, is_leaf: Optional[Callable[[Any], bool]] = None):
   return pytree.flatten(tree, is_leaf)
 
 
-def tree_unflatten(treedef, leaves):
+def tree_unflatten(treedef: PyTreeDef, leaves: Iterable[Leaf]) -> Any:
   """Reconstructs a pytree from the treedef and the leaves.
 
   The inverse of :func:`tree_flatten`.
 
   Args:
     treedef: the treedef to reconstruct
-    leaves: the list of leaves to use for reconstruction. The list must match
-      the leaves of the treedef.
+    leaves: the iterable of leaves to use for reconstruction. The iterable
+      must match the leaves of the treedef.
 
   Returns:
     The reconstructed pytree, containing the ``leaves`` placed in the structure
@@ -71,28 +74,32 @@ def tree_unflatten(treedef, leaves):
   """
   return treedef.unflatten(leaves)
 
-def tree_leaves(tree, is_leaf: Optional[Callable[[Any], bool]] = None):
+def tree_leaves(tree: Any,
+                is_leaf: Optional[Callable[[Any], bool]] = None
+                ) -> List[Leaf]:
   """Gets the leaves of a pytree."""
   return pytree.flatten(tree, is_leaf)[0]
 
-def tree_structure(tree, is_leaf: Optional[Callable[[Any], bool]] = None):
+def tree_structure(tree: Any,
+                   is_leaf: Optional[Callable[[Any], bool]] = None) -> PyTreeDef:
   """Gets the treedef for a pytree."""
   return pytree.flatten(tree, is_leaf)[1]
 
-def treedef_tuple(treedefs):
-  """Makes a tuple treedef from a list of child treedefs."""
+def treedef_tuple(treedefs: Iterable[PyTreeDef]) -> PyTreeDef:
+  """Makes a tuple treedef from an iterable of child treedefs."""
   return pytree.tuple(list(treedefs))
 
-def treedef_children(treedef):
+def treedef_children(treedef: PyTreeDef) -> List[PyTreeDef]:
   return treedef.children()
 
-def treedef_is_leaf(treedef):
+def treedef_is_leaf(treedef: PyTreeDef) -> bool:
   return treedef.num_nodes == 1
 
-def treedef_is_strict_leaf(treedef):
+def treedef_is_strict_leaf(treedef: PyTreeDef) -> bool:
   return treedef.num_nodes == 1 and treedef.num_leaves == 1
 
-def all_leaves(iterable, is_leaf: Optional[Callable[[Any], bool]] = None):
+def all_leaves(iterable: Iterable[Any],
+               is_leaf: Optional[Callable[[Any], bool]] = None) -> bool:
   """Tests whether all elements in the given iterable are all leaves.
 
   >>> tree = {"a": [1, 2, 3]}
@@ -100,8 +107,8 @@ def all_leaves(iterable, is_leaf: Optional[Callable[[Any], bool]] = None):
   >>> assert not all_leaves([tree])
 
   This function is useful in advanced cases, for example if a library allows
-  arbitrary map operations on a flat list of leaves it may want to check if
-  the result is still a flat list of leaves.
+  arbitrary map operations on a flat iterable of leaves it may want to check
+  if the result is still a flat iterable of leaves.
 
   Args:
     iterable: Iterable of leaves.
@@ -141,7 +148,7 @@ def register_pytree_node(nodetype: Type[T],
   pytree.register_node(nodetype, flatten_func, unflatten_func)
   _registry[nodetype] = _RegistryEntry(flatten_func, unflatten_func)
 
-def register_pytree_node_class(cls):
+def register_pytree_node_class(cls: U) -> U:
   """Extends the set of types that are considered internal nodes in pytrees.
 
   This function is a thin wrapper around ``register_pytree_node``, and provides
@@ -199,10 +206,12 @@ def tree_map(f: Callable[..., Any], tree: Any, *rest: Any,
   all_leaves = [leaves] + [treedef.flatten_up_to(r) for r in rest]
   return treedef.unflatten(f(*xs) for xs in zip(*all_leaves))
 
-def build_tree(treedef, xs):
+def build_tree(treedef: PyTreeDef, xs: Any) -> Any:
   return treedef.from_iterable_tree(xs)
 
-def tree_transpose(outer_treedef, inner_treedef, pytree_to_transpose):
+def tree_transpose(outer_treedef: PyTreeDef,
+                   inner_treedef: PyTreeDef,
+                   pytree_to_transpose: Any) -> Any:
   """Transform a tree having tree structure (outer, inner) into one having structure
   (inner, outer).
   """
@@ -212,8 +221,8 @@ def tree_transpose(outer_treedef, inner_treedef, pytree_to_transpose):
   if treedef.num_leaves != (inner_size * outer_size):
     expected_treedef = outer_treedef.compose(inner_treedef)
     raise TypeError(f"Mismatch\n{treedef}\n != \n{expected_treedef}")
-  flat = iter(flat)
-  lol = [[next(flat) for _ in range(inner_size)] for __ in range(outer_size)]
+  iter_flat = iter(flat)
+  lol = [[next(iter_flat) for _ in range(inner_size)] for __ in range(outer_size)]
   transposed_lol = zip(*lol)
   subtrees = map(partial(tree_unflatten, outer_treedef), transposed_lol)
   return tree_unflatten(inner_treedef, subtrees)
@@ -268,7 +277,7 @@ def tree_reduce(function: Callable[[T, Any], T],
   else:
     return functools.reduce(function, tree_leaves(tree), initializer)
 
-def tree_all(tree):
+def tree_all(tree: Any) -> bool:
   return all(tree_leaves(tree))
 
 register_pytree_node(
@@ -279,7 +288,7 @@ register_pytree_node(
 register_pytree_node(
   collections.defaultdict,
   lambda x: (tuple(x.values()), (x.default_factory, tuple(x.keys()))),
-  lambda s, values: collections.defaultdict(s[0], safe_zip(s[1], values)))  # type: ignore[index]
+  lambda s, values: collections.defaultdict(s[0], safe_zip(s[1], values)))  # type: ignore[index,call-overload]
 
 
 
@@ -315,7 +324,7 @@ class Partial(functools.partial):
   >>> import jax.numpy as jnp
   >>> add_one = Partial(jnp.add, 1)
   >>> add_one(2)
-  DeviceArray(3, dtype=int32, weak_type=True)
+  Array(3, dtype=int32, weak_type=True)
 
   Pytree compatibility means that the resulting partial function can be passed
   as an argument within transformed JAX functions, which is not possible with a
@@ -327,13 +336,13 @@ class Partial(functools.partial):
   ...   return f(*args)
   ...
   >>> call_func(add_one, 2)
-  DeviceArray(3, dtype=int32, weak_type=True)
+  Array(3, dtype=int32, weak_type=True)
 
   Passing zero arguments to ``Partial`` effectively wraps the original function,
   making it a valid argument in JAX transformed functions:
 
   >>> call_func(Partial(jnp.add), 1, 2)
-  DeviceArray(3, dtype=int32, weak_type=True)
+  Array(3, dtype=int32, weak_type=True)
 
   Had we passed ``jnp.add`` to ``call_func`` directly, it would have resulted in a
   ``TypeError``.
@@ -411,9 +420,9 @@ class KeyPath(NamedTuple):
     if isinstance(other, KeyPathEntry):
       return KeyPath(self.keys + (other,))
     raise TypeError(type(other))
-  def pprint(self) -> str:
+  def pprint(self, root: str = ' tree root') -> str:
     if not self.keys:
-      return ' tree root'
+      return root
     return ''.join(k.pprint() for k in self.keys)
 
 class GetitemKeyPathEntry(KeyPathEntry):
@@ -428,7 +437,7 @@ class FlattenedKeyPathEntry(KeyPathEntry):  # fallback
   def pprint(self) -> str:
     return f'[<flat index {self.key}>]'
 
-def _child_keys(pytree: Any) -> List[KeyPathEntry]:
+def _child_keys(pytree: Any) -> Sequence[KeyPathEntry]:
   assert not treedef_is_strict_leaf(tree_structure(pytree))
   handler = _keypath_registry.get(type(pytree))
   if handler:
@@ -440,9 +449,9 @@ def _child_keys(pytree: Any) -> List[KeyPathEntry]:
     num_children = len(treedef_children(tree_structure(pytree)))
     return [FlattenedKeyPathEntry(i) for i in range(num_children)]
 
-_keypath_registry: Dict[Type, Callable[[Any], List[KeyPathEntry]]] = {}
+_keypath_registry: Dict[Type, Callable[[Any], Sequence[KeyPathEntry]]] = {}
 
-def register_keypaths(ty: Type, handler: Callable[[Any], List[KeyPathEntry]]
+def register_keypaths(ty: Type, handler: Callable[[Any], Sequence[KeyPathEntry]]
                       ) -> None:
   _keypath_registry[ty] = handler
 
@@ -452,6 +461,19 @@ register_keypaths(list,
                   lambda lst: [GetitemKeyPathEntry(i) for i in range(len(lst))])
 register_keypaths(dict,
                   lambda dct: [GetitemKeyPathEntry(k) for k in sorted(dct)])
+
+def _generate_key_paths(tree: Any) -> List[Tuple[KeyPath, Any]]:
+  return list(_generate_key_paths_(KeyPath(()), tree))
+
+def _generate_key_paths_(key_path: KeyPath, tree: Any
+                         ) -> Iterable[Tuple[KeyPath, Any]]:
+  if treedef_is_strict_leaf(tree_structure(tree)):
+    yield key_path, tree
+  else:
+    child_keys = _child_keys(tree)
+    tree_children, _ = flatten_one_level(tree)
+    for k, c in zip(child_keys, tree_children):
+      yield from _generate_key_paths_(key_path + k, c)
 
 def _prefix_error(key_path: KeyPath, prefix_tree: Any, full_tree: Any,
                   is_leaf: Optional[Callable[[Any], bool]] = None,
@@ -475,15 +497,27 @@ def _prefix_error(key_path: KeyPath, prefix_tree: Any, full_tree: Any,
   # point, and because prefix_tree is not a leaf, each can be flattened once):
   prefix_tree_children, prefix_tree_meta = flatten_one_level(prefix_tree)
   full_tree_children, full_tree_meta = flatten_one_level(full_tree)
+  prefix_tree_keys = _child_keys(prefix_tree)
+  full_tree_keys = _child_keys(full_tree)
+  try:
+    diff = set(prefix_tree_keys).symmetric_difference(set(full_tree_keys))
+  except:
+    diff = None
   if len(prefix_tree_children) != len(full_tree_children):
     yield lambda name: ValueError(
       "pytree structure error: different numbers of pytree children at key path\n"
       f"    {{name}}{key_path.pprint()}\n"
       f"At that key path, the prefix pytree {{name}} has a subtree of type\n"
       f"    {type(prefix_tree)}\n"
-      f"with {len(prefix_tree_children)} children, "
+      f"with {len(prefix_tree_children)} child keys\n"
+      f"    {' '.join(str(k.key) for k in prefix_tree_keys)}\n"
       f"but at the same key path the full pytree has a subtree of the same "
-      f"type but with {len(full_tree_children)} children.".format(name=name))
+      f"type but with {len(full_tree_children)} child keys\n"
+      f"    {' '.join(str(k.key) for k in full_tree_keys)}\n"
+      .format(name=name)
+      + ("" if diff is None else
+         f"so the symmetric difference on key sets is\n"
+         f"    {' '.join(str(k.key) for k in diff)}"))
     return  # don't look for more errors in this subtree
 
   # Or they may disagree if their roots have different pytree metadata:
@@ -510,11 +544,10 @@ def _prefix_error(key_path: KeyPath, prefix_tree: Any, full_tree: Any,
 
   # If the root types and numbers of children agree, there must be an error
   # in a subtree, so recurse:
-  keys = _child_keys(prefix_tree)
-  keys_ = _child_keys(full_tree)
-  assert keys == keys_, \
-    f"equal pytree nodes gave differing keys: {keys} and {keys_}"
-  for k, t1, t2 in zip(keys, prefix_tree_children, full_tree_children):
+  assert prefix_tree_keys == full_tree_keys, \
+    ("equal pytree nodes gave differing prefix_tree_keys: "
+     f"{prefix_tree_keys} and {full_tree_keys}")
+  for k, t1, t2 in zip(prefix_tree_keys, prefix_tree_children, full_tree_children):
     yield from _prefix_error(key_path + k, t1, t2)
 
 

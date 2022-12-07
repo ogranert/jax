@@ -1,4 +1,4 @@
-# Copyright 2019 Google LLC
+# Copyright 2019 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -145,34 +145,34 @@ class NNFunctionsTest(jtu.JaxTestCase):
   def testOneHot(self):
     actual = nn.one_hot(jnp.array([0, 1, 2]), 3)
     expected = jnp.array([[1., 0., 0.],
-                         [0., 1., 0.],
-                         [0., 0., 1.]])
-    self.assertAllClose(actual, expected)
+                          [0., 1., 0.],
+                          [0., 0., 1.]])
+    self.assertAllClose(actual, expected, check_dtypes=False)
 
     actual = nn.one_hot(jnp.array([1, 2, 0]), 3)
     expected = jnp.array([[0., 1., 0.],
-                         [0., 0., 1.],
-                         [1., 0., 0.]])
-    self.assertAllClose(actual, expected)
+                          [0., 0., 1.],
+                          [1., 0., 0.]])
+    self.assertAllClose(actual, expected, check_dtypes=False)
 
   def testOneHotOutOfBound(self):
     actual = nn.one_hot(jnp.array([-1, 3]), 3)
     expected = jnp.array([[0., 0., 0.],
-                         [0., 0., 0.]])
-    self.assertAllClose(actual, expected)
+                          [0., 0., 0.]])
+    self.assertAllClose(actual, expected, check_dtypes=False)
 
   def testOneHotNonArrayInput(self):
     actual = nn.one_hot([0, 1, 2], 3)
     expected = jnp.array([[1., 0., 0.],
-                         [0., 1., 0.],
-                         [0., 0., 1.]])
-    self.assertAllClose(actual, expected)
+                          [0., 1., 0.],
+                          [0., 0., 1.]])
+    self.assertAllClose(actual, expected, check_dtypes=False)
 
   def testOneHotCustomDtype(self):
     actual = nn.one_hot(jnp.array([0, 1, 2]), 3, dtype=jnp.bool_)
     expected = jnp.array([[True, False, False],
-                         [False, True, False],
-                         [False, False, True]])
+                          [False, True, False],
+                          [False, False, True]])
     self.assertAllClose(actual, expected)
 
   def testOneHotConcretizationError(self):
@@ -183,14 +183,14 @@ class NNFunctionsTest(jtu.JaxTestCase):
 
   def testOneHotAxis(self):
     expected = jnp.array([[0., 1., 0.],
-                         [0., 0., 1.],
-                         [1., 0., 0.]]).T
+                          [0., 0., 1.],
+                          [1., 0., 0.]]).T
 
     actual = nn.one_hot(jnp.array([1, 2, 0]), 3, axis=0)
-    self.assertAllClose(actual, expected)
+    self.assertAllClose(actual, expected, check_dtypes=False)
 
     actual = nn.one_hot(jnp.array([1, 2, 0]), 3, axis=-2)
-    self.assertAllClose(actual, expected)
+    self.assertAllClose(actual, expected, check_dtypes=False)
 
   def testTanhExists(self):
     nn.tanh  # doesn't crash
@@ -210,6 +210,32 @@ class NNFunctionsTest(jtu.JaxTestCase):
 
     with jax.checking_leaks():
       fwd()  # doesn't crash
+
+  def testCustomJVPLeak2(self):
+    # https://github.com/google/jax/issues/8171
+    # The above test uses jax.nn.sigmoid, as in the original #8171, but that
+    # function no longer actually has a custom_jvp! So we inline the old def.
+
+    @jax.custom_jvp
+    def sigmoid(x):
+      one = jnp.float32(1)
+      return jax.lax.div(one, jax.lax.add(one, jax.lax.exp(jax.lax.neg(x))))
+    sigmoid.defjvps(lambda g, ans, x: g * ans * (jnp.float32(1) - ans))
+
+    @jax.jit
+    def fwd():
+      a = jnp.array(1., 'float32')
+
+      def f(hx, _):
+        hx = sigmoid(hx + a)
+        return hx, None
+
+      hx = jnp.array(0., 'float32')
+      jax.lax.scan(f, hx, None, length=2)
+
+    with jax.checking_leaks():
+      fwd()  # doesn't crash
+
 
 InitializerRecord = collections.namedtuple(
   "InitializerRecord",
@@ -237,16 +263,14 @@ INITIALIZER_RECS = [
 
 
 class NNInitializersTest(jtu.JaxTestCase):
-  @parameterized.named_parameters(jtu.cases_from_list(
-      {"testcase_name":
-       "_{}_{}".format(
-           rec.name,
-           jtu.format_shape_dtype_string(shape, dtype)),
-       "initializer": rec.initializer(),
-       "shape": shape, "dtype": dtype}
-      for rec in INITIALIZER_RECS
-      for shape in rec.shapes
-      for dtype in rec.dtypes))
+  @parameterized.parameters(itertools.chain.from_iterable(
+    jtu.sample_product_testcases(
+      [dict(initializer=rec.initializer())],
+      shape=rec.shapes,
+      dtype=rec.dtypes
+    )
+    for rec in INITIALIZER_RECS
+  ))
   def testInitializer(self, initializer, shape, dtype):
     rng = random.PRNGKey(0)
     val = initializer(rng, shape, dtype)
@@ -254,16 +278,14 @@ class NNInitializersTest(jtu.JaxTestCase):
     self.assertEqual(shape, jnp.shape(val))
     self.assertEqual(jax.dtypes.canonicalize_dtype(dtype), jnp.dtype(val))
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-      {"testcase_name":
-       "_{}_{}".format(
-           rec.name,
-           jtu.format_shape_dtype_string(shape, dtype)),
-       "initializer_provider": rec.initializer,
-       "shape": shape, "dtype": dtype}
-      for rec in INITIALIZER_RECS
-      for shape in rec.shapes
-      for dtype in rec.dtypes))
+  @parameterized.parameters(itertools.chain.from_iterable(
+    jtu.sample_product_testcases(
+      [dict(initializer_provider=rec.initializer)],
+      shape=rec.shapes,
+      dtype=rec.dtypes
+    )
+    for rec in INITIALIZER_RECS
+  ))
   def testInitializerProvider(self, initializer_provider, shape, dtype):
     rng = random.PRNGKey(0)
     initializer = initializer_provider(dtype=dtype)

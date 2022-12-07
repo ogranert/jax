@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ from functools import partial
 import itertools
 import operator
 from typing import (Any, Callable, Optional, Sequence, Tuple, List, Dict,
-                    TypeVar, Union, cast as type_cast)
+                    TypeVar, Union, cast as type_cast, overload)
 import warnings
 
 import numpy as np
@@ -29,12 +29,14 @@ from jax import core
 from jax._src import ad_util
 from jax._src import api
 from jax._src import api_util
+from jax._src import array
 from jax._src import device_array
 from jax._src import dispatch
 from jax import linear_util as lu
 from jax._src import dtypes
 from jax import tree_util
 from jax._src import source_info_util
+from jax._src.sharding import PmapSharding
 from jax._src.config import config
 from jax.core import (Primitive, UnshapedArray, ShapedArray, ConcreteArray,
                       raise_to_shaped, abstract_token, canonicalize_shape)
@@ -45,12 +47,12 @@ from jax.interpreters import xla
 from jax.interpreters import pxla
 from jax.interpreters import ad
 from jax.interpreters import batching
+from jax.interpreters.batching import ConcatAxis
 import jax._src.pretty_printer as pp
 from jax._src import util
 from jax._src.util import (cache, prod, safe_zip, safe_map, canonicalize_axis,
                            split_list)
 from jax.tree_util import tree_map
-from jax._src.lib import mlir_api_version
 from jax._src.lib import pytree
 from jax._src.lib import xla_bridge
 from jax._src.lib import xla_client
@@ -66,6 +68,7 @@ from jax._src.lax.utils import (
   standard_translate,
 )
 from jax._src.lax import slicing
+from jax._src.typing import Array, ArrayLike, DTypeLike, Shape
 
 xb = xla_bridge
 xc = xla_client
@@ -76,22 +79,10 @@ _max = builtins.max
 _min = builtins.min
 _reduce = functools.reduce
 
-Array = Any
-DType = Any
-Shape = core.Shape
-
 T = TypeVar("T")
 
 map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
-
-# TODO(jakevdp): replace this with an isinstance() check when JEP 12049 is complete.
-def _is_array_or_tracer(operand: Any) -> bool:
-  if config.jax_array:
-    from jax.experimental import array  # pylint: disable=g-import-not-at-top
-    return isinstance(operand, (core.Tracer, array.Array))
-  else:
-    return isinstance(operand, (core.Tracer, device_array.DeviceArray))
 
 def _validate_shapes(shapes: Sequence[Shape]):
   def _check_static_shape(shape: Shape):
@@ -130,8 +121,14 @@ def _try_broadcast_shapes(
         return None
   return tuple(result_shape)
 
+@overload
+def broadcast_shapes(*shapes: Tuple[int, ...]) -> Tuple[int, ...]: ...
+
+@overload
 def broadcast_shapes(*shapes: Tuple[Union[int, core.Tracer], ...]
-                     ) -> Tuple[Union[int, core.Tracer], ...]:
+                     ) -> Tuple[Union[int, core.Tracer], ...]: ...
+
+def broadcast_shapes(*shapes):
   """Returns the shape that results from NumPy broadcasting of `shapes`."""
   # NOTE: We have both cached and uncached versions to handle Tracers in shapes.
   try:
@@ -205,11 +202,11 @@ def _dyn_shape_staging_rule(trace, prim, out_aval, *args, **params):
 
 ### traceables
 
-def neg(x: Array) -> Array:
+def neg(x: ArrayLike) -> Array:
   r"""Elementwise negation: :math:`-x`."""
   return neg_p.bind(x)
 
-def sign(x: Array) -> Array:
+def sign(x: ArrayLike) -> Array:
   r"""Elementwise sign.
 
   For floating-point inputs, returns
@@ -233,7 +230,7 @@ def sign(x: Array) -> Array:
   """
   return sign_p.bind(x)
 
-def nextafter(x1: Array, x2: Array) -> Array:
+def nextafter(x1: ArrayLike, x2: ArrayLike) -> Array:
   r"""Returns the next representable value after `x1` in the direction of `x2`.
 
   Note that in some environments flush-denormal-to-zero semantics is used.
@@ -241,19 +238,19 @@ def nextafter(x1: Array, x2: Array) -> Array:
   values which appear as zero in any operations. Consider this example::
 
     >>> jnp.nextafter(0, 1)  # denormal numbers are representable
-    DeviceArray(1.e-45, dtype=float32, weak_type=True)
+    Array(1.e-45, dtype=float32, weak_type=True)
     >>> jnp.nextafter(0, 1) * 1  # but are flushed to zero
-    DeviceArray(0., dtype=float32, weak_type=True)
+    Array(0., dtype=float32, weak_type=True)
 
   For the smallest usable (i.e. normal) float, use ``tiny`` of ``jnp.finfo``.
   """
   return nextafter_p.bind(x1, x2)
 
-def floor(x: Array) -> Array:
+def floor(x: ArrayLike) -> Array:
   r"""Elementwise floor: :math:`\left\lfloor x \right\rfloor`."""
   return floor_p.bind(x)
 
-def ceil(x: Array) -> Array:
+def ceil(x: ArrayLike) -> Array:
   r"""Elementwise ceiling: :math:`\left\lceil x \right\rceil`."""
   return ceil_p.bind(x)
 
@@ -261,7 +258,7 @@ class RoundingMethod(enum.IntEnum):
   AWAY_FROM_ZERO = 0
   TO_NEAREST_EVEN = 1
 
-def round(x: Array,
+def round(x: ArrayLike,
           rounding_method: RoundingMethod = RoundingMethod.AWAY_FROM_ZERO
           ) -> Array:
   r"""Elementwise round.
@@ -280,7 +277,7 @@ def round(x: Array,
   rounding_method = RoundingMethod(rounding_method)
   return round_p.bind(x, rounding_method=rounding_method)
 
-def is_finite(x: Array) -> Array:
+def is_finite(x: ArrayLike) -> Array:
   r"""Elementwise :math:`\mathrm{isfinite}`.
 
   For each element x returns `True` if and only if x is not :math:`\pm\infty` or
@@ -288,182 +285,182 @@ def is_finite(x: Array) -> Array:
   """
   return is_finite_p.bind(x)
 
-def exp(x: Array) -> Array:
+def exp(x: ArrayLike) -> Array:
   r"""Elementwise exponential: :math:`e^x`."""
   return exp_p.bind(x)
 
-def expm1(x: Array) -> Array:
+def expm1(x: ArrayLike) -> Array:
   r"""Elementwise :math:`e^{x} - 1`."""
   return expm1_p.bind(x)
 
-def log(x: Array) -> Array:
+def log(x: ArrayLike) -> Array:
   r"""Elementwise natural logarithm: :math:`\mathrm{log}(x)`."""
   return log_p.bind(x)
 
-def log1p(x: Array) -> Array:
+def log1p(x: ArrayLike) -> Array:
   r"""Elementwise :math:`\mathrm{log}(1 + x)`."""
   return log1p_p.bind(x)
 
-def tanh(x: Array) -> Array:
+def tanh(x: ArrayLike) -> Array:
   r"""Elementwise hyperbolic tangent: :math:`\mathrm{tanh}(x)`."""
   return tanh_p.bind(x)
 
-def logistic(x: Array) -> Array:
+def logistic(x: ArrayLike) -> Array:
   r"""Elementwise logistic (sigmoid) function: :math:`\frac{1}{1 + e^{-x}}`."""
   return logistic_p.bind(x)
 
-def sin(x: Array) -> Array:
+def sin(x: ArrayLike) -> Array:
   r"""Elementwise sine: :math:`\mathrm{sin}(x)`."""
   return sin_p.bind(x)
 
-def cos(x: Array) -> Array:
+def cos(x: ArrayLike) -> Array:
   r"""Elementwise cosine: :math:`\mathrm{cos}(x)`."""
   return cos_p.bind(x)
 
-def atan2(x: Array, y: Array) -> Array:
+def atan2(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise arc tangent of two variables:
     :math:`\mathrm{atan}({x \over y})`."""
   return atan2_p.bind(x, y)
 
-def betainc(a: Array, b: Array, x: Array) -> Array:
+def betainc(a: ArrayLike, b: ArrayLike, x: ArrayLike) -> Array:
   r"""Elementwise regularized incomplete beta integral."""
   return regularized_incomplete_beta_p.bind(a, b, x)
 
-def lgamma(x: Array) -> Array:
+def lgamma(x: ArrayLike) -> Array:
   r"""Elementwise log gamma: :math:`\mathrm{log}(\Gamma(x))`."""
   return lgamma_p.bind(x)
 
-def digamma(x: Array) -> Array:
+def digamma(x: ArrayLike) -> Array:
   r"""Elementwise digamma: :math:`\psi(x)`."""
   return digamma_p.bind(x)
 
-def igamma(a: Array, x: Array) -> Array:
+def igamma(a: ArrayLike, x: ArrayLike) -> Array:
   r"""Elementwise regularized incomplete gamma function."""
   return igamma_p.bind(a, x)
 
-def igammac(a: Array, x: Array) -> Array:
+def igammac(a: ArrayLike, x: ArrayLike) -> Array:
   r"""Elementwise complementary regularized incomplete gamma function."""
   return igammac_p.bind(a, x)
 
-def igamma_grad_a(a: Array, x: Array) -> Array:
+def igamma_grad_a(a: ArrayLike, x: ArrayLike) -> Array:
   r"""Elementwise derivative of the regularized incomplete gamma function."""
   return igamma_grad_a_p.bind(a, x)
 
-def random_gamma_grad(a: Array, x: Array) -> Array:
+def random_gamma_grad(a: ArrayLike, x: ArrayLike) -> Array:
   r"""Elementwise derivative of samples from `Gamma(a, 1)`."""
   return random_gamma_grad_p.bind(a, x)
 
-def bessel_i0e(x: Array) -> Array:
+def bessel_i0e(x: ArrayLike) -> Array:
   r"""Exponentially scaled modified Bessel function of order 0:
   :math:`\mathrm{i0e}(x) = e^{-|x|} \mathrm{i0}(x)`
   """
   return bessel_i0e_p.bind(x)
 
-def bessel_i1e(x: Array) -> Array:
+def bessel_i1e(x: ArrayLike) -> Array:
   r"""Exponentially scaled modified Bessel function of order 1:
   :math:`\mathrm{i1e}(x) = e^{-|x|} \mathrm{i1}(x)`
   """
   return bessel_i1e_p.bind(x)
 
-def erf(x: Array) -> Array:
+def erf(x: ArrayLike) -> Array:
   r"""Elementwise error function: :math:`\mathrm{erf}(x)`."""
   return erf_p.bind(x)
 
-def erfc(x: Array) -> Array:
+def erfc(x: ArrayLike) -> Array:
   r"""Elementwise complementary error function:
     :math:`\mathrm{erfc}(x) = 1 - \mathrm{erf}(x)`."""
   return erfc_p.bind(x)
 
-def erf_inv(x: Array) -> Array:
+def erf_inv(x: ArrayLike) -> Array:
   r"""Elementwise inverse error function: :math:`\mathrm{erf}^{-1}(x)`."""
   return erf_inv_p.bind(x)
 
-def real(x: Array) -> Array:
+def real(x: ArrayLike) -> Array:
   r"""Elementwise extract real part: :math:`\mathrm{Re}(x)`.
 
   Returns the real part of a complex number.
   """
   return real_p.bind(x)
 
-def imag(x: Array) -> Array:
+def imag(x: ArrayLike) -> Array:
   r"""Elementwise extract imaginary part: :math:`\mathrm{Im}(x)`.
 
   Returns the imaginary part of a complex number.
   """
   return imag_p.bind(x)
 
-def complex(x: Array, y: Array) -> Array:
+def complex(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise make complex number: :math:`x + jy`.
 
   Builds a complex number from real and imaginary parts.
   """
   return complex_p.bind(x, y)
 
-def conj(x: Array) -> Array:
+def conj(x: ArrayLike) -> Array:
   r"""Elementwise complex conjugate function: :math:`\overline{x}`."""
   return conj_p.bind(x, input_dtype=_dtype(x))
 
-def abs(x: Array) -> Array:
+def abs(x: ArrayLike) -> Array:
   r"""Elementwise absolute value: :math:`|x|`."""
   return abs_p.bind(x)
 
-def pow(x: Array, y: Array) -> Array:
+def pow(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise power: :math:`x^y`."""
   return pow_p.bind(x, y)
 
-def integer_pow(x: Array, y: int) -> Array:
+def integer_pow(x: ArrayLike, y: int) -> Array:
   r"""Elementwise power: :math:`x^y`, where :math:`y` is a fixed integer."""
   return integer_pow_p.bind(x, y=y)
 
-def sqrt(x: Array) -> Array:
+def sqrt(x: ArrayLike) -> Array:
   r"""Elementwise square root: :math:`\sqrt{x}`."""
   return sqrt_p.bind(x)
 
-def rsqrt(x: Array) -> Array:
+def rsqrt(x: ArrayLike) -> Array:
   r"""Elementwise reciprocal square root:  :math:`1 \over \sqrt{x}`."""
   return rsqrt_p.bind(x)
 
-def cbrt(x: Array) -> Array:
+def cbrt(x: ArrayLike) -> Array:
   r"""Elementwise cube root: :math:`\sqrt[3]{x}`."""
   return cbrt_p.bind(x)
 
-def bitwise_not(x: Array) -> Array:
+def bitwise_not(x: ArrayLike) -> Array:
   r"""Elementwise NOT: :math:`\neg x`."""
   return not_p.bind(x)
 
-def bitwise_and(x: Array, y: Array) -> Array:
+def bitwise_and(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise AND: :math:`x \wedge y`."""
   return and_p.bind(x, y)
 
-def bitwise_or(x: Array, y: Array) -> Array:
+def bitwise_or(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise OR: :math:`x \vee y`."""
   return or_p.bind(x, y)
 
-def bitwise_xor(x: Array, y: Array) -> Array:
+def bitwise_xor(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise exclusive OR: :math:`x \oplus y`."""
   return xor_p.bind(x, y)
 
-def population_count(x: Array) -> Array:
+def population_count(x: ArrayLike) -> Array:
   r"""Elementwise popcount, count the number of set bits in each element."""
   return population_count_p.bind(x)
 
-def clz(x: Array) -> Array:
+def clz(x: ArrayLike) -> Array:
   r"""Elementwise count-leading-zeros."""
   return clz_p.bind(x)
 
-def add(x: Array, y: Array) -> Array:
+def add(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise addition: :math:`x + y`."""
   return add_p.bind(x, y)
 
-def sub(x: Array, y: Array) -> Array:
+def sub(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise subtraction: :math:`x - y`."""
   return sub_p.bind(x, y)
 
-def mul(x: Array, y: Array) -> Array:
+def mul(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise multiplication: :math:`x \times y`."""
   return mul_p.bind(x, y)
 
-def div(x: Array, y: Array) -> Array:
+def div(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise division: :math:`x \over y`.
 
   Integer division overflow
@@ -472,7 +469,7 @@ def div(x: Array, y: Array) -> Array:
   """
   return div_p.bind(x, y)
 
-def rem(x: Array, y: Array) -> Array:
+def rem(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise remainder: :math:`x \bmod y`.
 
   The sign of the result is taken from the dividend,
@@ -485,57 +482,57 @@ def rem(x: Array, y: Array) -> Array:
   """
   return rem_p.bind(x, y)
 
-def max(x: Array, y: Array) -> Array:
+def max(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise maximum: :math:`\mathrm{max}(x, y)`
 
   For complex numbers, uses a lexicographic comparison on the
   `(real, imaginary)` pairs."""
   return max_p.bind(x, y)
 
-def min(x: Array, y: Array) -> Array:
+def min(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise minimum:  :math:`\mathrm{min}(x, y)`
 
   For complex numbers, uses a lexicographic comparison on the
   `(real, imaginary)` pairs."""
   return min_p.bind(x, y)
 
-def shift_left(x: Array, y: Array) -> Array:
+def shift_left(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise left shift: :math:`x \ll y`."""
   return shift_left_p.bind(x, y)
 
-def shift_right_arithmetic(x: Array, y: Array) -> Array:
+def shift_right_arithmetic(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise arithmetic right shift: :math:`x \gg y`."""
   return shift_right_arithmetic_p.bind(x, y)
 
-def shift_right_logical(x: Array, y: Array) -> Array:
+def shift_right_logical(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise logical right shift: :math:`x \gg y`."""
   return shift_right_logical_p.bind(x, y)
 
-def eq(x: Array, y: Array) -> Array:
+def eq(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise equals: :math:`x = y`."""
   return eq_p.bind(x, y)
 
-def ne(x: Array, y: Array) -> Array:
+def ne(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise not-equals: :math:`x \neq y`."""
   return ne_p.bind(x, y)
 
-def ge(x: Array, y: Array) -> Array:
+def ge(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise greater-than-or-equals: :math:`x \geq y`."""
   return ge_p.bind(x, y)
 
-def gt(x: Array, y: Array) -> Array:
+def gt(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise greater-than: :math:`x > y`."""
   return gt_p.bind(x, y)
 
-def le(x: Array, y: Array) -> Array:
+def le(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise less-than-or-equals: :math:`x \leq y`."""
   return le_p.bind(x, y)
 
-def lt(x: Array, y: Array) -> Array:
+def lt(x: ArrayLike, y: ArrayLike) -> Array:
   r"""Elementwise less-than: :math:`x < y`."""
   return lt_p.bind(x, y)
 
-def convert_element_type(operand: Array, new_dtype: DType) -> Array:
+def convert_element_type(operand: ArrayLike, new_dtype: DTypeLike) -> Array:
   """Elementwise cast.
 
   Wraps XLA's `ConvertElementType
@@ -551,22 +548,25 @@ def convert_element_type(operand: Array, new_dtype: DType) -> Array:
     An array with the same shape as `operand`, cast elementwise to `new_dtype`.
   """
   if hasattr(operand, '__jax_array__'):
-    operand = operand.__jax_array__()
+    operand = operand.__jax_array__()  # type: ignore
   return _convert_element_type(operand, new_dtype, weak_type=False)
 
-def _convert_element_type(operand: Array, new_dtype: Optional[DType] = None,
+def _convert_element_type(operand: ArrayLike, new_dtype: Optional[DTypeLike] = None,
                           weak_type: bool = False):
+  if (core.is_opaque_dtype(new_dtype) or
+      core.is_opaque_dtype(getattr(operand, 'dtype', None))):
+    return convert_element_type_p.bind(operand, new_dtype=new_dtype,
+                                       weak_type=bool(weak_type))
+
   # Don't canonicalize old_dtype because x64 context might cause
   # un-canonicalized operands to be passed in.
   old_dtype = dtypes.dtype(operand, canonicalize=False)
   old_weak_type = dtypes.is_weakly_typed(operand)
-
   if new_dtype is None:
     new_dtype = old_dtype
   else:
     new_dtype = np.dtype(new_dtype)
   new_dtype = dtypes.dtype(new_dtype, canonicalize=True)
-  new_weak_type = bool(weak_type)
 
   if (dtypes.issubdtype(old_dtype, np.complexfloating) and
       not dtypes.issubdtype(new_dtype, np.complexfloating)):
@@ -582,13 +582,13 @@ def _convert_element_type(operand: Array, new_dtype: Optional[DType] = None,
     operand = np.asarray(operand, new_dtype)
     old_weak_type = False
 
-  if (old_dtype, old_weak_type) == (new_dtype, new_weak_type) and _is_array_or_tracer(operand):
-    return operand
+  if (old_dtype, old_weak_type) == (new_dtype, weak_type) and isinstance(operand, Array):
+    return type_cast(Array, operand)
   else:
     return convert_element_type_p.bind(operand, new_dtype=new_dtype,
-                                       weak_type=new_weak_type)
+                                       weak_type=bool(weak_type))
 
-def bitcast_convert_type(operand: Array, new_dtype: DType) -> Array:
+def bitcast_convert_type(operand: ArrayLike, new_dtype: DTypeLike) -> Array:
   """Elementwise bitcast.
 
   Wraps XLA's `BitcastConvertType
@@ -607,7 +607,7 @@ def bitcast_convert_type(operand: Array, new_dtype: DType) -> Array:
   new_dtype = dtypes.canonicalize_dtype(new_dtype)
   return bitcast_convert_type_p.bind(operand, new_dtype=new_dtype)
 
-def clamp(min: Array, x: Array, max: Array) -> Array:
+def clamp(min: ArrayLike, x: ArrayLike, max: ArrayLike) -> Array:
   r"""Elementwise clamp.
 
   Returns :math:`\mathrm{clamp}(x) = \begin{cases}
@@ -618,7 +618,7 @@ def clamp(min: Array, x: Array, max: Array) -> Array:
   """
   return clamp_p.bind(min, x, max)
 
-def concatenate(operands: Sequence[Array], dimension: int) -> Array:
+def concatenate(operands: Union[Array, Sequence[ArrayLike]], dimension: int) -> Array:
   """Concatenates a sequence of arrays along `dimension`.
 
   Wraps XLA's `Concatenate
@@ -637,8 +637,8 @@ def concatenate(operands: Sequence[Array], dimension: int) -> Array:
     raise ValueError("concatenate requires a non-empty sequences of arrays")
   if len(operands) == 1:
     op, = operands
-    if _is_array_or_tracer(op):
-      return op
+    if isinstance(op, Array):
+      return type_cast(Array, op)
   return concatenate_p.bind(*operands, dimension=dimension)
 
 
@@ -696,7 +696,7 @@ PrecisionLike = Union[None, str, PrecisionType, Tuple[str, str],
                       Tuple[PrecisionType, PrecisionType]]
 
 def dot(lhs: Array, rhs: Array, precision: PrecisionLike = None,
-        preferred_element_type: Optional[DType] = None) -> Array:
+        preferred_element_type: Optional[DTypeLike] = None) -> Array:
   """Vector/vector, matrix/vector, and matrix/matrix multiplication.
 
   Wraps XLA's `Dot
@@ -731,9 +731,9 @@ def dot(lhs: Array, rhs: Array, precision: PrecisionLike = None,
 DotDimensionNumbers = Tuple[Tuple[Sequence[int], Sequence[int]],
                             Tuple[Sequence[int], Sequence[int]]]
 
-def dot_general(lhs: Array, rhs: Array, dimension_numbers: DotDimensionNumbers,
+def dot_general(lhs: ArrayLike, rhs: ArrayLike, dimension_numbers: DotDimensionNumbers,
                 precision: PrecisionLike = None,
-                preferred_element_type: Optional[DType] = None) -> Array:
+                preferred_element_type: Optional[DTypeLike] = None) -> Array:
   """More general contraction operator.
 
   Wraps XLA's `DotGeneral
@@ -770,7 +770,7 @@ def dot_general(lhs: Array, rhs: Array, dimension_numbers: DotDimensionNumbers,
                             precision=canonicalize_precision(precision),
                             preferred_element_type=preferred_element_type)
 
-def broadcast(operand: Array, sizes: Sequence[int]) -> Array:
+def broadcast(operand: ArrayLike, sizes: Sequence[int]) -> Array:
   """Broadcasts an array, adding new leading dimensions
 
   Args:
@@ -787,7 +787,7 @@ def broadcast(operand: Array, sizes: Sequence[int]) -> Array:
   dims = tuple(range(len(sizes), len(sizes) + np.ndim(operand)))
   return broadcast_in_dim(operand, tuple(sizes) + np.shape(operand), dims)
 
-def broadcast_in_dim(operand: Array, shape: Shape,
+def broadcast_in_dim(operand: ArrayLike, shape: Shape,
                      broadcast_dimensions: Sequence[int]) -> Array:
   """Wraps XLA's `BroadcastInDim
   <https://www.tensorflow.org/xla/operation_semantics#broadcastindim>`_
@@ -805,8 +805,8 @@ def broadcast_in_dim(operand: Array, shape: Shape,
   See Also:
     jax.lax.broadcast : simpler interface to add new leading dimensions.
   """
-  if np.ndim(operand) == len(shape) and not len(broadcast_dimensions) and _is_array_or_tracer(operand):
-    return operand
+  if np.ndim(operand) == len(shape) and not len(broadcast_dimensions) and isinstance(operand, Array):
+    return type_cast(Array, operand)
   if config.jax_dynamic_shapes:
     # We must gate this behavior under a flag because otherwise the errors
     # raised are different (and have worse source provenance information).
@@ -821,7 +821,7 @@ def broadcast_to_rank(x: Array, rank: int) -> Array:
   """Adds leading dimensions of ``1`` to give ``x`` rank ``rank``."""
   return broadcast(x, (1,) * (rank - x.ndim))
 
-def reshape(operand: Array, new_sizes: Shape,
+def reshape(operand: ArrayLike, new_sizes: Shape,
             dimensions: Optional[Sequence[int]] = None) -> Array:
   """Wraps XLA's `Reshape
   <https://www.tensorflow.org/xla/operation_semantics#reshape>`_
@@ -847,18 +847,18 @@ def reshape(operand: Array, new_sizes: Shape,
     >>> x = jnp.arange(6)
     >>> y = reshape(x, (2, 3))
     >>> y
-    DeviceArray([[0, 1, 2],
+    Array([[0, 1, 2],
                  [3, 4, 5]], dtype=int32)
 
     Reshaping back to one dimension:
 
     >>> reshape(y, (6,))
-    DeviceArray([0, 1, 2, 3, 4, 5], dtype=int32)
+    Array([0, 1, 2, 3, 4, 5], dtype=int32)
 
     Reshaping to one dimension with permutation of dimensions:
 
     >>> reshape(y, (6,), (1, 0))
-    DeviceArray([0, 3, 1, 4, 2, 5], dtype=int32)
+    Array([0, 3, 1, 4, 2, 5], dtype=int32)
   """
   new_sizes = canonicalize_shape(new_sizes)  # TODO
   new_sizes = tuple(new_sizes)
@@ -869,8 +869,8 @@ def reshape(operand: Array, new_sizes: Shape,
   else:
     dims = api_util._ensure_index_tuple(dimensions)
     same_dims = tuple(dims) == tuple(range(np.ndim(operand)))
-  if np.shape(operand) and same_shape and same_dims and _is_array_or_tracer(operand):
-    return operand
+  if np.shape(operand) and same_shape and same_dims and isinstance(operand, Array):
+    return type_cast(Array, operand)
   else:
     dyn_shape, static_new_sizes = _extract_tracers_dyn_shape(new_sizes)
 
@@ -878,7 +878,7 @@ def reshape(operand: Array, new_sizes: Shape,
       operand, *dyn_shape, new_sizes=tuple(static_new_sizes),
       dimensions=None if dims is None or same_dims else dims)
 
-def pad(operand: Array, padding_value: Array,
+def pad(operand: ArrayLike, padding_value: ArrayLike,
         padding_config: Sequence[Tuple[int, int, int]]) -> Array:
   """Applies low, high, and/or interior padding to an array.
 
@@ -900,14 +900,14 @@ def pad(operand: Array, padding_value: Array,
   """
   return pad_p.bind(operand, padding_value, padding_config=tuple(padding_config))
 
-def rev(operand: Array, dimensions: Sequence[int]) -> Array:
+def rev(operand: ArrayLike, dimensions: Sequence[int]) -> Array:
   """Wraps XLA's `Rev
   <https://www.tensorflow.org/xla/operation_semantics#rev_reverse>`_
   operator.
   """
   return rev_p.bind(operand, dimensions=tuple(dimensions))
 
-def select(pred: Array, on_true: Array, on_false: Array) -> Array:
+def select(pred: ArrayLike, on_true: ArrayLike, on_false: ArrayLike) -> Array:
   """Wraps XLA's `Select
   <https://www.tensorflow.org/xla/operation_semantics#select>`_
   operator.
@@ -916,7 +916,7 @@ def select(pred: Array, on_true: Array, on_false: Array) -> Array:
   # select(). This is because it implements `select_n`.
   return select_n_p.bind(pred, on_false, on_true)
 
-def select_n(which: Array, *cases: Array) -> Array:
+def select_n(which: ArrayLike, *cases: ArrayLike) -> Array:
   """Selects array values from multiple cases.
 
   Generalizes XLA's `Select
@@ -942,25 +942,25 @@ def select_n(which: Array, *cases: Array) -> Array:
   return select_n_p.bind(which, *cases)
 
 
-def transpose(operand: Array, permutation: Sequence[int]) -> Array:
+def transpose(operand: ArrayLike, permutation: Sequence[int]) -> Array:
   """Wraps XLA's `Transpose
   <https://www.tensorflow.org/xla/operation_semantics#transpose>`_
   operator.
   """
   permutation = tuple(operator.index(d) for d in permutation)
-  if permutation == tuple(range(np.ndim(operand))) and _is_array_or_tracer(operand):
-    return operand
+  if permutation == tuple(range(np.ndim(operand))) and isinstance(operand, Array):
+    return type_cast(Array, operand)
   else:
     return transpose_p.bind(operand, permutation=permutation)
 
-def argmin(operand: Array, axis: int,
-           index_dtype: DType) -> Tuple[Array, Array]:
+def argmin(operand: ArrayLike, axis: int,
+           index_dtype: DTypeLike) -> Array:
   """Computes the index of the minimum element along ``axis``."""
   return argmin_p.bind(operand, axes=(axis,),
                        index_dtype=dtypes.canonicalize_dtype(index_dtype))
 
-def argmax(operand: Array, axis: int,
-           index_dtype: DType) -> Tuple[Array, Array]:
+def argmax(operand: ArrayLike, axis: int,
+           index_dtype: DTypeLike) -> Array:
   """Computes the index of the maximum element along ``axis``."""
   return argmax_p.bind(operand, axes=(axis,),
                        index_dtype=dtypes.canonicalize_dtype(index_dtype))
@@ -998,8 +998,8 @@ def reduce(operands: Any,
     flat_init_avals = safe_map(_abstractify, flat_init_values)
     jaxpr, consts, out_tree = _variadic_reduction_jaxpr(
         computation, tuple(flat_init_avals), init_value_tree)
-    out = reduce_p.bind(*(flat_operands + flat_init_values), computation=computation,
-                         jaxpr=jaxpr, consts=consts, dimensions=tuple(dimensions))
+    out = reduce_p.bind(*flat_operands, *flat_init_values, computation=computation,
+                        jaxpr=jaxpr, consts=consts, dimensions=tuple(dimensions))
     return tree_util.tree_unflatten(out_tree, out)
 
 @cache()
@@ -1059,48 +1059,66 @@ def _get_monoid_reducer(monoid_op: Callable,
       return _reduce_min if np.equal(aval.val, _get_min_identity(dtype)) else None
   return None
 
-def _get_bitwise_and_identity(dtype: DType) -> Array:
+def _get_bitwise_and_identity(dtype: DTypeLike) -> np.ndarray:
   return np.array(-1, dtype)
 
-def _get_bitwise_or_identity(dtype: DType) -> Array:
+def _get_bitwise_or_identity(dtype: DTypeLike) -> np.ndarray:
   return np.array(0, dtype)
 
-def _get_max_identity(dtype: DType) -> Array:
+def _get_sum_identity(dtype: DTypeLike) -> np.ndarray:
+  return np.array(0, dtype)
+
+def _get_prod_identity(dtype: DTypeLike) -> np.ndarray:
+  return np.array(1, dtype)
+
+def _get_max_identity(dtype: DTypeLike) -> np.ndarray:
   if dtypes.issubdtype(dtype, np.inexact):
     return np.array(-np.inf, dtype)
   elif dtypes.issubdtype(dtype, np.integer):
     return np.array(dtypes.iinfo(dtype).min, dtype)
   elif dtypes.issubdtype(dtype, np.bool_):
     return np.array(False, np.bool_)
+  else:
+    raise ValueError(f"Unsupported dtype for max: {dtype}")
 
-def _get_min_identity(dtype: DType) -> Array:
+def _get_min_identity(dtype: DTypeLike) -> np.ndarray:
   if dtypes.issubdtype(dtype, np.inexact):
     return np.array(np.inf, dtype)
   elif dtypes.issubdtype(dtype, np.integer):
     return np.array(dtypes.iinfo(dtype).max, dtype)
   elif dtypes.issubdtype(dtype, np.bool_):
     return np.array(True, np.bool_)
+  else:
+    raise ValueError(f"Unsupported dtype for min: {dtype}")
 
-def _reduce_sum(operand: Array, axes: Sequence[int]) -> Array:
+def _reduce_sum(operand: ArrayLike, axes: Sequence[int]) -> Array:
   return reduce_sum_p.bind(operand, axes=tuple(axes))
 
-def _reduce_prod(operand: Array, axes: Sequence[int]) -> Array:
+def _reduce_prod(operand: ArrayLike, axes: Sequence[int]) -> Array:
   return reduce_prod_p.bind(operand, axes=tuple(axes))
 
-def _reduce_max(operand: Array, axes: Sequence[int]) -> Array:
+def _reduce_max(operand: ArrayLike, axes: Sequence[int]) -> Array:
   return reduce_max_p.bind(operand, axes=tuple(axes))
 
-def _reduce_min(operand: Array, axes: Sequence[int]) -> Array:
+def _reduce_min(operand: ArrayLike, axes: Sequence[int]) -> Array:
   return reduce_min_p.bind(operand, axes=tuple(axes))
 
-def _reduce_or(operand: Array, axes: Sequence[int]) -> Array:
+def _reduce_or(operand: ArrayLike, axes: Sequence[int]) -> Array:
   return reduce_or_p.bind(operand, axes=tuple(axes))
 
-def _reduce_and(operand: Array, axes: Sequence[int]) -> Array:
+def _reduce_and(operand: ArrayLike, axes: Sequence[int]) -> Array:
   return reduce_and_p.bind(operand, axes=tuple(axes))
 
-def _reduce_xor(operand: Array, axes: Sequence[int]) -> Array:
+def _reduce_xor(operand: ArrayLike, axes: Sequence[int]) -> Array:
   return reduce_xor_p.bind(operand, axes=tuple(axes))
+
+@overload
+def sort(operand: Sequence[Array], dimension: int = -1,
+         is_stable: bool = True, num_keys: int = 1) -> Tuple[Array, ...]: ...
+
+@overload
+def sort(operand: Array, dimension: int = -1,
+         is_stable: bool = True, num_keys: int = 1) -> Array: ...
 
 def sort(operand: Union[Array, Sequence[Array]], dimension: int = -1,
          is_stable: bool = True, num_keys: int = 1) -> Union[Array, Tuple[Array, ...]]:
@@ -1127,36 +1145,36 @@ def sort(operand: Union[Array, Sequence[Array]], dimension: int = -1,
     if len(operand) == 0:
       raise TypeError("Sort requires at least one operand")
     if not (1 <= num_keys <= len(operand)):
-      raise ValueError(f"num_keys={num_keys} must be between 1 and len(operand)={len(operand)}")
+      raise ValueError(f"{num_keys=} must be between 1 and {len(operand)=}")
     dimension = canonicalize_axis(dimension, len(operand[0].shape))
     return tuple(sort_p.bind(*operand, dimension=dimension,
                              is_stable=is_stable,
                              num_keys=num_keys))
   else:
     if num_keys != 1:
-      raise ValueError(f"num_keys={num_keys} must equal 1 for a single operand.")
+      raise ValueError(f"{num_keys=} must equal 1 for a single operand.")
     dimension = canonicalize_axis(dimension, len(operand.shape))
     return sort_p.bind(operand, dimension=dimension, is_stable=is_stable, num_keys=1)[0]
 
-def sort_key_val(keys: Array, values: Array, dimension: int = -1,
+def sort_key_val(keys: Array, values: ArrayLike, dimension: int = -1,
                  is_stable: bool = True) -> Tuple[Array, Array]:
   """Sorts ``keys`` along ``dimension`` and applies the same permutation to ``values``."""
   dimension = canonicalize_axis(dimension, len(keys.shape))
   k, v = sort_p.bind(keys, values, dimension=dimension, is_stable=is_stable, num_keys=1)
   return k, v
 
-def top_k(operand: Array, k: int) -> Tuple[Array, Array]:
+def top_k(operand: ArrayLike, k: int) -> Tuple[Array, Array]:
   """Returns top ``k`` values and their indices along the last axis of ``operand``."""
   k = int(k)
   if k < 0:
     raise ValueError(f"k argument to top_k must be nonnegative, got {k}")
   return top_k_p.bind(operand, k=k)
 
-def tie_in(x: Array, y: Array) -> Array:
+def tie_in(x: Any, y: T) -> T:
   """Deprecated. Ignores ``x`` and returns ``y``."""
   return y
 
-def full(shape: Shape, fill_value: Array, dtype: Optional[DType] = None) -> Array:
+def full(shape: Shape, fill_value: ArrayLike, dtype: Optional[DTypeLike] = None) -> Array:
   """Returns an array of `shape` filled with `fill_value`.
 
   Args:
@@ -1174,7 +1192,7 @@ def full(shape: Shape, fill_value: Array, dtype: Optional[DType] = None) -> Arra
   fill_value = _convert_element_type(fill_value, dtype, weak_type)
   return broadcast(fill_value, shape)
 
-def zeros_like_shaped_array(aval: Array) -> Array:
+def zeros_like_shaped_array(aval: ArrayLike) -> Array:
   assert isinstance(aval, ShapedArray)
   if aval.dtype == dtypes.float0:
     scalar_zero = np.zeros((), dtype=aval.dtype)
@@ -1184,14 +1202,14 @@ def zeros_like_shaped_array(aval: Array) -> Array:
 
 ad_util.aval_zeros_likers[ShapedArray] = zeros_like_shaped_array
 
-def iota(dtype: DType, size: int) -> Array:
+def iota(dtype: DTypeLike, size: int) -> Array:
   """Wraps XLA's `Iota
   <https://www.tensorflow.org/xla/operation_semantics#iota>`_
   operator.
   """
   return broadcasted_iota(dtype, (size,), 0)
 
-def broadcasted_iota(dtype: DType, shape: Shape, dimension: int) -> Array:
+def broadcasted_iota(dtype: DTypeLike, shape: Shape, dimension: int) -> Array:
   """Convenience wrapper around ``iota``."""
   dtype = dtypes.canonicalize_dtype(dtype)
   shape = canonicalize_shape(shape)
@@ -1202,7 +1220,7 @@ def broadcasted_iota(dtype: DType, shape: Shape, dimension: int) -> Array:
   return iota_p.bind(*dynamic_shape, dtype=dtype, shape=tuple(static_shape),
                      dimension=dimension)
 
-def _eye(dtype: DType, shape: Shape, offset: int) -> Array:
+def _eye(dtype: DTypeLike, shape: Shape, offset: int) -> Array:
   """Like numpy.eye, create a 2D array with ones on a diagonal."""
   offset = int(offset)
   dtype = dtypes.canonicalize_dtype(dtype)
@@ -1210,7 +1228,7 @@ def _eye(dtype: DType, shape: Shape, offset: int) -> Array:
                 broadcasted_iota(np.int32, shape, 1))
   return convert_element_type_p.bind(bool_eye, new_dtype=dtype, weak_type=False)
 
-def _delta(dtype: DType, shape: Shape, axes: Sequence[int]) -> Array:
+def _delta(dtype: DTypeLike, shape: Shape, axes: Sequence[int]) -> Array:
   """This utility function exists for creating Kronecker delta arrays."""
   axes = map(int, axes)
   dtype = dtypes.canonicalize_dtype(dtype)
@@ -1222,7 +1240,7 @@ def _delta(dtype: DType, shape: Shape, axes: Sequence[int]) -> Array:
                                        new_dtype=dtype, weak_type=False)
   return broadcast_in_dim(result, shape, axes)
 
-def _tri(dtype: DType, shape: Shape, offset: int) -> Array:
+def _tri(dtype: DTypeLike, shape: Shape, offset: int) -> Array:
   """Like numpy.tri, create a 2D array with ones below a diagonal."""
   offset = int(offset)
   dtype = dtypes.canonicalize_dtype(dtype)
@@ -1242,13 +1260,13 @@ def stop_gradient(x: T) -> T:
   For example:
 
   >>> jax.grad(lambda x: x**2)(3.)
-  DeviceArray(6., dtype=float32, weak_type=True)
+  Array(6., dtype=float32, weak_type=True)
   >>> jax.grad(lambda x: jax.lax.stop_gradient(x)**2)(3.)
-  DeviceArray(0., dtype=float32, weak_type=True)
+  Array(0., dtype=float32, weak_type=True)
   >>> jax.grad(jax.grad(lambda x: x**2))(3.)
-  DeviceArray(2., dtype=float32, weak_type=True)
+  Array(2., dtype=float32, weak_type=True)
   >>> jax.grad(jax.grad(lambda x: jax.lax.stop_gradient(x)**2))(3.)
-  DeviceArray(0., dtype=float32, weak_type=True)
+  Array(0., dtype=float32, weak_type=True)
   """
   def stop(x):
     # only bind primitive on inexact dtypes, to avoid some staging
@@ -1261,7 +1279,7 @@ def stop_gradient(x: T) -> T:
       return x
   return tree_map(stop, x)
 
-def reduce_precision(operand: Union[float, Array],
+def reduce_precision(operand: Union[float, ArrayLike],
                      exponent_bits: int,
                      mantissa_bits: int) -> Array:
   """Wraps XLA's `ReducePrecision
@@ -1274,15 +1292,15 @@ def reduce_precision(operand: Union[float, Array],
     operator.index, mantissa_bits, "mantissa_bits argument of lax.reduce_precision")
   return reduce_precision_p.bind(operand, exponent_bits=exponent_bits, mantissa_bits=mantissa_bits)
 
-def squeeze(array: Array, dimensions: Sequence[int]) -> Array:
+def squeeze(array: ArrayLike, dimensions: Sequence[int]) -> Array:
   """Squeeze any number of size 1 dimensions from an array."""
   ndim = np.ndim(array)
   dimensions = tuple(sorted(canonicalize_axis(i, ndim) for i in dimensions))
-  if not dimensions and _is_array_or_tracer(array):
-    return array
+  if not dimensions and isinstance(array, Array):
+    return type_cast(Array, array)
   return squeeze_p.bind(array, dimensions=dimensions)
 
-def expand_dims(array: Array, dimensions: Sequence[int]) -> Array:
+def expand_dims(array: ArrayLike, dimensions: Sequence[int]) -> Array:
   """Insert any number of size 1 dimensions into an array."""
   if len(set(dimensions)) != len(dimensions):
     raise ValueError(f'repeated axis in lax.expand_dims: {dimensions}')
@@ -1300,7 +1318,7 @@ def expand_dims(array: Array, dimensions: Sequence[int]) -> Array:
 
 ### convenience wrappers around traceables
 
-def full_like(x: Array, fill_value: Array, dtype: Optional[DType] = None,
+def full_like(x: ArrayLike, fill_value: ArrayLike, dtype: Optional[DTypeLike] = None,
               shape: Optional[Shape] = None) -> Array:
   """Create a full array like np.full based on the example array `x`.
 
@@ -1314,8 +1332,6 @@ def full_like(x: Array, fill_value: Array, dtype: Optional[DType] = None,
     An ndarray with the same shape as `x` with its entries set equal to
     `fill_value`, similar to the output of np.full.
   """
-  from jax.experimental import sharding, array
-
   fill_shape = np.shape(x) if shape is None else canonicalize_shape(shape)
   weak_type = dtype is None and dtypes.is_weakly_typed(x)
   dtype = dtype or _dtype(x)
@@ -1327,10 +1343,12 @@ def full_like(x: Array, fill_value: Array, dtype: Optional[DType] = None,
   # probably in the form of a primitive like `val = match_sharding_p.bind(x, val)`
   # (so it works in staged-out code as well as 'eager' code). Related to
   # equi-sharding.
-  if (config.jax_array and hasattr(x, 'sharding') and
-      not dispatch.is_single_device_sharding(x.sharding)):
-    return array.make_array_from_callback(
-        fill_shape, x.sharding, lambda idx: val[idx])  # type: ignore[arg-type]
+  if config.jax_array and shape is None and isinstance(x, array.ArrayImpl):
+    sharding = x.sharding  # type: ignore[union-attr]
+    if (not dispatch.is_single_device_sharding(sharding) and
+        not isinstance(sharding, PmapSharding)):
+      return array.make_array_from_callback(
+          type_cast(array.Shape, fill_shape), sharding, lambda idx: val[idx])
   return val
 
 
@@ -1377,11 +1395,11 @@ def batch_matmul(lhs: Array, rhs: Array,
 # These functions also exist in the XLA client library, but we treat them
 # as non-primitive to maintain a smaller set of autodiff primitives.
 
-def square(x: Array) -> Array:
+def square(x: ArrayLike) -> Array:
   r"""Elementwise square: :math:`x^2`."""
   return integer_pow(x, 2)
 
-def reciprocal(x: Array) -> Array:
+def reciprocal(x: ArrayLike) -> Array:
   r"""Elementwise reciprocal: :math:`1 \over x`."""
   return integer_pow(x, -1)
 
@@ -1396,39 +1414,39 @@ def _upcast_fp16_for_computation(f):
 
   return f_wrapped
 
-def tan(x: Array) -> Array:
+def tan(x: ArrayLike) -> Array:
   r"""Elementwise tangent: :math:`\mathrm{tan}(x)`."""
   return tan_p.bind(x)
 
-def asin(x: Array) -> Array:
+def asin(x: ArrayLike) -> Array:
   r"""Elementwise arc sine: :math:`\mathrm{asin}(x)`."""
   return asin_p.bind(x)
 
-def acos(x: Array) -> Array:
+def acos(x: ArrayLike) -> Array:
   r"""Elementwise arc cosine: :math:`\mathrm{acos}(x)`."""
   return acos_p.bind(x)
 
-def atan(x: Array) -> Array:
+def atan(x: ArrayLike) -> Array:
   r"""Elementwise arc tangent: :math:`\mathrm{atan}(x)`."""
   return atan_p.bind(x)
 
-def sinh(x: Array) -> Array:
+def sinh(x: ArrayLike) -> Array:
   r"""Elementwise hyperbolic sine: :math:`\mathrm{sinh}(x)`."""
   return sinh_p.bind(x)
 
-def cosh(x: Array) -> Array:
+def cosh(x: ArrayLike) -> Array:
   r"""Elementwise hyperbolic cosine: :math:`\mathrm{cosh}(x)`."""
   return cosh_p.bind(x)
 
-def asinh(x: Array) -> Array:
+def asinh(x: ArrayLike) -> Array:
   r"""Elementwise inverse hyperbolic sine: :math:`\mathrm{asinh}(x)`."""
   return asinh_p.bind(x)
 
-def acosh(x: Array) -> Array:
+def acosh(x: ArrayLike) -> Array:
   r"""Elementwise inverse hyperbolic cosine: :math:`\mathrm{acosh}(x)`."""
   return acosh_p.bind(x)
 
-def atanh(x: Array) -> Array:
+def atanh(x: ArrayLike) -> Array:
   r"""Elementwise inverse hyperbolic tangent: :math:`\mathrm{atanh}(x)`."""
   return atanh_p.bind(x)
 
@@ -1444,19 +1462,22 @@ def _iter(tracer):
     raise TypeError("iteration over a 0-d array")  # same as numpy error
   else:
     n = int(tracer.shape[0])
-    # return (index_in_dim(tracer, i, keepdims=False) for i in range(n))
-    return iter([slicing.index_in_dim(tracer, i, keepdims=False)
-                 for i in range(n)])
+    if any(isinstance(d, core.Tracer) for d in tracer.shape):
+      return (slicing.dynamic_index_in_dim(tracer, i, keepdims=False)
+              for i in range(n))
+    else:
+      return (slicing.index_in_dim(tracer, i, keepdims=False) for i in range(n))
 ShapedArray._iter = staticmethod(_iter)
+core.DShapedArray._iter = staticmethod(_iter)
 
 # Add some ad handlers that use (or could use) lax primitives
 
-def zeros_like_array(x: Array) -> Array:
+def zeros_like_array(x: ArrayLike) -> Array:
   return full_like(x, 0)
 
 for t in itertools.chain(
     dtypes.python_scalar_dtypes.keys(), array_types,
-    device_array.device_array_types,
+    device_array.device_array_types, [array.ArrayImpl],
     [pxla.ShardedDeviceArray, pxla._ShardedDeviceArray,
      pxla.pmap_lib.ShardedDeviceArray]):
   ad_util.jaxval_adders[t] = add
@@ -1464,6 +1485,7 @@ ad_util.jaxval_zeros_likers[device_array._DeviceArray] = zeros_like_array
 ad_util.jaxval_zeros_likers[device_array.Buffer] = zeros_like_array
 ad_util.jaxval_zeros_likers[pxla.ShardedDeviceArray] = zeros_like_array
 ad_util.jaxval_zeros_likers[pxla.pmap_lib.ShardedDeviceArray] = zeros_like_array
+ad_util.jaxval_zeros_likers[array.ArrayImpl] = zeros_like_array
 
 
 ### primitives
@@ -1779,11 +1801,7 @@ def asin_impl(x):
 
 asin_p = standard_unop(_float | _complex, 'asin')
 ad.defjvp(asin_p, lambda g, x: mul(g, rsqrt(_const(x, 1) - square(x))))
-if mlir_api_version < 31:
-  mlir.register_lowering(asin_p, mlir.lower_fun(asin_impl,
-                                                multiple_results=False))
-else:
-  mlir.register_lowering(asin_p, partial(_nary_lower_mhlo, chlo.AsinOp))
+mlir.register_lowering(asin_p, partial(_nary_lower_mhlo, chlo.AsinOp))
 
 def acos_impl(x):
   if dtypes.issubdtype(_dtype(x), np.complexfloating):
@@ -1812,11 +1830,7 @@ def atan_impl(x):
 
 atan_p = standard_unop(_float | _complex, 'atan')
 ad.defjvp(atan_p, lambda g, x: div(g, _const(x, 1) + square(x)))
-if mlir_api_version < 31:
-  mlir.register_lowering(atan_p, mlir.lower_fun(atan_impl,
-                                                multiple_results=False))
-else:
-  mlir.register_lowering(atan_p, partial(_nary_lower_mhlo, chlo.AtanOp))
+mlir.register_lowering(atan_p, partial(_nary_lower_mhlo, chlo.AtanOp))
 
 atan2_p = standard_naryop([_float | _complex, _float | _complex], 'atan2')
 ad.defjvp(atan2_p,
@@ -1906,12 +1920,9 @@ xla.register_translation(bessel_i0e_p, standard_translate(bessel_i0e_p))
 ad.defjvp2(bessel_i0e_p, lambda g, y, x: g * (bessel_i1e(x) - sign(x) * y))
 
 bessel_i1e_p = standard_unop(_float, 'bessel_i1e')
-xla.register_translation(bessel_i1e_p, standard_translate(bessel_i1e_p))
-if mlir_api_version < 32:
-  xla.register_translation(bessel_i1e_p, standard_translate(bessel_i1e_p))
-else:
-  mlir.register_lowering(bessel_i1e_p,
-                         partial(_nary_lower_mhlo, chlo.BesselI1eOp))
+mlir.register_lowering(bessel_i1e_p,
+                        partial(_nary_lower_mhlo, chlo.BesselI1eOp))
+
 def _bessel_i1e_jvp(g, y, x):
   eps = dtypes.finfo(_dtype(x)).eps
   x_is_not_tiny = abs(x) > eps
@@ -2331,7 +2342,8 @@ def _convert_elt_type_folding_rule(consts, eqn):
   c, = consts
   o, = eqn.outvars
   if (type(c) in {np.ndarray, *dtypes.python_scalar_dtypes} and
-      isinstance(o.aval, core.UnshapedArray) and not np.shape(c)):
+      isinstance(o.aval, core.UnshapedArray) and not np.shape(c) and
+      not core.is_opaque_dtype(eqn.params['new_dtype'])):
     out = np.array(c, eqn.params['new_dtype'])
     if not o.aval.weak_type:
       return [out], None
@@ -2342,7 +2354,9 @@ def _convert_elt_type_folding_rule(consts, eqn):
 
 def _convert_elt_type_fwd_rule(eqn):
   v, = eqn.invars
-  if (v.aval.dtype == eqn.params['new_dtype'] and
+  if (not core.is_opaque_dtype(eqn.params['new_dtype']) and
+      not core.is_opaque_dtype(v.aval.dtype) and
+      v.aval.dtype == eqn.params['new_dtype'] and
       v.aval.weak_type == eqn.params['weak_type']):
     return [v], None
   else:
@@ -2361,7 +2375,6 @@ def _convert_elt_type_pp_rule(eqn, context, settings):
   annotation = (source_info_util.summarize(eqn.source_info)
                 if settings.source_info else None)
   return [lhs, pp.text(" = ", annotation=annotation), *rhs]
-
 
 convert_element_type_p = Primitive('convert_element_type')
 convert_element_type_p.def_impl(partial(xla.apply_primitive, convert_element_type_p))
@@ -2463,7 +2476,7 @@ def _masked(padded_value, logical_shape, dimensions, value=0):
 
 
 def _dot_general_shape_rule(lhs, rhs, *, dimension_numbers, precision,
-                            preferred_element_type: Optional[DType]):
+                            preferred_element_type: Optional[DTypeLike]):
   (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = dimension_numbers
   if not all(np.all(np.greater_equal(d, 0)) and np.all(np.less(d, lhs.ndim))
              for d in (lhs_contracting, lhs_batch)):
@@ -2539,7 +2552,7 @@ def tuple_delete(tup, idx):
 
 
 def _dot_general_dtype_rule(lhs, rhs, *, dimension_numbers, precision,
-                            preferred_element_type: Optional[DType]):
+                            preferred_element_type: Optional[DTypeLike]):
   input_dtype = naryop_dtype_rule(_input_dtype, [_any, _any], 'dot_general', lhs, rhs)
   if preferred_element_type is None:
     return input_dtype
@@ -2547,7 +2560,7 @@ def _dot_general_dtype_rule(lhs, rhs, *, dimension_numbers, precision,
   return preferred_element_type
 
 def _dot_general_transpose_lhs(g, y, *, dimension_numbers, precision,
-                               preferred_element_type: Optional[DType],
+                               preferred_element_type: Optional[DTypeLike],
                                swap_ans=False):
   (x_contract, y_contract), (x_batch, y_batch) = dimension_numbers
   x_ndim = g.ndim - y.ndim + len(x_batch) + 2 * len(x_contract)
@@ -2564,7 +2577,7 @@ def _dot_general_transpose_lhs(g, y, *, dimension_numbers, precision,
                    tuple(out_axes))
 
 def _dot_general_transpose_rhs(g, x, *, dimension_numbers, precision,
-                               preferred_element_type: Optional[DType]):
+                               preferred_element_type: Optional[DTypeLike]):
   (x_contract, y_contract), (x_batch, y_batch) = dimension_numbers
   swapped_dimension_numbers = ((y_contract, x_contract), (y_batch, x_batch))
   return _dot_general_transpose_lhs(
@@ -2575,8 +2588,23 @@ def _dot_general_transpose_rhs(g, x, *, dimension_numbers, precision,
 
 def _dot_general_batch_rule(batched_args, batch_dims, *, dimension_numbers,
                             precision,
-                            preferred_element_type: Optional[DType]):
+                            preferred_element_type: Optional[DTypeLike]):
   lhs, rhs = batched_args
+  lbd, rbd = batch_dims
+  (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
+  if (type(lbd) is type(rbd) is ConcatAxis and
+      lbd.axis in lhs_contract and rbd.axis in rhs_contract):
+    # first handle any other part of the dot with these as batch dims
+    lhs_contract_ = [d for d in lhs_contract if d != lbd.axis]
+    rhs_contract_ = [d for d in rhs_contract if d != rbd.axis]
+    lhs_batch_ = (lbd.axis, *lhs_batch)
+    rhs_batch_ = (rbd.axis, *rhs_batch)
+    new_dnums = ((lhs_contract_, rhs_contract_), (lhs_batch_, rhs_batch_))
+    out = dot_general(lhs, rhs, new_dnums, precision=precision,
+                      preferred_element_type=preferred_element_type)
+    # now a segment sum along that batch axis
+    return batching.segment_sum(out, lbd.segment_lengths), 0
+
   new_dimension_numbers, result_batch_dim = _dot_general_batch_dim_nums(
       (lhs.ndim, rhs.ndim), batch_dims, dimension_numbers)
   batched_out = dot_general(lhs, rhs, new_dimension_numbers,
@@ -2597,31 +2625,52 @@ def _dot_general_batch_dim_nums(ndims, batch_dims, dimension_numbers):
   def bump_dims(dims, b):
     return tuple(np.add(dims, np.greater_equal(dims, b)))
 
-  if lbd is not None and rbd is not None:
+  if type(lbd) is type(rbd) is int:
     # adding a batch dimension
     lhs_batch = (lbd,) + bump_dims(lhs_batch, lbd)
     rhs_batch = (rbd,) + bump_dims(rhs_batch, rbd)
     lhs_contract = bump_dims(lhs_contract, lbd)
     rhs_contract = bump_dims(rhs_contract, rbd)
     result_batch_dim = 0
-  else:
-    # adding a tensor product dimension
-    if lbd is not None:
-      other = tuple(d for d in range(lhs_ndim)
-                    if d not in lhs_batch and d not in lhs_contract)
-      result_batch_dim = (len(lhs_batch) + sum(np.less(other, lbd)))
-      lhs_batch = bump_dims(lhs_batch, lbd)
-      lhs_contract = bump_dims(lhs_contract, lbd)
+  elif rbd is None and type(lbd) is ConcatAxis and lbd.axis not in lhs_contract:
+    if lbd.axis in lhs_batch:
+      axis = int(np.sum(np.less(lhs_batch, lbd.axis)))
     else:
-      other = tuple(d for d in range(rhs_ndim)
-                    if d not in rhs_batch and d not in rhs_contract)
-      result_batch_dim = (lhs_ndim - len(lhs_contract) +
-                          sum(np.less(other, rbd)))
-      rhs_batch = bump_dims(rhs_batch, rbd)
-      rhs_contract = bump_dims(rhs_contract, rbd)
+      lhs_tensor = [d for d in range(lhs_ndim)
+                    if d not in lhs_batch and d not in lhs_contract]
+      axis = len(lhs_batch) + int(np.sum(np.less(lhs_tensor, lbd.axis)))
+    result_batch_dim = ConcatAxis(axis, lbd.segment_lengths)
+  elif lbd is None and type(rbd) is ConcatAxis and rbd.axis not in rhs_contract:
+    if rbd.axis in rhs_batch:
+      axis = int(np.sum(np.less(rhs_batch, rbd.axis)))
+    else:
+      rhs_tensor = [d for d in range(rhs_ndim)
+                    if d not in rhs_batch and d not in rhs_contract]
+      axis = (lhs_ndim - len(lhs_contract) +
+              int(sum(np.less(rhs_tensor, rbd.axis))))
+    result_batch_dim = ConcatAxis(axis, rbd.segment_lengths)
+  elif (type(lbd) is int and
+        (rbd is None or type(rbd) is ConcatAxis and
+         rbd.axis not in rhs_contract)):
+    lhs_tensor = [d for d in range(lhs_ndim)
+                  if d not in lhs_batch and d not in lhs_contract]
+    result_batch_dim = len(lhs_batch) + int(sum(np.less(lhs_tensor, lbd)))
+    lhs_batch = bump_dims(lhs_batch, lbd)
+    lhs_contract = bump_dims(lhs_contract, lbd)
+  elif (type(rbd) is int and
+        (lbd is None or type(lbd) is ConcatAxis and
+         lbd.axis not in lhs_contract)):
+    rhs_tensor = [d for d in range(rhs_ndim)
+                  if d not in rhs_batch and d not in rhs_contract]
+    result_batch_dim = (lhs_ndim - len(lhs_contract) +
+                        int(sum(np.less(rhs_tensor, rbd))))
+    rhs_batch = bump_dims(rhs_batch, rbd)
+    rhs_contract = bump_dims(rhs_contract, rbd)
+  else:
+    assert False
 
   new_dimension_numbers = ((lhs_contract, rhs_contract), (lhs_batch, rhs_batch))
-  return new_dimension_numbers, int(result_batch_dim)
+  return new_dimension_numbers, result_batch_dim
 
 def _dot_general_padding_rule(in_avals, out_avals, lhs, rhs, *,
                               dimension_numbers, **params):
@@ -2762,15 +2811,27 @@ def _broadcast_in_dim_transpose_rule(ct, operand, *dyn_shape,
   return ([expand_dims(_reduce_sum(ct, axes), unit_dims)] +
           [None] * len(dyn_shape))
 
-def _broadcast_in_dim_batch_rule(batched_args, batch_dims, *dyn_shape, shape,
+def _broadcast_in_dim_batch_rule(batched_args, batch_dims, shape,
                                  broadcast_dimensions):
-  if dyn_shape: raise NotImplementedError  # TODO(mattjj)
-  operand, = batched_args
-  bdim, = batch_dims
-  new_operand = batching.moveaxis(operand, bdim, 0)
-  new_shape = (operand.shape[bdim],) + shape
-  new_broadcast_dimensions = (0,) + tuple(np.add(1, broadcast_dimensions))
-  return broadcast_in_dim(new_operand, new_shape, new_broadcast_dimensions), 0
+  operand, *dyn_shape = batched_args
+  operand_bdim, *dyn_shape_bdims = batch_dims
+  if len(dyn_shape) > 1: raise NotImplementedError
+  if (operand_bdim is not None and
+      (not dyn_shape_bdims or dyn_shape_bdims[0] is None)):
+    new_operand = batching.moveaxis(operand, operand_bdim, 0)
+    new_shape = (operand.shape[operand_bdim],) + shape
+    new_broadcast_dimensions = (0,) + tuple(np.add(1, broadcast_dimensions))
+    return broadcast_in_dim(new_operand, new_shape, new_broadcast_dimensions), 0
+  elif (operand_bdim is None and dyn_shape_bdims and
+        dyn_shape_bdims[0] is not None):
+    (d,), (d_bdim,) = dyn_shape, dyn_shape_bdims  # NotImplementedError above
+    assert d_bdim == 0  # must be scalar in the program to be batched
+    new_shape = _merge_dyn_shape(shape, (int(d.sum()),))
+    out = broadcast_in_dim(operand, new_shape, broadcast_dimensions)
+    idx, = (i for i, s in enumerate(shape) if s is None)
+    return out, batching.ConcatAxis(idx, d)
+  else:
+    raise NotImplementedError  # TODO(mattjj)
 
 def _broadcast_in_dim_fwd_rule(eqn):
   v, *dyn = eqn.invars
@@ -2872,7 +2933,10 @@ def _broadcast_in_dim_pp_rule(eqn, context, settings):
   return [lhs, pp.text(" = ", annotation=annotation), *rhs]
 
 def _broadcast_in_dim_abstract_eval(x, *dyn_shape, shape, broadcast_dimensions):
-  if not any(isinstance(d, core.BInt) for d in shape):
+  if dyn_shape: raise NotImplementedError
+  del dyn_shape
+  if not any(isinstance(d, core.DArray) and
+             type(core.get_aval(d).dtype) is core.bint for d in shape):
     shape = _broadcast_in_dim_shape_rule(  # error checking
         x, shape=shape, broadcast_dimensions=broadcast_dimensions)
     return core.ShapedArray(shape, x.dtype, x.weak_type, x.named_shape)
@@ -2899,12 +2963,10 @@ mlir.register_lowering(broadcast_in_dim_p, _broadcast_in_dim_lower)
 def _clamp_shape_rule(min, operand, max):
   if min.shape and min.shape != operand.shape:
     raise TypeError("clamp requires min.shape == operand.shape or min.shape == "
-                    f"(), got min.shape={min.shape}, "
-                    f"operand.shape={operand.shape}.")
+                    f"(), got min.shape={min.shape}, {operand.shape=}.")
   if max.shape and max.shape != operand.shape:
     raise TypeError("clamp requires max.shape == operand.shape or max.shape == "
-                    f"(), got max.shape={max.shape}, "
-                    f"operand.shape={operand.shape}.")
+                    f"(), got max.shape={max.shape}, {operand.shape=}.")
   return operand.shape
 
 _clamp_dtype_rule = partial(naryop_dtype_rule, _input_dtype, [_any, _any, _any],
@@ -2958,12 +3020,8 @@ ad.defjvp(clamp_p,
           lambda g, min, operand, max:
           select(lt(max, operand), g, _zeros(operand)))
 batching.primitive_batchers[clamp_p] = _clamp_batch_rule
-if mlir_api_version < 30:
-  mlir.register_lowering(
-      clamp_p, partial(_nary_lower_mhlo, mhlo.ClampOp, explicit_type=True))
-else:
-  mlir.register_lowering(
-      clamp_p, partial(_nary_lower_mhlo, mhlo.ClampOp))
+mlir.register_lowering(
+    clamp_p, partial(_nary_lower_mhlo, mhlo.ClampOp))
 pe.def_trivial_padding(clamp_p)
 
 def _concatenate_shape_rule(*operands, **kwargs):
@@ -3026,11 +3084,19 @@ def _concatenate_batch_rule(batched_args, batch_dims, *, dimension):
               for op, bdim in zip(batched_args, batch_dims)]
   return concatenate(operands, dimension + 1), 0
 
+def _concatenate_pad_rule(in_avals, out_avals, *operands, dimension):
+  if all(isinstance(a.shape[dimension], (int, np.integer))
+         for a in in_avals):
+    return [concatenate(operands, dimension)]
+  else:
+    raise NotImplementedError  # TODO(mattjj)
+
 concatenate_p = standard_primitive(
     _concatenate_shape_rule, _concatenate_dtype_rule, 'concatenate')
 ad.deflinear2(concatenate_p, _concatenate_transpose_rule)
 ad.primitive_transposes[concatenate_p] = _concatenate_transpose_rule
 batching.primitive_batchers[concatenate_p] = _concatenate_batch_rule
+pe.padding_rules[concatenate_p] = _concatenate_pad_rule
 
 def _concatenate_lower(ctx, *xs, dimension):
   return mhlo.ConcatenateOp(xs, mlir.i64_attr(dimension)).results
@@ -3141,7 +3207,7 @@ def _compute_squeeze_shape(shape, dimensions):
   if any(not core.symbolic_equal_dim(shape[d], 1) for d in dimensions):
     raise ValueError(
         "cannot select an axis to squeeze out which has size not equal to "
-        f"one, got shape={shape} and dimensions={dimensions}")
+        f"one, got {shape=} and {dimensions=}")
   return tuple(s for i, s in enumerate(shape) if i not in dims_set)
 
 def _squeeze_transpose_rule(t, operand, *, dimensions):
@@ -3159,6 +3225,7 @@ squeeze_p = standard_primitive(_squeeze_shape_rule, _squeeze_dtype_rule,
                                'squeeze')
 ad.deflinear2(squeeze_p, _squeeze_transpose_rule)
 batching.primitive_batchers[squeeze_p] = _squeeze_batch_rule
+pe.def_trivial_padding(squeeze_p)
 
 def _squeeze_lower(ctx, operand, *, dimensions):
   del dimensions  # Implied by the output aval.
@@ -3173,9 +3240,7 @@ def _squeeze_lower(ctx, operand, *, dimensions):
     ).results
   else:
     return mhlo.ReshapeOp(mlir.aval_to_ir_type(aval_out), operand).results
-
 mlir.register_lowering(squeeze_p, _squeeze_lower)
-
 
 
 def shape_as_value(shape: core.Shape):
@@ -3620,13 +3685,13 @@ def _reduce_sum_transpose_rule(cotangent, operand, *, axes):
   assert result.shape == input_shape
   return [result]
 
-def _reduce_sum_padding_rule(in_avals, out_avals, operand, *, axes):
+def _reducer_padding(traceable, ident, in_avals, out_avals, operand, *, axes):
   del out_avals
   aval, = in_avals
   padded_axes = [(i, d.val) for i, d in enumerate(aval.shape)
                  if isinstance(d, pe.BoundedAxisSize)]
-  masked_operand = _replace_masked_values(operand, 0, padded_axes)
-  return [_reduce_sum(masked_operand, axes)]
+  operand_ = _replace_masked_values(operand, ident(aval.dtype), padded_axes)
+  return [traceable(operand_, axes)]
 
 def _replace_masked_values(x, val, padded_axes):
   if not padded_axes: return x
@@ -3640,7 +3705,8 @@ reduce_sum_p = standard_primitive(
   'reduce_sum')
 ad.deflinear2(reduce_sum_p, _reduce_sum_transpose_rule)
 batching.defreducer(reduce_sum_p)
-pe.padding_rules[reduce_sum_p] = _reduce_sum_padding_rule
+pe.padding_rules[reduce_sum_p] = partial(_reducer_padding, _reduce_sum,
+                                         _get_sum_identity)
 
 
 def _reduce_op_shape_rule(operand, *, axes, input_shape=None):
@@ -3663,6 +3729,8 @@ reduce_prod_p = standard_primitive(
   'reduce_prod')
 ad.primitive_jvps[reduce_prod_p] = _reduce_prod_jvp_rule
 batching.defreducer(reduce_prod_p)
+pe.padding_rules[reduce_prod_p] = partial(_reducer_padding, _reduce_prod,
+                                          _get_prod_identity)
 
 
 def _reduce_chooser_shape_rule(operand, *, axes):
@@ -3678,15 +3746,21 @@ def _reduce_chooser_jvp_rule(g, ans, operand, *, axes):
   counts = _reduce_sum(location_indicators, axes)
   return div(_reduce_sum(mul(g, location_indicators), axes), counts)
 
+
 reduce_max_p = standard_primitive(_reduce_op_shape_rule, _input_dtype,
                                   'reduce_max')
 ad.defjvp2(reduce_max_p, _reduce_chooser_jvp_rule)
 batching.defreducer(reduce_max_p)
+pe.padding_rules[reduce_max_p] = partial(_reducer_padding, _reduce_max,
+                                         _get_max_identity)
+
 
 reduce_min_p = standard_primitive(_reduce_op_shape_rule, _input_dtype,
                                   'reduce_min')
 ad.defjvp2(reduce_min_p, _reduce_chooser_jvp_rule)
 batching.defreducer(reduce_min_p)
+pe.padding_rules[reduce_min_p] = partial(_reducer_padding, _reduce_min,
+                                         _get_min_identity)
 
 
 def _argminmax_shape_rule(operand, *, axes, index_dtype):
@@ -3695,7 +3769,7 @@ def _argminmax_shape_rule(operand, *, axes, index_dtype):
     raise ValueError(f"Invalid axis {axis} for operand shape {operand.shape}")
   if not core.greater_equal_dim(operand.shape[axis], 1):
     raise ValueError("argmin and argmax require non-empty reduced dimension. "
-                     f"operand.shape={operand.shape} axis={axis}")
+                     f"operand.shape={operand.shape} {axis=}")
   return tuple(np.delete(operand.shape, axis))
 
 def _argminmax_dtype_rule(operand, *, axes, index_dtype):
@@ -3784,19 +3858,19 @@ def _unary_reduce_lower(reducer, unit_factory, ctx, x, *, axes):
   return op.results
 
 mlir.register_lowering(reduce_sum_p, partial(_unary_reduce_lower, mhlo.AddOp,
-                                         lambda dtype: np.array(0, dtype)))
+                                             _get_sum_identity))
 mlir.register_lowering(reduce_prod_p, partial(_unary_reduce_lower, mhlo.MulOp,
-                                          lambda dtype: np.array(1, dtype)))
+                                              _get_prod_identity))
 mlir.register_lowering(reduce_or_p, partial(_unary_reduce_lower, mhlo.OrOp,
-                                          _get_bitwise_or_identity))
+                                            _get_bitwise_or_identity))
 mlir.register_lowering(reduce_and_p, partial(_unary_reduce_lower, mhlo.AndOp,
-                                          _get_bitwise_and_identity))
+                                             _get_bitwise_and_identity))
 mlir.register_lowering(reduce_xor_p, partial(_unary_reduce_lower, mhlo.XorOp,
-                                          _get_bitwise_or_identity))
+                                             _get_bitwise_or_identity))
 mlir.register_lowering(reduce_min_p, partial(_unary_reduce_lower, mlir.min_mhlo,
-                                         _get_min_identity))
+                                             _get_min_identity))
 mlir.register_lowering(reduce_max_p, partial(_unary_reduce_lower, mlir.max_mhlo,
-                                         _get_max_identity))
+                                             _get_max_identity))
 
 
 
@@ -4070,6 +4144,7 @@ def _stop_gradient_batch_rule(batched_args, batch_dims):
 
 ad.primitive_jvps[ad_util.stop_gradient_p] = _stop_gradient_jvp_rule
 batching.primitive_batchers[ad_util.stop_gradient_p] = _stop_gradient_batch_rule
+pe.def_trivial_padding(ad_util.stop_gradient_p)
 
 
 def create_token(_=None):
@@ -4340,7 +4415,7 @@ mlir.register_lowering(rng_bit_generator_p,
                        _rng_bit_generator_lowering)
 
 
-def _array_copy(arr):
+def _array_copy(arr: ArrayLike) -> Array:
   return copy_p.bind(arr)
 
 # The copy_p primitive exists for expressing making copies of runtime arrays.
@@ -4389,8 +4464,9 @@ def _iota_abstract_eval(*, dtype, shape, dimension):
     raise TypeError(msg.format(typename, ', '.join(accepted_typenames)))
   if not 0 <= dimension < len(shape):
     raise ValueError("iota dimension must be between 0 and len(shape), got "
-                     f"dimension={dimension} for shape {shape}")
-  if not any(isinstance(d, core.BInt) for d in shape):
+                     f"{dimension=} for {shape=}")
+  if not any(isinstance(d, core.DArray) and
+             type(core.get_aval(d).dtype) is core.bint for d in shape):
     return ShapedArray(shape, dtype)
   # TODO(mattjj): unify DShapedArray with ShapedArray, and remove this code
   return core.DShapedArray(shape, dtype, False)
@@ -4434,6 +4510,13 @@ def _iota_lower(ctx, *dyn_shape, dtype, shape, dimension):
                        mlir.i64_attr(dimension)).results
 mlir.register_lowering(iota_p, _iota_lower)
 
+def _iota_batching_rule(in_vals, in_dims, *, dtype, shape, dimension):
+  (segment_lengths,), (ax,) = in_vals, in_dims
+  shapes = [_merge_dyn_shape(shape, (d,)) for d in segment_lengths]
+  iotas = [broadcasted_iota(dtype, s, dimension) for s in shapes]
+  return concatenate(iotas, dimension), batching.ConcatAxis(ax, segment_lengths)
+batching.primitive_batchers[iota_p] = _iota_batching_rule
+
 def _iota_pp_rule(eqn, context, settings):
   printed_params = {}
   if len(eqn.params['shape']) > 1:
@@ -4463,23 +4546,6 @@ def _iota_padding_rule(in_avals, out_avals, *dyn_shape, dtype, shape, dimension)
   return [iota_p.bind(*new_dyn_shape, shape=tuple(new_shape),
                       dtype=dtype, dimension=dimension)]
 pe.padding_rules[iota_p] = _iota_padding_rule
-
-
-def make_bint(i, bd: int):
-  return bint_p.bind(i, bd=bd)
-
-bint_p = core.Primitive('bint')
-
-@bint_p.def_impl
-def _bint_impl(i, *, bd):
-  return core.BInt(i, bd)
-
-@bint_p.def_abstract_eval
-def bint_abstract_eval(_, *, bd: int):
-  return core.AbstractBInt(bound=bd)
-
-pe.padding_rules[bint_p] = lambda _, __, i, bd: [i]
-mlir.register_lowering(bint_p, lambda ctx, x, bd: [x])
 
 
 ### util
@@ -4611,7 +4677,7 @@ def _check_shapelike(fun_name, arg_name, obj, non_zero_shape=False):
   if not len(obj):  # pylint: disable=g-explicit-length-test
     return
   if (config.jax_dynamic_shapes and isinstance(obj, (tuple, list)) and
-      any(isinstance(d, (core.Tracer, core.BInt)) for d in obj)):
+      any(isinstance(d, (core.Tracer, core.DArray)) for d in obj)):
     return  # TODO(mattjj): handle more checks in the dynamic shape case
   obj_arr = np.array(obj)
   if obj_arr.ndim != 1:
@@ -4646,7 +4712,7 @@ _two: Callable = partial(full_like, shape=(), fill_value=2)
 dtype: Callable = partial(dtypes.dtype, canonicalize=True)
 _dtype: Callable = partial(dtypes.dtype, canonicalize=True)
 
-def _isnan(x) -> bool:
+def _isnan(x: ArrayLike) -> Array:
   return ne(x, x)
 
 def _iscomplex(x) -> bool:
@@ -4754,3 +4820,19 @@ def _empty_lower(ctx, *, dtype):
     return dtype._rules.empty_mlir(ctx)
   return mlir.ir_constants(np.zeros((), np.dtype(dtype)))
 mlir.register_lowering(empty_p, _empty_lower)
+
+
+class BIntRules:
+  @staticmethod
+  def aval_to_ir_types(aval):
+    dtype = dtypes._scalar_type_to_dtype(int)
+    return (ir.RankedTensorType.get(aval.shape, mlir.dtype_to_ir_type(dtype)),)
+
+  @staticmethod
+  def result_handler(sticky_device, aval):
+    def handler(_, buf):
+      buf.aval = core.ShapedArray(buf.shape, buf.dtype)
+      return core.DArray(aval, buf)
+    return handler
+
+core.bint._rules = BIntRules

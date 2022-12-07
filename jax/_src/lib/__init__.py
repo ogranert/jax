@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,19 +20,6 @@ import re
 import os
 import warnings
 from typing import Optional, Tuple
-
-# This apparently-unused import is to work around
-# https://github.com/google/jax/issues/9218#issuecomment-1016949739
-# If the user is using Conda, we want to ensure that Conda's libstdc++ is chosen
-# by the dynamic linker in preference to the system libstdc++. Before importing
-# jaxlib, we first must import a library that:
-# a) is likely to be provided by Conda and not hand-installed by the user, and
-# b) uses C++ and links to libstdc++.
-# Some submodules of scipy (e.g., scipy.signal) satisfy this criterion.
-# If the user isn't using Conda, this code merely wastes a bit of time, but
-# we're likely to import scipy anyway later.
-import scipy.signal as _signal
-del _signal
 
 try:
   import jaxlib as jaxlib
@@ -100,16 +87,7 @@ cpu_feature_guard.check_cpu_features()
 import jaxlib.xla_client as xla_client
 import jaxlib.lapack as lapack
 
-# TODO(phawkins): remove pocketfft references when the minimum jaxlib version
-# is 0.3.17 or newer.
-try:
-  import jaxlib.pocketfft as pocketfft  # pytype: disable=import-error
-except ImportError:
-  pocketfft = None  # type: ignore
-try:
-  import jaxlib.ducc_fft as ducc_fft  # pytype: disable=import-error
-except ImportError:
-  ducc_fft = None  # type: ignore
+import jaxlib.ducc_fft as ducc_fft
 
 xla_extension = xla_client._xla
 pytree = xla_client._xla.pytree
@@ -127,9 +105,15 @@ import jaxlib.gpu_linalg as gpu_linalg  # pytype: disable=import-error
 # branch on the Jax github.
 xla_extension_version = getattr(xla_client, '_version', 0)
 
+if version > (0, 3, 25):
+  import jaxlib.gpu_rnn as gpu_rnn  # pytype: disable=import-error
+
 can_execute_with_token = (
-    xla_extension_version >= 89 and
-    hasattr(xla_client.Executable, "execute_with_token"))
+    xla_extension_version >= 89 and hasattr(
+        xla_client.LoadedExecutable  # type: ignore
+        if xla_extension_version >= 98 else
+        xla_client.Executable,  # type: ignore
+        'execute_with_token'))
 
 # Version number for MLIR:Python APIs, provided by jaxlib.
 mlir_api_version = xla_client.mlir_api_version

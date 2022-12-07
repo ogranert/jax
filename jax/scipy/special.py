@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 from jax._src.scipy.special import (
   betainc as betainc,
   betaln as betaln,
+  bessel_jn as bessel_jn,
   digamma as digamma,
   entr as entr,
   erf as erf,

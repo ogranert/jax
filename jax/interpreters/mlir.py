@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,18 +25,15 @@ import itertools
 import re
 import typing
 from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
-                    Sequence, Set, Tuple, Type, Union, FrozenSet)
-from typing_extensions import Protocol
+                    Protocol, Sequence, Set, Tuple, Type, Union, FrozenSet)
 import warnings
 
-import jax
 from jax import core
 from jax import linear_util as lu
 from jax._src import ad_util
 from jax._src import device_array
 from jax._src import dtypes
-from jax._src.lib import mlir_api_version
-from jax._src.lib import version as jaxlib_version
+from jax._src.lib import mlir_api_version, xla_extension_version
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import chlo
 from jax._src.lib.mlir.dialects import mhlo
@@ -144,14 +141,9 @@ def _array_ir_types(aval: Union[core.ShapedArray, core.DShapedArray]
   return (ir.RankedTensorType.get(aval.shape, dtype_to_ir_type(aval.dtype)),)
 
 def _dynamic_array_ir_types(aval: core.ShapedArray) -> Sequence[ir.Type]:
-  # in the MHLO builder, -1 indicates a '?' axis size
-  shape = [d if type(d) is int else d.bound if type(d) is core.BInt else -1
-           for d in aval.shape]
+  dyn_size = ir.ShapedType.get_dynamic_size() if mlir_api_version >= 35 else -1
+  shape = [d if type(d) is int else dyn_size for d in aval.shape]
   return (ir.RankedTensorType.get(shape, dtype_to_ir_type(aval.dtype)),)
-
-def _bint_ir_types(aval: core.AbstractBInt) -> Sequence[ir.Type]:
-  dtype = dtypes._scalar_type_to_dtype(int)
-  return (ir.RankedTensorType.get((), dtype_to_ir_type(dtype)),)
 
 ir_type_handlers: Dict[Type[core.AbstractValue],
                         Callable[[Any], Sequence[ir.Type]]] = {}
@@ -166,7 +158,6 @@ def aval_to_ir_types(aval: core.AbstractValue) -> Sequence[ir.Type]:
   except KeyError as err:
     raise TypeError(f"No ir_type_handler for aval type: {type(aval)}") from err
 
-ir_type_handlers[core.AbstractBInt] = _bint_ir_types
 ir_type_handlers[core.ShapedArray] = _array_ir_types
 ir_type_handlers[core.ConcreteArray] = _array_ir_types
 ir_type_handlers[core.AbstractToken] = lambda _: [mhlo.TokenType.get()]
@@ -317,35 +308,29 @@ register_constant_handler(
 def _source_info_to_location(
     primitive: core.Primitive, params: Dict,
     source_info: source_info_util.SourceInfo,
-    name_stack: Union[str, source_info_util.NameStack] = "") -> ir.Location:
-  if config.jax_experimental_name_stack:
-    eqn_str = (f'{str(source_info.name_stack)}/'
-               f'{core.str_eqn_compact(primitive.name, params)}')
-  else:
-    assert isinstance(name_stack, str)
-    eqn_str = name_stack + core.str_eqn_compact(primitive.name, params)
+    name_stack: source_info_util.NameStack) -> ir.Location:
+  eqn_str = (f'{str(source_info.name_stack)}/'
+             f'{core.str_eqn_compact(primitive.name, params)}')
   frame = source_info_util.user_frame(source_info)
   if frame is None:
     loc = ir.Location.unknown()
   else:
     loc = ir.Location.file(xla._get_canonical_source_file(frame),
-                           frame.line_num, 1)
+                           frame.start_line, frame.start_column)
   loc = ir.Location.name(eqn_str, childLoc=loc)
   # TODO(phawkins): also include primitive.name as the operator type.
   return loc
 
 
 # Translation rules
-NameStack = Union[str, source_info_util.NameStack]
-
 def make_ir_context() -> ir.Context:
   """Creates an MLIR context suitable for JAX IR."""
   context = ir.Context()
   mhlo.register_mhlo_dialect(context)
-  if mlir_api_version < 33:
-    chlo.register_chlo_dialect(context)
-  else:
-    chlo.register_dialect(context)
+  chlo.register_dialect(context)
+  if mlir_api_version >= 37:
+    from jax._src.lib.mlir.dialects import stablehlo
+    stablehlo.register_dialect(context)
   return context
 
 
@@ -402,7 +387,7 @@ class ShardingContext:
 
   This context also uses the GSPMD partitioner.
   """
-  sharding: Any
+  device_assignment: Sequence[xc.Device]
 
   # Similar to SPMDContext as ShardingContext also uses the GSPMD partitioner.
   @property
@@ -422,7 +407,7 @@ class ModuleContext:
   backend_or_name: Optional[Union[str, xb.XlaBackend]]
   platform: str
   axis_context: AxisContext
-  name_stack: NameStack
+  name_stack: source_info_util.NameStack
   keepalives: List[Any]
   channel_iterator: Iterator[int]
   host_callbacks: List[Any]
@@ -440,7 +425,7 @@ class ModuleContext:
       backend_or_name: Optional[Union[str, xb.XlaBackend]],
       platform: str,
       axis_context: AxisContext,
-      name_stack: NameStack,
+      name_stack: source_info_util.NameStack,
       keepalives: List[Any],
       channel_iterator: Iterator[int],
       host_callbacks: List[Any],
@@ -543,7 +528,6 @@ def flatten_lowering_ir_args(
 ) -> Sequence[Sequence[ir.Value]]:
   return util.flatten(map(wrap_singleton_ir_values, xs))
 
-_module_unique_id = itertools.count()
 _module_name_regex = re.compile(r"[^\w.-]")
 
 def sharded_aval(aval: core.ShapedArray,
@@ -578,6 +562,12 @@ class LoweringResult(NamedTuple):
   host_callbacks: List[Any]
 
 
+if xla_extension_version >= 102:
+  _platforms_with_donation = ["cpu", "cuda", "rocm", "tpu"]
+else:
+  _platforms_with_donation = ["cuda", "rocm", "tpu"]
+
+
 def lower_jaxpr_to_module(
     module_name: str,
     jaxpr: core.ClosedJaxpr,
@@ -586,7 +576,7 @@ def lower_jaxpr_to_module(
     backend_or_name: Optional[Union[str, xb.XlaBackend]],
     platform: str,
     axis_context: AxisContext,
-    name_stack: NameStack,
+    name_stack: source_info_util.NameStack,
     donated_args: Sequence[bool],
     replicated_args: Optional[Sequence[bool]] = None,
     arg_shardings: Optional[Sequence[Optional[xc.OpSharding]]] = None,
@@ -616,8 +606,7 @@ def lower_jaxpr_to_module(
         out_aval, = out_aval.dtype._rules.physical_avals(out_aval)
       out_avals.append(sharded_aval(out_aval, out_sharding))
 
-  platforms_with_donation = ("cuda", "rocm", "tpu")
-  if platform in platforms_with_donation:
+  if platform in _platforms_with_donation:
     input_output_aliases, donated_args = _set_up_aliases(
         in_avals, out_avals, donated_args)
   if any(eff not in lowerable_effects for eff in jaxpr.effects):
@@ -627,7 +616,7 @@ def lower_jaxpr_to_module(
     unused_donations = [str(a) for a, d in zip(in_avals, donated_args)
                         if d]
     msg = "See an explanation at https://jax.readthedocs.io/en/latest/faq.html#buffer-donation."
-    if platform not in platforms_with_donation:
+    if platform not in _platforms_with_donation:
       msg = f"Donation is not implemented for {platform}.\n{msg}"
     warnings.warn(f"Some donated buffers were not usable: {', '.join(unused_donations)}.\n{msg}")
 
@@ -642,14 +631,8 @@ def lower_jaxpr_to_module(
     # Remove module name characters that XLA would alter. This ensures that
     # XLA computation preserves the module name.
     module_name = _module_name_regex.sub("_", module_name)
-    if config.jax_unique_mhlo_module_names:
-      # Some clients expect modules to have unique names, e.g., in trace data.
-      # This may or may not be a reasonable assumption.
-      ctx.module.operation.attributes["sym_name"] = ir.StringAttr.get(
-          f"{module_name}.{next(_module_unique_id)}")
-    else:
-      ctx.module.operation.attributes["sym_name"] = ir.StringAttr.get(
-          module_name)
+    ctx.module.operation.attributes["sym_name"] = ir.StringAttr.get(
+        module_name)
     unlowerable_effects = {eff for eff in jaxpr.effects
                            if eff not in lowerable_effects}
     if unlowerable_effects:
@@ -990,13 +973,14 @@ def jaxpr_subcomp(ctx: ModuleContext, jaxpr: core.Jaxpr,
   Assumes that an MLIR context, location, and insertion point are set.
   """
   assert ctx.platform != "gpu"
-  def read(v: core.Var) -> Sequence[ir.Value]:
+  def read(v: core.Atom) -> Sequence[ir.Value]:
     if type(v) is core.Literal:
       return ir_constants(v.val, canonicalize_types=True)
     else:
+      assert isinstance(v, core.Var)
       return env[v]
 
-  def aval(v: core.Var) -> core.AbstractValue:
+  def aval(v: core.Atom) -> core.AbstractValue:
     if type(v) is core.Literal:
       return xla.abstractify(v.val)
     else:
@@ -1016,14 +1000,11 @@ def jaxpr_subcomp(ctx: ModuleContext, jaxpr: core.Jaxpr,
   map(write, jaxpr.invars, args)
   for eqn in jaxpr.eqns:
     in_nodes = map(read, eqn.invars)
-    if config.jax_experimental_name_stack:
-      assert isinstance(ctx.name_stack, source_info_util.NameStack), type(ctx.name_stack)
-      source_info = eqn.source_info.replace(
-          name_stack=ctx.name_stack + eqn.source_info.name_stack)
-    else:
-      source_info = eqn.source_info
+    assert isinstance(ctx.name_stack, source_info_util.NameStack), type(ctx.name_stack)
+    source_info = eqn.source_info.replace(
+        name_stack=ctx.name_stack + eqn.source_info.name_stack)
     loc = _source_info_to_location(eqn.primitive, eqn.params, source_info,
-                                   name_stack=ctx.name_stack)
+                                   ctx.name_stack)
     with source_info_util.user_context(eqn.source_info.traceback), loc:
       if eqn.primitive in _platform_specific_lowerings[ctx.platform]:
         rule = _platform_specific_lowerings[ctx.platform][eqn.primitive]
@@ -1038,8 +1019,7 @@ def jaxpr_subcomp(ctx: ModuleContext, jaxpr: core.Jaxpr,
             f"MLIR translation rule for primitive '{eqn.primitive.name}' not "
             f"found for platform {ctx.platform}")
 
-      eqn_ctx = (ctx.replace(name_stack=source_info.name_stack) if
-                 config.jax_experimental_name_stack else ctx)
+      eqn_ctx = ctx.replace(name_stack=source_info.name_stack)
       effects = [eff for eff in eqn.effects if eff in core.ordered_effects]
       tokens_in = tokens.subset(effects)
       avals_in = map(aval, eqn.invars)
@@ -1169,21 +1149,16 @@ def _xla_call_lower(ctx, *args,
 
 register_lowering(xla.xla_call_p, _xla_call_lower)
 
-def _named_call_lowering(ctx, *args, name, backend=None,
-                         call_jaxpr):
+def _core_call_lowering(ctx, *args, name, backend=None, call_jaxpr):
   out_nodes, tokens = _call_lowering(
       name, name, call_jaxpr, backend, ctx.module_context,
       ctx.avals_in, ctx.avals_out, ctx.tokens_in, *args)
   ctx.set_tokens_out(tokens)
   return out_nodes
 
-register_lowering(core.named_call_p, _named_call_lowering)
-register_lowering(core.call_p, partial(_named_call_lowering, name="core_call"))
+register_lowering(core.call_p, partial(_core_call_lowering, name="core_call"))
 register_lowering(core.closed_call_p,
-                  partial(_named_call_lowering, name="core_closed_call"))
-
-register_lowering(core.closed_call_p,
-                  partial(_named_call_lowering, name="core_closed_call"))
+                  partial(_core_call_lowering, name="core_closed_call"))
 
 
 def full_like_aval(value, aval: core.ShapedArray) -> ir.Value:
@@ -1246,7 +1221,8 @@ def convert_mhlo(x, aval_in, aval_out):
 
   In particular, treat casts to boolean as x != 0, rather than truncating
   integer values (b/209440332)."""
-  if aval_out.dtype == np.dtype(np.bool_):
+  if (not core.is_opaque_dtype(aval_out.dtype) and
+      aval_out.dtype == np.dtype(np.bool_)):
     if dtypes.issubdtype(aval_in.dtype, np.inexact):
       compare_type = "FLOAT"
     elif dtypes.issubdtype(aval_in.dtype, np.signedinteger):
@@ -1552,18 +1528,28 @@ def _emit_tpu_python_callback(
   ctx.module_context.add_host_callback(opaque)
   return outputs, token, opaque
 
+def _layout_to_mlir_layout(minor_to_major: Optional[Sequence[int]]):
+  if minor_to_major is None:
+    # Needed for token layouts
+    layout = np.zeros((0,), dtype="int64")
+  else:
+    layout = np.array(minor_to_major, dtype="int64")
+  return ir.DenseIntElementsAttr.get(layout, type=ir.IndexType.get())
+
+def _aval_to_default_layout(aval):
+  # Row major order is default for `NumPy`.
+  return list(range(aval.ndim - 1, -1, -1))
 
 def emit_python_callback(
     ctx: LoweringRuleContext, callback, token: Optional[Any],
     operands: List[ir.Value], operand_avals: List[core.ShapedArray],
     result_avals: List[core.ShapedArray],
-    has_side_effect: bool, *, sharding: Optional[xc.OpSharding] = None
+    has_side_effect: bool, *, sharding: Optional[xc.OpSharding] = None,
+    operand_layouts: Optional[Sequence[Optional[Sequence[int]]]] = None,
+    result_layouts: Optional[Sequence[Optional[Sequence[int]]]] = None,
     ) -> Tuple[List[ir.Value], Any, Any]:
   """Emits MHLO that calls back to a provided Python function."""
   platform = ctx.module_context.platform
-  if platform in {"tpu"} and jaxlib_version < (0, 3, 15):
-    raise ValueError(
-        "`EmitPythonCallback` on TPU only supported on jaxlib >= 0.3.15")
   if platform not in {"cpu", "cuda", "rocm", "tpu"}:
     raise ValueError(
         f"`EmitPythonCallback` not supported on {platform} backend.")
@@ -1572,6 +1558,19 @@ def emit_python_callback(
       [xla.aval_to_xla_shapes(result_aval) for result_aval in result_avals])
   operand_shapes = util.flatten(
       [xla.aval_to_xla_shapes(op_aval) for op_aval in operand_avals])
+  # Handling layouts
+  if operand_layouts is None:
+    operand_layouts = map(_aval_to_default_layout, operand_avals)
+  operand_mlir_layouts = [
+      _layout_to_mlir_layout(_aval_to_default_layout(layout)) if layout is None
+      else _layout_to_mlir_layout(layout) for layout, aval
+      in zip(operand_layouts, operand_avals)]
+  if result_layouts is None:
+    result_layouts = map(_aval_to_default_layout, result_avals)
+  result_mlir_layouts = [
+      _layout_to_mlir_layout(_aval_to_default_layout(aval)) if layout is None
+      else _layout_to_mlir_layout(layout) for layout, aval
+      in zip(result_layouts, result_avals)]
 
   # First we apply checks to ensure output shapes and dtypes match the expected
   # ones.
@@ -1611,6 +1610,13 @@ def emit_python_callback(
     ]
     operands = [token, *operands]
     result_types = [token_type()[0], *result_types]
+    if xla_extension_version >= 105:
+      operand_mlir_layouts = [_layout_to_mlir_layout(None), *operand_mlir_layouts]
+      result_mlir_layouts = [_layout_to_mlir_layout(None), *result_mlir_layouts]
+    else:
+      # Token layouts aren't converted correctly into HLO in older XLA versions.
+      operand_mlir_layouts = None  # type: ignore
+      result_mlir_layouts = None  # type: ignore
   callback_descriptor, keepalive = (
       backend.get_emit_python_callback_descriptor(_wrapped_callback,
                                                   operand_shapes,
@@ -1618,6 +1624,8 @@ def emit_python_callback(
   descriptor_operand = ir_constant(
       callback_descriptor, canonicalize_types=False)
   callback_operands = [descriptor_operand, *operands]
+  if operand_mlir_layouts is not None:
+    operand_mlir_layouts = [_layout_to_mlir_layout([]), *operand_mlir_layouts]
   result_type = ir.TupleType.get_tuple(result_types)
   call_target_name = ("xla_python_gpu_callback"
                      if platform in {"cuda", "rocm"} else "xla_python_cpu_callback")
@@ -1629,8 +1637,12 @@ def emit_python_callback(
       api_version=i32_attr(2),
       called_computations=ir.ArrayAttr.get([]),
       backend_config=ir.StringAttr.get(str(callback_descriptor)),
-      operand_layouts=None,
-      result_layouts=None)
+      operand_layouts=(
+        None if operand_mlir_layouts is None
+        else ir.ArrayAttr.get(operand_mlir_layouts)),
+      result_layouts=(
+        None if result_mlir_layouts is None
+        else ir.ArrayAttr.get(result_mlir_layouts)))
   if sharding is not None:
     set_sharding(result, sharding)
   results = [
@@ -1640,6 +1652,21 @@ def emit_python_callback(
   if token:
     token, *results = results
   return results, token, keepalive
+
+def build_xla_computation_helper(
+    closed_jaxpr: core.ClosedJaxpr, *, name: str, platform: str,
+    backend_or_name: str, axis_context: AxisContext) -> xc.XlaComputation:
+  """Helper to generate pmap-style XLA computations for custom partitioners."""
+  if closed_jaxpr.effects:
+    raise NotImplementedError
+  lowering_result = lower_jaxpr_to_module(name, closed_jaxpr,
+      backend_or_name=backend_or_name, unordered_effects=[], ordered_effects=[],
+      name_stack=source_info_util.NameStack(),
+      donated_args=[False] * len(closed_jaxpr.jaxpr.invars),
+      axis_context=axis_context, platform=platform)
+  return xc._xla.mlir.mlir_module_to_xla_computation(
+      module_to_string(lowering_result.module), use_tuple_args=False,
+      return_tuple=False)
 
 # Lax ops missing MLIR lowerings.
 # # TODO(b/203775215): these are missing from the cHLO dialect. Either add

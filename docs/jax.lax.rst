@@ -205,12 +205,15 @@ Linear algebra operators (jax.lax.linalg)
     cholesky
     eig
     eigh
+    hessenberg
     lu
+    householder_product
     qdwh
     qr
     schur
     svd
     triangular_solve
+    tridiagonal
     tridiagonal_solve
 
 Argument classes

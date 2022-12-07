@@ -1,4 +1,4 @@
-# Copyright 2019 Google LLC
+# Copyright 2019 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,7 +26,6 @@ import numpy as np
 import jax
 from jax._src import dtypes
 from jax import numpy as jnp
-from jax.experimental import array
 
 from jax._src import test_util as jtu
 from jax._src.lax import lax as lax_internal
@@ -76,13 +75,6 @@ def identity(x):
   return x
 
 
-def _check_instance(self, x):
-  if config.jax_array:
-    self.assertIsInstance(x, array.Array)
-  else:
-    self.assertIsInstance(x, jnp.DeviceArray)
-
-
 class DtypesTest(jtu.JaxTestCase):
 
   def test_canonicalize_type(self):
@@ -108,7 +100,7 @@ class DtypesTest(jtu.JaxTestCase):
       dtypes.canonicalize_dtype("nonsense")
 
   @parameterized.named_parameters(
-    {"testcase_name": f"_swap={swap}_jit={jit}",
+    {"testcase_name": f"_{swap=}_{jit=}",
      "swap": swap, "jit": jit}
     for swap in [False, True] for jit in [False, True])
   @jtu.ignore_warning(category=UserWarning,
@@ -130,10 +122,10 @@ class DtypesTest(jtu.JaxTestCase):
       (jnp.array(1., dtype=jnp.float32), jnp.array(0., dtype=jnp.float32), jnp.float32),
       (jnp.array(1., dtype=jnp.float32), jnp.array(0., dtype=jnp.float64), jnp.float64),
       (jnp.array(1., dtype=jnp.float64), jnp.array(0., dtype=jnp.float64), jnp.float64),
-      (jnp.array([1.]), 0., jnp.float_),
-      (jnp.array([1.]), jnp.array(0.), jnp.float_),
-      (jnp.array([1.]), jnp.array(0., dtype=jnp.float16), jnp.float_),
-      (jnp.array([1.]), jnp.array(0., dtype=jnp.float32), jnp.float_),
+      (jnp.array([1.]), 0., jnp.float64),
+      (jnp.array([1.]), jnp.array(0.), jnp.float64),
+      (jnp.array([1.]), jnp.array(0., dtype=jnp.float16), jnp.float64),
+      (jnp.array([1.]), jnp.array(0., dtype=jnp.float32), jnp.float64),
       (jnp.array([1.]), jnp.array(0., dtype=jnp.float64), jnp.float64),
       (jnp.array([1.], dtype=jnp.float32), jnp.array(0., dtype=jnp.float16), jnp.float32),
       (jnp.array([1.], dtype=jnp.float16), jnp.array(0., dtype=jnp.float32), jnp.float32),
@@ -231,7 +223,7 @@ class DtypesTest(jtu.JaxTestCase):
   def testScalarInstantiation(self, scalar_type):
     a = scalar_type(1)
     self.assertEqual(a.dtype, jnp.dtype(scalar_type))
-    _check_instance(self, a)
+    self.assertIsInstance(a, jax.Array)
     self.assertEqual(0, jnp.ndim(a))
     self.assertIsInstance(np.dtype(scalar_type).type(1), scalar_type)
 
@@ -306,13 +298,13 @@ class DtypesTest(jtu.JaxTestCase):
 class TestPromotionTables(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
-      {"testcase_name": f"_jaxtype={jaxtype}", "jaxtype": jaxtype}
+      {"testcase_name": f"_{jaxtype=}", "jaxtype": jaxtype}
       for jaxtype in dtypes._jax_types + dtypes._weak_types)
   def testJaxTypeFromType(self, jaxtype):
     self.assertIs(dtypes._jax_type(*dtypes._dtype_and_weaktype(jaxtype)), jaxtype)
 
   @parameterized.named_parameters(
-      {"testcase_name": f"_jaxtype={jaxtype}", "jaxtype": jaxtype}
+      {"testcase_name": f"_{jaxtype=}", "jaxtype": jaxtype}
       for jaxtype in dtypes._jax_types + dtypes._weak_types)
   def testJaxTypeFromVal(self, jaxtype):
     try:
@@ -322,7 +314,7 @@ class TestPromotionTables(jtu.JaxTestCase):
     self.assertIs(dtypes._jax_type(*dtypes._dtype_and_weaktype(val)), jaxtype)
 
   @parameterized.named_parameters(
-      {"testcase_name": f"_dtype={dtype}", "dtype": dtype}
+      {"testcase_name": f"_{dtype=}", "dtype": dtype}
       for dtype in dtypes._jax_types)
   def testJaxTypeWeak(self, dtype):
     jax_type = dtypes._jax_type(dtype, weak_type=True)
@@ -472,7 +464,7 @@ class TestPromotionTables(jtu.JaxTestCase):
     self._CompileAndCheck(f, args_maker, check_dtypes=True)
 
   @parameterized.named_parameters(
-    {"testcase_name": f"_dtype={dtype}_weak_type={weak_type}",
+    {"testcase_name": f"_{dtype=}_{weak_type=}",
      "dtype": dtype, "weak_type": weak_type}
     for dtype in all_dtypes
     for weak_type in [True, False]
@@ -487,12 +479,11 @@ class TestPromotionTables(jtu.JaxTestCase):
       expected = x.dtype
     self.assertEqual(dtypes.result_type(x), expected)
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-    {"testcase_name": f"_dtype={dtype}_weak_type={weak_type}_promotion={promotion}",
-     "dtype": dtype, "weak_type": weak_type, "promotion": promotion}
-    for dtype in all_dtypes
-    for weak_type in [True, False]
-    for promotion in ['standard', 'strict']))
+  @jtu.sample_product(
+    dtype=all_dtypes,
+    weak_type=[True, False],
+    promotion=['standard', 'strict'],
+  )
   def testBinaryNonPromotion(self, dtype, weak_type, promotion):
     # Regression test for https://github.com/google/jax/issues/6051
     x = lax_internal._convert_element_type(0, dtype, weak_type=weak_type)
@@ -502,11 +493,11 @@ class TestPromotionTables(jtu.JaxTestCase):
     if promotion == 'standard' or not weak_type or dtype == dtypes.bool_:
       expected_dtype = dtype
     elif dtypes.issubdtype(dtype, np.complexfloating):
-      expected_dtype = dtypes.complex_
+      expected_dtype = np.complex128
     elif dtypes.issubdtype(dtype, np.floating):
-      expected_dtype = dtypes.float_
+      expected_dtype = np.float64
     else:
-      expected_dtype = dtypes.int_
+      expected_dtype = np.int64
 
     # No boolean weak types.
     expected_weak_type = weak_type and dtype != bool
@@ -516,7 +507,7 @@ class TestPromotionTables(jtu.JaxTestCase):
     self.assertEqual(dtypes.is_weakly_typed(y), expected_weak_type)
 
   @parameterized.named_parameters(
-    {"testcase_name": f"_dtype={dtype}_weak_type={weak_type}",
+    {"testcase_name": f"_{dtype=}_{weak_type=}",
      "dtype": dtype, "weak_type": weak_type}
     for dtype in all_dtypes
     for weak_type in [True, False]

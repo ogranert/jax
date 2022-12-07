@@ -4,20 +4,163 @@ Best viewed [here](https://jax.readthedocs.io/en/latest/changelog.html).
 
 <!--
 Remember to align the itemized text with the first line of an item within a list.
-
-PLEASE REMEMBER TO CHANGE THE '..main' WITH AN ACTUAL TAG in GITHUB LINK.
 -->
 
-## jax 0.3.18 (Unreleased)
-* [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.17...main).
+## jax 0.4.0
+* Changes
+  * Support for Python 3.7 has been dropped, in accordance with JAX's
+    {ref}`version-support-policy`.
+  * We introduce `jax.Array` which is a unified array type that subsumes
+    `DeviceArray`, `ShardedDeviceArray`, and `GlobalDeviceArray` types in JAX.
+    The `jax.Array` type helps make parallelism a core feature of JAX,
+    simplifies and unifies JAX internals, and allows us to unify `jit` and
+    `pjit`.  `jax.Array` has been enabled by default in JAX 0.4 and makes some
+    breaking change to the `pjit` API.  The [jax.Array migration
+    guide](https://jax.readthedocs.io/en/latest/jax_array_migration.html) can
+    help you migrate your codebase to `jax.Array`. You can also look at the
+    [Parallelism with
+    JAX](https://jax.readthedocs.io/en/latest/notebooks/Parallelism_with_JAX.html)
+    tutorial to understand the new concepts.
+  * `PartitionSpec` and `Mesh` are now out of experimental. The new API endpoints
+    are `jax.sharding.PartitionSpec` and `jax.sharding.Mesh`.
+    `jax.experimental.maps.Mesh` and `jax.experimental.PartitionSpec` are
+    deprecated and will be removed in 3 months.
+  * If using ABSL flags together with `jax.config`, the ABSL flag values are no
+    longer read or written after the JAX configuration options are initially
+    populated from the ABSL flags. This change improves performance of reading
+    `jax.config` options, which are used pervasively in JAX.
+  * The jax2tf.call_tf function now uses for TF lowering the first TF
+    device of the same platform as used by the embedding JAX computation.
+    Before, it was using the 0th device for the JAX-default backend.
+  * A number of `jax.numpy` functions now have their arguments marked as
+    positional-only, matching NumPy.
+
+## jaxlib 0.4.0
+* Changes
+  * Support for Python 3.7 has been dropped, in accordance with JAX's
+    {ref}`version-support-policy`.
+  * The behavior of `XLA_PYTHON_CLIENT_MEM_FRACTION=.XX` has been changed to allocate XX% of
+    the total GPU memory instead of the previous behavior of using currently available GPU memory
+    to calculate preallocation. Please refer to
+    [GPU memory allocation](https://jax.readthedocs.io/en/latest/gpu_memory_allocation.html) for
+    more details.
+  * The deprecated method `.block_host_until_ready()` has been removed. Use
+    `.block_until_ready()` instead.
+
+
+## jax 0.3.25 (Nov 15, 2022)
+* Changes
+  * {func}`jax.numpy.linalg.pinv` now supports the `hermitian` option.
+  * {func}`jax.scipy.linalg.hessenberg` is now supported on CPU only. Requires
+    jaxlib > 0.3.24.
+  * New functions {func}`jax.lax.linalg.hessenberg`,
+    {func}`jax.lax.linalg.tridiagonal`, and
+    {func}`jax.lax.linalg.householder_product` were added. Householder reduction
+    is currently CPU-only and tridiagonal reductions are supported on CPU and
+    GPU only.
+  * The gradients of `svd` and `jax.numpy.linalg.pinv` are now computed more
+    economically for non-square matrices.
+* Breaking Changes
+  * Deleted the `jax_experimental_name_stack` config option.
+  * Convert a string `axis_names` arguments to the
+    {class}`jax.experimental.maps.Mesh` constructor into a singleton tuple
+    instead of unpacking the string into a sequence of character axis names.
+
+## jaxlib 0.3.25 (Nov 15, 2022)
+* Changes
+  * Added support for tridiagonal reductions on CPU and GPU.
+  * Added support for upper Hessenberg reductions on CPU.
+* Bugs
+  * Fixed a bug that meant that frames in tracebacks captured by JAX were
+    incorrectly mapped to source lines under Python 3.10+
+
+## jax 0.3.24 (Nov 4, 2022)
+* Changes
+  * JAX should be faster to import. We now import scipy lazily, which accounted
+    for a significant fraction of JAX's import time.
+  * Setting the env var `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=$N` can be
+    used to limit the number of cache entries written to the persistent cache.
+    By default, computations that take 1 second or more to compile will be
+    cached.
+    * Added {func}`jax.scipy.stats.mode`.
+  * The default device order used by `pmap` on TPU if no order is specified now
+    matches `jax.devices()` for single-process jobs. Previously the
+    two orderings differed, which could lead to unnecessary copies or
+    out-of-memory errors. Requiring the orderings to agree simplifies matters.
+* Breaking Changes
+    * {func}`jax.numpy.gradient` now behaves like most other functions in {mod}`jax.numpy`,
+      and forbids passing lists or tuples in place of arrays ({jax-issue}`#12958`)
+    * Functions in {mod}`jax.numpy.linalg` and {mod}`jax.numpy.fft` now uniformly
+      require inputs to be array-like: i.e. lists and tuples cannot be used in place
+      of arrays. Part of {jax-issue}`#7737`.
+* Deprecations
+  * `jax.sharding.MeshPspecSharding` has been renamed to `jax.sharding.NamedSharding`.
+    `jax.sharding.MeshPspecSharding` name will be removed in 3 months.
+
+## jaxlib 0.3.24 (Nov 4, 2022)
+* Changes
+  * Buffer donation now works on CPU. This may break code that marked buffers
+    for donation on CPU but relied on donation not being implemented.
+
+## jax 0.3.23 (Oct 12, 2022)
+* Changes
+  * Update Colab TPU driver version for new jaxlib release.
+
+## jax 0.3.22 (Oct 11, 2022)
+* Changes
+  * Add `JAX_PLATFORMS=tpu,cpu` as default setting in TPU initialization,
+  so JAX will raise an error if TPU cannot be initialized instead of falling
+  back to CPU. Set `JAX_PLATFORMS=''` to override this behavior and automatically
+  choose an available backend (the original default), or set `JAX_PLATFORMS=cpu`
+  to always use CPU regardless of if the TPU is available.
+* Deprecations
+  * Several test utilities deprecated in JAX v0.3.8 are now removed from
+    {mod}`jax.test_util`.
+
+## jaxlib 0.3.22 (Oct 11, 2022)
+
+## jax 0.3.21 (Sep 30, 2022)
+* [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.20...jax-v0.3.21).
+* Changes
+  * The persistent compilation cache will now warn instead of raising an
+    exception on error ({jax-issue}`#12582`), so program execution can continue
+    if something goes wrong with the cache. Set
+    `JAX_RAISE_PERSISTENT_CACHE_ERRORS=true` to revert this behavior.
+
+## jax 0.3.20 (Sep 28, 2022)
+* Bug fixes:
+  * Adds missing `.pyi` files that were missing from the previous release ({jax-issue}`#12536`).
+  * Fixes an incompatibility between `jax` 0.3.19 and the libtpu version it pinned ({jax-issue}`#12550`). Requires jaxlib 0.3.20.
+  * Fix incorrect `pip` url in `setup.py` comment ({jax-issue}`#12528`).
+
+## jaxlib 0.3.20 (Sep 28, 2022)
+* [GitHub commits](https://github.com/google/jax/compare/jaxlib-v0.3.15...jaxlib-v0.3.20).
+* Bug fixes
+  * Fixes support for limiting the visible CUDA devices via
+   `jax_cuda_visible_devices` in distributed jobs. This functionality is needed for
+   the JAX/SLURM integration on GPU ({jax-issue}`#12533`).
+
+## jax 0.3.19 (Sep 27, 2022)
+* [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.18...jax-v0.3.19).
+* Fixes required jaxlib version.
+
+## jax 0.3.18 (Sep 26, 2022)
+* [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.17...jax-v0.3.18).
 * Changes
   * Ahead-of-time lowering and compilation functionality (tracked in
     {jax-issue}`#7733`) is stable and public. See [the
     overview](https://jax.readthedocs.io/en/latest/aot.html) and the API docs
     for {mod}`jax.stages`.
+  * Introduced {class}`jax.Array`, intended to be used for both `isinstance` checks
+    and type annotations for array types in JAX. Notice that this included some subtle
+    changes to how `isinstance` works for {class}`jax.numpy.ndarray` for jax-internal
+    objects, as {class}`jax.numpy.ndarray` is now a simple alias of {class}`jax.Array`.
 * Breaking changes
   * `jax._src` is no longer imported into the from the public `jax` namespace.
     This may break users that were using JAX internals.
+  * `jax.soft_pmap` has been deleted. Please use `pjit` or `xmap` instead.
+    `jax.soft_pmap` is undocumented. If it were documented, a deprecation period
+    would have been provided.
 
 ## jax 0.3.17 (Aug 31, 2022)
 * [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.16...jax-v0.3.17).
@@ -58,9 +201,6 @@ PLEASE REMEMBER TO CHANGE THE '..main' WITH AN ACTUAL TAG in GITHUB LINK.
   * {func}`jax.checkpoint`, also known as {func}`jax.remat`, has a new
     implementation switched on by default, meaning the old implementation is
     deprecated; see [JEP 11830](https://jax.readthedocs.io/en/latest/jep/11830-new-remat-checkpoint.html).
-
-## jaxlib 0.3.16 (Unreleased)
-* [GitHub commits](https://github.com/google/jax/compare/jaxlib-v0.3.15...main).
 
 ## jax 0.3.15 (July 22, 2022)
 * [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.14...jax-v0.3.15).

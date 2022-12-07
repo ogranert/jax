@@ -1,4 +1,4 @@
-# Copyright 2021 Google LLC
+# Copyright 2021 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,18 +16,19 @@
 import abc
 import asyncio
 import itertools
+import logging
 from functools import partial
 import re
 import threading
-from typing import Callable, Sequence, Optional
-from absl import logging
+from typing import Callable, Sequence, Optional, Dict, Any
 
 import jax
 from jax._src import distributed
 from jax._src.config import config
 from jax.experimental import global_device_array as gda
-from jax.experimental import array
-from jax.experimental import sharding
+from jax._src import array
+from jax._src import sharding
+from jax._src import typing
 from jax.experimental.maps import Mesh
 import jax.numpy as jnp
 import numpy as np
@@ -38,6 +39,8 @@ TS_CONTEXT = ts.Context({'file_io_concurrency': {'limit': 128}})
 _REMOVED_VALUE = 'Value removed'
 _CHECKPOINT_SUCCESS = 'checkpoint_write_success'
 _module_unique_count = itertools.count()
+
+logger = logging.getLogger(__name__)
 
 
 async def create_async_array_from_callback(
@@ -55,10 +58,8 @@ async def create_async_array_from_callback(
 
   dbs = [jax.device_put(array, device)
          for array, device in zip(local_arrays, addressable_da)]
-  aval = jax.ShapedArray(global_shape, dbs[0].dtype)
-  return array.Array(
-      aval, inp_sharding, dbs, committed=True,
-      _fast_path_args=array._ArrayFastPathArgs(device_to_index_map, addressable_da))
+  return array.make_array_from_single_device_arrays(
+      global_shape, inp_sharding, dbs)
 
 
 async def create_async_gda_from_callback(
@@ -88,10 +89,10 @@ def _get_metadata(arr):
     dtype = 'bfloat16'
   else:
     dtype = np.dtype(arr.dtype).str
-  if isinstance(arr, array.Array):
+  if isinstance(arr, array.ArrayImpl):
     local_shape = arr._arrays[0].shape
   else:
-    local_shape = arr.local_data(0).shape
+    local_shape = arr.addressable_data(0).shape
   return {
       'compressor': {
           'id': 'gzip'
@@ -152,9 +153,9 @@ class _LimitInFlightBytes:
 
 
 async def async_serialize(arr_inp, tensorstore_spec, commit_future=None):
-  if (isinstance(arr_inp, array.Array) and jax.process_count() > 1 and
-      arr_inp.is_fully_addressable()):
-    raise ValueError('Passing fully addressable Arrays to a multi-host '
+  if (isinstance(arr_inp, array.ArrayImpl) and jax.process_count() > 1 and
+      arr_inp.is_fully_addressable):
+    raise ValueError('Passing fully addressable Arrays to a multiprocess '
                      'serialization is not allowed.')
   # 'metadata' may not be present at the top level (for example, if we are using
   # a 'cast' driver).
@@ -189,10 +190,10 @@ async def async_serialize(arr_inp, tensorstore_spec, commit_future=None):
       else:
         await write_future.commit
 
-  if isinstance(arr_inp, array.Array):
+  if isinstance(arr_inp, array.ArrayImpl):
     local_shards = arr_inp.addressable_shards
   else:
-    local_shards = arr_inp.local_shards
+    local_shards = arr_inp.addressable_shards
   future_write_state = jax.tree_util.tree_map(_write_array, local_shards)
   return await asyncio.gather(*future_write_state)
 
@@ -234,12 +235,12 @@ def estimate_read_memory_footprint(t: ts.TensorStore) -> int:
   return num_bytes
 
 
-async def async_deserialize(mesh, mesh_axes, tensorstore_spec,
+async def async_deserialize(in_sharding, tensorstore_spec,
                             global_shape=None, dtype=None,
                             byte_limiter: Optional[_LimitInFlightBytes] = None):
   t = await ts.open(ts.Spec(tensorstore_spec), open=True, context=TS_CONTEXT)
   shape = t.shape if global_shape is None else global_shape
-  new_shard_shape = gda.get_shard_shape(tuple(shape), mesh, mesh_axes)
+  new_shard_shape = in_sharding.shard_shape(tuple(shape))
 
   async def cb(index):
     # This maybe needed because the shape the array was saved with is smaller
@@ -268,14 +269,21 @@ async def async_deserialize(mesh, mesh_axes, tensorstore_spec,
     return out
 
   if config.jax_array:
-    inp_sharding = sharding.MeshPspecSharding(mesh, mesh_axes)
-    return await create_async_array_from_callback(tuple(shape), inp_sharding, cb)
+    return await create_async_array_from_callback(tuple(shape), in_sharding, cb)
   else:
-    return await create_async_gda_from_callback(tuple(shape), mesh, mesh_axes, cb)
+    if not isinstance(in_sharding, sharding.NamedSharding):
+      raise ValueError('Deserializing a GlobalDeviceArray is only possible with '
+                       'a `NamedSharding` which consists of a `mesh` and '
+                       f'`pspec`, but got {in_sharding}')
+    return await create_async_gda_from_callback(
+        tuple(shape), in_sharding.mesh, in_sharding.spec, cb)
 
 
-def run_deserialization(global_meshes, mesh_axes, tensorstore_specs,
-                        global_shapes=None, dtypes=None, concurrent_gb=32):
+def run_deserialization(shardings: Sequence[sharding.Sharding],
+                        tensorstore_specs: Sequence[Dict[str, Any]],
+                        global_shapes: Optional[Sequence[array.Shape]] = None,
+                        dtypes: Optional[Sequence[typing.DTypeLike]] = None,
+                        concurrent_gb: int = 32):
   concurrent_bytes = concurrent_gb * 10**9
 
   async def _run_deserializer():
@@ -284,7 +292,7 @@ def run_deserialization(global_meshes, mesh_axes, tensorstore_specs,
 
     future_arrays = jax.tree_util.tree_map(
         partial(async_deserialize, byte_limiter=byte_limiter),
-        global_meshes, mesh_axes, tensorstore_specs,
+        shardings, tensorstore_specs,
         [None] * len(tensorstore_specs) if global_shapes is None else global_shapes,
         [None] * len(tensorstore_specs) if dtypes is None else dtypes)
     return await asyncio.gather(*future_arrays)
@@ -353,8 +361,10 @@ class GlobalAsyncCheckpointManagerBase(metaclass=abc.ABCMeta):
     """Serializes GDAs to TensorStore."""
 
   @abc.abstractmethod
-  def deserialize(self, global_meshes, mesh_axes, tensorstore_specs,
-                  global_shapes=None, dtypes=None):
+  def deserialize(self, shardings: Sequence[sharding.Sharding],
+                  tensorstore_specs: Sequence[Dict[str, Any]],
+                  global_shapes: Optional[Sequence[array.Shape]] = None,
+                  dtypes: Optional[Sequence[typing.DTypeLike]] = None):
     """Deserializes GDAs from TensorStore."""
 
 
@@ -377,7 +387,7 @@ class AsyncManager:
 
   def __del__(self):
     if self._thread is not None and self._thread.is_alive():
-      logging.warning('Please add `.wait_until_finished()` in the main thread '
+      logger.warning('Please add `.wait_until_finished()` in the main thread '
                       'before your program finishes because there is a '
                       'possibility of losing errors raised if the '
                       'this class is deleted before writing is completed.')
@@ -385,20 +395,20 @@ class AsyncManager:
   def _thread_func(self):
     try:
       current_process = jax.process_index()
-      logging.info('Starting commit to storage layer by process: %s',
+      logger.info('Starting commit to storage layer by process: %s',
                    current_process)
       for future in self._commit_futures:
         future.result()
-      logging.info('Finished committing to storage layer by process: %s',
+      logger.info('Finished committing to storage layer by process: %s',
                    current_process)
 
       # All processes will wait at the barrier. When all processes are at the
       # barrier, the barrier will be satisfied. If not, then it will timeout.
       key_for_barrier = _get_key(self._count)
-      logging.info('Key used for barrier is %s for process %s',
+      logger.info('Key used for barrier is %s for process %s',
                    key_for_barrier, current_process)
       self._client.wait_at_barrier(key_for_barrier, self._timeout_in_ms)
-      logging.info('Finished waiting at barrier for process %s',
+      logger.info('Finished waiting at barrier for process %s',
                    current_process)
 
       if current_process == 0:
@@ -463,7 +473,7 @@ class GlobalAsyncCheckpointManager(AsyncManager, GlobalAsyncCheckpointManagerBas
       final_checkpoint_dir: Final checkpoint directory where the checkpoints
         will be moved from `temp_checkpoint_dir`.
     """
-    logging.info('Waiting for previous serialization to finish.')
+    logger.info('Waiting for previous serialization to finish.')
     self.wait_until_finished()
 
     commit_futures = [[] for _ in range(len(tensorstore_specs))]
@@ -481,8 +491,10 @@ class GlobalAsyncCheckpointManager(AsyncManager, GlobalAsyncCheckpointManagerBas
     # has finished writing.
     self._start_async_commit(on_commit_callback)
 
-  def deserialize(self, global_meshes, mesh_axes, tensorstore_specs,
-                  global_shapes=None, dtypes=None):
+  def deserialize(self, shardings: Sequence[sharding.Sharding],
+                  tensorstore_specs: Sequence[Dict[str, Any]],
+                  global_shapes: Optional[Sequence[array.Shape]] = None,
+                  dtypes: Optional[Sequence[typing.DTypeLike]] = None):
     self.wait_until_finished()
-    return run_deserialization(global_meshes, mesh_axes, tensorstore_specs,
+    return run_deserialization(shardings, tensorstore_specs,
                                global_shapes, dtypes)

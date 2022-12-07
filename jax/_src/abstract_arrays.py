@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,23 +31,21 @@ abstract_token = core.abstract_token
 canonicalize_shape = core.canonicalize_shape
 raise_to_shaped = core.raise_to_shaped
 
-
-def make_shaped_array(x):
-  dtype = dtypes.canonicalize_dtype(dtypes.result_type(x))
-  return ShapedArray(np.shape(x), dtype)
-
 def zeros_like_array(x):
   dtype, weak_type = dtypes._lattice_result_type(x)
   dtype = dtypes.canonicalize_dtype(dtype)
   aval = ShapedArray(np.shape(x), dtype, weak_type=weak_type)
   return ad_util.zeros_like_aval(aval)
 
-array_types = {np.ndarray, np.bool_,
-               np.int8, np.int16, np.int32, np.int64,
-               np.uint8, np.uint16, np.uint32, np.uint64,
-               dtypes.bfloat16, np.float16, np.float32, np.float64,
-               np.complex64, np.complex128,
-               np.longlong, np.intc}
+numpy_scalar_types = {
+    np.int8, np.int16, np.int32, np.int64,
+    np.uint8, np.uint16, np.uint32, np.uint64,
+    dtypes.bfloat16, np.float16, np.float32, np.float64,
+    np.complex64, np.complex128,
+    np.bool_, np.longlong, np.intc,
+}
+
+array_types = {np.ndarray} | numpy_scalar_types
 
 def canonical_concrete_aval(val, weak_type=None):
   return ConcreteArray(dtypes.canonicalize_dtype(np.result_type(val)), val,

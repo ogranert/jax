@@ -1,4 +1,4 @@
-# Copyright 2020 Google LLC
+# Copyright 2020 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,7 +24,6 @@ import unittest
 from unittest import skip, SkipTest
 
 from absl.testing import absltest
-from absl.testing import parameterized
 
 import jax
 from jax import ad_checkpoint
@@ -514,12 +513,7 @@ class HostCallbackTapTest(jtu.JaxTestCase):
     self.assertEqual(
         len(local_devices()), len(re.findall(r"112", testing_stream.output)))
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list(
-          dict(
-              testcase_name=f"_with_jit_{with_jit}",
-              with_jit=with_jit)
-          for with_jit in [True, False]))
+  @jtu.sample_product(with_jit=[True, False])
   def test_tap_pytree(self, with_jit=False):
     def func(x, what=""):
       """Returns some pytrees depending on x"""
@@ -551,12 +545,7 @@ class HostCallbackTapTest(jtu.JaxTestCase):
     hcb.barrier_wait()  # Wait for receivers to be done
     self.assertEqual(3, tap_count)
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list(
-          dict(
-              testcase_name=f"_concurrent_{concurrent}",
-              concurrent=concurrent)
-          for concurrent in [True, False]))
+  @jtu.sample_product(concurrent=[True, False])
   def test_tap_multiple(self, concurrent=False):
     """Call id_tap multiple times, concurrently or in sequence. """
     if concurrent and jtu.device_under_test() in ["cpu", "gpu"]:
@@ -628,12 +617,7 @@ class HostCallbackTapTest(jtu.JaxTestCase):
     [t.start() for t in threads]
     [t.join() for t in threads]
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list(
-          dict(
-              testcase_name=f"_with_jit_{with_jit}",
-              with_jit=with_jit)
-          for with_jit in [True, False]))
+  @jtu.sample_product(with_jit=[True, False])
   def test_tap_cond(self, with_jit=False):
     """A conditional"""
 
@@ -663,11 +647,7 @@ class HostCallbackTapTest(jtu.JaxTestCase):
         where: end
         4""", testing_stream.output)
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list(
-          dict(testcase_name=f"_with_jit_{with_jit}",
-               with_jit=with_jit)
-          for with_jit in [True, False]))
+  @jtu.sample_product(with_jit=[True, False])
   def test_tap_while_cond(self, with_jit=False):
     def func(x):
       x1 = hcb.id_print(x, where="1", output_stream=testing_stream)
@@ -741,12 +721,7 @@ class HostCallbackTapTest(jtu.JaxTestCase):
                                  where: 3
                                  3""", testing_stream.output)
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list(
-          dict(
-              testcase_name=f"_with_jit_{with_jit}",
-              with_jit=with_jit)
-          for with_jit in [True, False]))
+  @jtu.sample_product(with_jit=[True, False])
   def test_tap_scan_cond(self, with_jit=True):
     def func(x):
       x1 = hcb.id_print(x, where="1", output_stream=testing_stream)
@@ -767,7 +742,7 @@ class HostCallbackTapTest(jtu.JaxTestCase):
     if with_jit:
       func = jax.jit(func)
     res = func(1)
-    self.assertAllClose(jnp.array([1, 2, 3]), res)
+    self.assertAllClose(jnp.arange(1, 4), res)
     hcb.barrier_wait()
     assertMultiLineStrippedEqual(self, """
         where: 1
@@ -796,15 +771,11 @@ class HostCallbackTapTest(jtu.JaxTestCase):
         [1 2 3]""", testing_stream.output)
     testing_stream.reset()
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list(
-          dict(
-              testcase_name=f"_shape_{shape}_dtype_{np.dtype(dtype).name}_nr_args={nr_args}",
-              shape=shape,
-              dtype=dtype,
-              nr_args=nr_args) for nr_args in [1, 2]
-          for shape in [(), (2,), (2, 3), (2, 3, 4)]
-          for dtype in jtu.dtypes.all))
+  @jtu.sample_product(
+    nr_args=[1, 2],
+    shape=[(), (2,), (2, 3), (2, 3, 4)],
+    dtype=jtu.dtypes.all,
+  )
   def test_tap_jit_dtypes(self, nr_args=2, dtype=jnp.int16, shape=(2,)):
     if dtype in (jnp.complex64, jnp.complex128, jnp.bool_):
       raise SkipTest(f"host_callback not implemented for {dtype}.")
@@ -817,7 +788,7 @@ class HostCallbackTapTest(jtu.JaxTestCase):
     jit_fun1 = jax.jit(lambda xs: hcb.id_print(
         xs,
         a_new_test="************",
-        testcase_name=f"shape_{shape}_dtype_{dtype}_nr_args={nr_args}"))
+        testcase_name=f"{shape=}_{dtype=}_{nr_args=}"))
 
     res = jit_fun1(args)
     self.assertAllClose(args, res, check_dtypes=True)
@@ -1971,13 +1942,11 @@ class HostCallbackTapTest(jtu.JaxTestCase):
       10"""
     self.assertMultiLineStrippedEqual(expected, testing_stream.output)
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list(
-          dict(testcase_name=f"_use_remat={use_remat}_{grad_func}_use_result={use_result}",
-               use_result=use_result, use_remat=use_remat, grad_func=grad_func)
-          for use_result in [True, False]
-          for grad_func in ["grad", "value_and_grad"]
-          for use_remat in ["old", "new", "none"]))
+  @jtu.sample_product(
+    use_result=[True, False],
+    grad_func=["grad", "value_and_grad"],
+    use_remat=["old", "new", "none"],
+  )
   def test_tap_remat(self, use_result=False, grad_func="grad", use_remat="new"):
     if use_remat == "old": raise SkipTest()
 
@@ -2108,11 +2077,9 @@ class HostCallbackCallTest(jtu.JaxTestCase):
         self.assertAllClose(2 * arg, fun(arg))
     self.assertEqual(count[0], 1)
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list(
-          dict(testcase_name=f"_{np.dtype(dtype).name}", dtype=dtype)
-          for dtype in jtu.dtypes.all
-          if dtype != np.bool_))
+  @jtu.sample_product(
+    dtype=[dtype for dtype in jtu.dtypes.all if dtype != np.bool_],
+  )
   def test_call_types(self, dtype=np.float64):
 
     def f_outside(x):
@@ -2404,7 +2371,8 @@ class HostCallbackCallTest(jtu.JaxTestCase):
       # On GPU we get a nice error back to Python
       with self.assertRaisesRegex(
           RuntimeError,
-          "RET_CHECK failure .* Mismatch between infeed source buffer shape s8.12345."):
+          "(.* Mismatch between infeed source buffer shape s8.12345."
+          "|.*The destination shape does not match the source shape.)"):
         thunk()
     elif jtu.device_under_test() == "tpu":
       # On TPU we get no error!!!

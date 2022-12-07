@@ -1,4 +1,4 @@
-# Copyright 2022 Google LLC
+# Copyright 2022 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,27 +13,13 @@
 # limitations under the License.
 """Module for state types."""
 from __future__ import annotations
-from functools import partial
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, List, Optional, Sequence, Set, Union
 
-from jax import api_util
 from jax import core
-from jax import linear_util as lu
-from jax import tree_util
-from jax._src import ad_util
-from jax._src import device_array
-from jax._src import dispatch
-from jax._src import pretty_printer as pp
 from jax._src.lib import xla_bridge, xla_client
-from jax._src.util import (safe_map, safe_zip, split_list, tuple_insert,
-                           tuple_delete, prod)
-from jax.interpreters import ad
-from jax.interpreters import batching
-from jax.interpreters import mlir
-from jax.interpreters import partial_eval as pe
-from jax.interpreters import xla
-import numpy as np
+from jax._src.util import safe_map, safe_zip, tuple_insert, tuple_delete, prod
+from jax._src.lax.control_flow import common
 
 xc = xla_client
 xb = xla_bridge
@@ -48,6 +34,7 @@ Array = Any
 class RefEffect:
   def __init__(self, ref_aval: ShapedArrayRef):
     self.ref_aval = ref_aval
+    common.allowed_effects.add(self)
 
   def __eq__(self, other):
     if not isinstance(other, self.__class__):
@@ -56,6 +43,11 @@ class RefEffect:
 
   def __hash__(self):
     return hash((self.__class__, self.ref_aval))
+
+  def replace(self, *, ref_aval: Optional[ShapedArrayRef] = None):
+    if ref_aval is None:
+      ref_aval = self.ref_aval
+    return self.__class__(ref_aval)
 
 class ReadEffect(RefEffect):
   def __str__(self):
@@ -140,3 +132,10 @@ def _unmap_ref(size, axis_name, axis, aval):
   return ShapedArrayRef(tuple_insert(aval.shape, axis, size), aval.dtype)
 
 core.aval_mapping_handlers[ShapedArrayRef] = (_map_ref, _unmap_ref)
+
+def get_ref_state_effects(
+    avals: Sequence[core.AbstractValue],
+    effects: core.Effects) -> List[Set[StateEffect]]:
+  return [{eff for eff in effects
+           if isinstance(eff, (ReadEffect, WriteEffect, AccumEffect))
+           and eff.ref_aval is aval} for aval in avals]

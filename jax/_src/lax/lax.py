@@ -1060,7 +1060,7 @@ def _get_monoid_reducer(monoid_op: Callable,
   return None
 
 def _get_bitwise_and_identity(dtype: DTypeLike) -> np.ndarray:
-  return np.array(-1, dtype)
+  return np.array(-1).astype(dtype)
 
 def _get_bitwise_or_identity(dtype: DTypeLike) -> np.ndarray:
   return np.array(0, dtype)
@@ -1668,11 +1668,9 @@ def _nary_lower_mhlo(op: Callable, ctx,
   """
   del params
   avals_in, (aval_out,) = ctx.avals_in, ctx.avals_out
-  if config.jax_dynamic_shapes:
-    substitute = partial(_substitute_axis_sizes_in_aval, ctx.axis_size_env)
-    avals_in = map(substitute, avals_in)
-    aval_out = substitute(aval_out)
-  broadcasted_args = broadcast_mhlo(aval_out, avals_in, args)
+  broadcasted_args = mlir.multi_broadcast_in_dim(
+      ctx, args, avals_in, aval_out.shape)
+
   if explicit_type:
     return op(mlir.aval_to_ir_type(aval_out), *broadcasted_args).results
   else:
@@ -1707,10 +1705,10 @@ def _sign_lower_mhlo(ctx, x):
   x_aval, = ctx.avals_in
   if dtypes.issubdtype(x_aval.dtype, np.unsignedinteger):
     return mhlo.SelectOp(
-        mlir.compare_mhlo(x, mlir.full_like_aval(0, x_aval), 'EQ',
+        mlir.compare_mhlo(x, mlir.full_like_aval(ctx, 0, x_aval), 'EQ',
                           'UNSIGNED').result,
-        mlir.full_like_aval(0, x_aval),
-        mlir.full_like_aval(1, x_aval)).results
+        mlir.full_like_aval(ctx, 0, x_aval),
+        mlir.full_like_aval(ctx, 1, x_aval)).results
   return mhlo.SignOp(x).results
 
 mlir.register_lowering(sign_p, _sign_lower_mhlo)
@@ -2262,16 +2260,12 @@ mlir.register_lowering(shift_right_logical_p,
 
 def _compare_lower_mhlo(direction: str, ctx, x, y):
   avals_in, (aval_out,) = ctx.avals_in, ctx.avals_out
-  if config.jax_dynamic_shapes:
-    substitute = partial(_substitute_axis_sizes_in_aval, ctx.axis_size_env)
-    avals_in = map(substitute, avals_in)
-    aval_out = substitute(aval_out)
-  x_aval, y_aval = avals_in
-  x, y = broadcast_mhlo(aval_out.update(dtype=x_aval.dtype), ctx.avals_in,
-                        (x, y))
-  if dtypes.issubdtype(x_aval.dtype, np.inexact):
+  x_dtype = avals_in[0].dtype
+  x, y = mlir.multi_broadcast_in_dim(ctx, (x, y), avals_in, aval_out.shape)
+
+  if dtypes.issubdtype(x_dtype, np.inexact):
     compare_type = "FLOAT"
-  elif dtypes.issubdtype(x_aval.dtype, np.signedinteger):
+  elif dtypes.issubdtype(x_dtype, np.signedinteger):
     compare_type = "SIGNED"
   else:
     compare_type = "UNSIGNED"
@@ -2400,7 +2394,7 @@ def _convert_element_type_lower(ctx, operand, *, new_dtype, weak_type):
       not dtypes.issubdtype(new_dtype, np.complexfloating)):
     operand = mhlo.RealOp(operand).result
     aval_in = aval_in.update(dtype=_real_dtype(aval_in.dtype))
-  return [mlir.convert_mhlo(operand, aval_in, aval_out)]
+  return [mlir.convert_mhlo(ctx, operand, aval_in, aval_out)]
 
 mlir.register_lowering(convert_element_type_p, _convert_element_type_lower)
 
@@ -2906,17 +2900,10 @@ def _broadcast_in_dim_lower(ctx, x, *dyn_shape, shape, broadcast_dimensions):
         ctx, x, *dyn_shape, shape=shape,
         broadcast_dimensions=broadcast_dimensions)
   if dyn_shape:
-    shape = _merge_dyn_shape(shape, dyn_shape)
-    return mhlo.DynamicBroadcastInDimOp(
-        mlir.aval_to_ir_type(aval_out), x,
-        mlir.shape_tensor(shape),
-        mlir.dense_int_elements(broadcast_dimensions),
-    ).results
-  else:
-    return mhlo.BroadcastInDimOp(
-        mlir.aval_to_ir_type(aval_out), x,
-        mlir.dense_int_elements(broadcast_dimensions)
-    ).results
+    aval_out = aval_out.update(shape=_merge_dyn_shape(shape, dyn_shape))
+
+  return [mlir.broadcast_in_dim(ctx, x, aval_out,
+                                broadcast_dimensions=broadcast_dimensions)]
 
 def _broadcast_in_dim_pp_rule(eqn, context, settings):
   # Don't print shape or trivial broadcast_dimensions in params, since it can be
@@ -3229,17 +3216,8 @@ pe.def_trivial_padding(squeeze_p)
 
 def _squeeze_lower(ctx, operand, *, dimensions):
   del dimensions  # Implied by the output aval.
-  aval_out, = ctx.avals_out
-  if config.jax_dynamic_shapes:
-    substitute = partial(_substitute_axis_sizes_in_aval, ctx.axis_size_env)
-    aval_out = substitute(aval_out)
-  if any(isinstance(d, ir.Value) for d in aval_out.shape):
-    return mhlo.DynamicReshapeOp(
-        mlir.aval_to_ir_type(aval_out), operand,
-        mlir.shape_tensor(aval_out.shape),
-    ).results
-  else:
-    return mhlo.ReshapeOp(mlir.aval_to_ir_type(aval_out), operand).results
+  return [mlir.reshape(ctx, operand, ctx.avals_out[0])]
+
 mlir.register_lowering(squeeze_p, _squeeze_lower)
 
 
@@ -3329,13 +3307,8 @@ def _reshape_lower(ctx, x, *dyn_shape, new_sizes, dimensions):
   if dimensions is not None:
     x = mhlo.TransposeOp(x, mlir.dense_int_elements(dimensions)).result
   if dyn_shape:
-    shape = _merge_dyn_shape(new_sizes, dyn_shape)
-    return mhlo.DynamicReshapeOp(
-        mlir.aval_to_ir_type(aval_out), x,
-        mlir.shape_tensor(shape),
-    ).results
-  else:
-    return mhlo.ReshapeOp(mlir.aval_to_ir_type(aval_out), x).results
+    aval_out = aval_out.update(shape=_merge_dyn_shape(new_sizes, dyn_shape))
+  return [mlir.reshape(ctx, x, aval_out)]
 
 def _reshape_staging_rule(
     trace, x, *dyn, new_sizes, dimensions):
@@ -3519,7 +3492,7 @@ def _select_mhlo_lowering(ctx, which, *cases):
       return cases[0]
     mid = len(cases) // 2
     pred = mlir.compare_mhlo(which,
-                             mlir.full_like_aval(offset + mid, which_aval),
+                             mlir.full_like_aval(ctx, offset + mid, which_aval),
                              lt, compare_type)
     return mhlo.SelectOp(pred, _select(offset, cases[:mid]),
                          _select(offset + mid, cases[mid:])).result
@@ -3661,7 +3634,8 @@ def _reduce_lower(ctx, *values, computation, jaxpr, consts, dimensions):
     if jaxpr.effects:
       raise NotImplementedError('Cannot lower effectful `reduce`.')
     out_nodes, _ = mlir.jaxpr_subcomp(reducer_ctx, jaxpr, mlir.TokenSet(), consts,
-                                      *([a] for a in reducer.arguments))
+                                      *([a] for a in reducer.arguments),
+                                      dim_var_values=ctx.dim_var_values)
     mhlo.ReturnOp(util.flatten(out_nodes))
   return op.results
 
@@ -4418,11 +4392,49 @@ mlir.register_lowering(rng_bit_generator_p,
 def _array_copy(arr: ArrayLike) -> Array:
   return copy_p.bind(arr)
 
+
+def _which_dim_sharded(s: PmapSharding) -> Optional[int]:
+  sharded_dim = None
+  for i, s in enumerate(s.sharding_spec.sharding):
+    if isinstance(s, pxla.Unstacked):
+      sharded_dim = i
+      break
+  return sharded_dim
+
+
+def _identity_fn(x): return x
+
+
+def _copy_impl_pmap_sharding(sharded_dim, *args, **kwargs):
+  axis_name, static_broadcasted_tuple, donate_tuple = api._shared_code_pmap(
+    _identity_fn, None, (), (), sharded_dim, sharded_dim)
+  p = api._prepare_pmap(
+      _identity_fn, sharded_dim, sharded_dim, static_broadcasted_tuple,
+      donate_tuple, None, None, args, kwargs)
+  out_flat =  pxla.xla_pmap_impl(
+      p.flat_fun, *p.flat_args, backend=None, axis_name=axis_name,
+      axis_size=p.local_axis_size, global_axis_size=None, devices=p.devices,
+      in_axes=p.in_axes_flat, out_axes_thunk=p.out_axes_thunk,
+      name=p.flat_fun.__name__, donated_invars=p.donated_invars,
+      global_arg_shapes=p.global_arg_shapes_flat)
+  return tree_util.tree_unflatten(p.out_tree(), out_flat)
+
+
+# TODO(https://github.com/google/jax/issues/13552): Look into making this a
+# method on jax.Array so that we can bypass the XLA compilation here.
+def _copy_impl(prim, *args, **kwargs):
+  a, = args
+  if (config.jax_array and isinstance(a, jax.Array) and
+      isinstance(a.sharding, PmapSharding)):
+    sharded_dim = _which_dim_sharded(a.sharding)
+    return _copy_impl_pmap_sharding(sharded_dim, *args, **kwargs)
+  return xla.apply_primitive(prim, *args, **kwargs)
+
 # The copy_p primitive exists for expressing making copies of runtime arrays.
 # For that reason we don't simplify it out of jaxprs (e.g. for jit invariance).
 # It's used in jnp.array(x, copy=True), which is the user-facing API.
 copy_p = core.Primitive('copy')
-copy_p.def_impl(partial(xla.apply_primitive, copy_p))
+copy_p.def_impl(partial(_copy_impl, copy_p))
 copy_p.def_abstract_eval(lambda x: x)
 mlir.register_lowering(copy_p, lambda ctx, x: [x])
 ad.deflinear(copy_p, lambda t: [copy_p.bind(t)])
@@ -4499,7 +4511,9 @@ def _iota_lower(ctx, *dyn_shape, dtype, shape, dimension):
   del dtype
   aval_out, = ctx.avals_out
   if dyn_shape:
-    shape = _merge_dyn_shape(shape, dyn_shape)
+    aval_out = aval_out.update(shape=_merge_dyn_shape(shape, dyn_shape))
+  if not core.is_constant_shape(aval_out.shape):
+    shape = mlir.eval_dynamic_shape(ctx, aval_out.shape)
     return mhlo.DynamicIotaOp(
         mlir.aval_to_ir_type(aval_out),
         mlir.shape_tensor(shape),

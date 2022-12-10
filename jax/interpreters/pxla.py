@@ -944,17 +944,21 @@ _register_handlers_for_sharded_device_array(pmap_lib.ShardedDeviceArray)
 
 ### the xla_pmap primitive and its rules are comparable to xla_call in xla.py
 
-def xla_pmap_impl_lazy(fun: lu.WrappedFun, *args,
-                  backend: Optional[str],
-                  axis_name: core.AxisName,
-                  axis_size: int,
-                  global_axis_size: Optional[int],
-                  devices: Optional[Sequence[Any]],
-                  name: str,
-                  in_axes: Sequence[Optional[int]],
-                  out_axes_thunk: Callable[[], Sequence[Optional[int]]],
-                  donated_invars: Sequence[bool],
-                  global_arg_shapes: Sequence[Optional[Tuple[int, ...]]]):
+
+def xla_pmap_impl_lazy(
+    fun: lu.WrappedFun,
+    *args,
+    backend: Optional[str],
+    axis_name: core.AxisName,
+    axis_size: int,
+    global_axis_size: Optional[int],
+    devices: Optional[Sequence[Any]],
+    name: str,
+    in_axes: Sequence[Optional[int]],
+    out_axes_thunk: Callable[[], Sequence[Optional[int]]],
+    donated_invars: Sequence[bool],
+    global_arg_shapes: Sequence[Optional[Tuple[int, ...]]],
+):
   if (config.jax_disable_jit and config.jax_eager_pmap and
       global_axis_size is None and not any(d for d in donated_invars) and
       not all(g is not None for g in global_arg_shapes)):
@@ -2235,7 +2239,7 @@ def _mhlo_shard(aval, axis_env, xs, in_axis):
 
 
 # TODO(b/110096942): more efficient gather
-def _mhlo_unshard(aval, axis_env, out_axis, xs, platform):
+def _mhlo_unshard(ctx: mlir.LoweringRuleContext, aval, axis_env, out_axis, xs, platform):
   if aval is core.abstract_token:
     return xs
   elif isinstance(aval, core.ShapedArray):
@@ -2249,7 +2253,7 @@ def _mhlo_unshard(aval, axis_env, out_axis, xs, platform):
 
     dims = list(aval.shape)
     padded_aval = aval.update(shape=[axis_env.sizes[-1]] + dims)
-    padded = mlir.full_like_aval(0, padded_aval)
+    padded = mlir.full_like_aval(ctx, 0, padded_aval)
     zero = mlir.ir_constant(np.zeros((), dtype=np.uint32))
     idxs = [_unravel_index_mhlo(axis_env)] + [zero] * len(dims)
     broadcast_result = mhlo.BroadcastOp(
@@ -2270,7 +2274,7 @@ def _mhlo_unshard(aval, axis_env, out_axis, xs, platform):
 
     # TODO(mattjj): remove this logic when AllReduce PRED supported on CPU / GPU
     if convert_bool:
-      float_zero = mlir.full_like_aval(0, padded_aval)
+      float_zero = mlir.full_like_aval(ctx, 0, padded_aval)
       out = mhlo.CompareOp(
           out,
           float_zero,
@@ -2308,9 +2312,10 @@ def _pmap_lowering(ctx, *in_nodes, axis_name,
         name_stack=xla.extend_name_stack(ctx.module_context.name_stack,
                                          util.wrap_name(name, 'pmap')))
     sharded_outs, _ = mlir.jaxpr_subcomp(sub_ctx, call_jaxpr, mlir.TokenSet(), (),
-                                         *in_nodes_sharded)
+                                         *in_nodes_sharded,
+                                         dim_var_values=ctx.dim_var_values)
   out_avals = [v.aval for v in call_jaxpr.outvars]
-  outs = [_mhlo_unshard(aval, new_env, out_axis, shard,
+  outs = [_mhlo_unshard(ctx, aval, new_env, out_axis, shard,
                         platform=ctx.module_context.platform)
           for aval, out_axis, shard in zip(out_avals, out_axes, sharded_outs)]
   return outs
@@ -2472,8 +2477,8 @@ class Mesh(ContextDecorator):
 
   def __repr__(self):
     if self.empty:
-      return "Mesh([], ())"
-    return f"Mesh({self.device_ids!r}, {self.axis_names!r})"
+      return "Mesh(device_ids=[], axis_names=())"
+    return f"Mesh(device_ids={self.device_ids!r}, axis_names={self.axis_names!r})"
 
   @cached_property
   def local_devices(self):

@@ -6,7 +6,12 @@ Best viewed [here](https://jax.readthedocs.io/en/latest/changelog.html).
 Remember to align the itemized text with the first line of an item within a list.
 -->
 
-## jax 0.4.0
+## jax 0.4.2
+
+## jaxlib 0.4.2
+
+## jax 0.4.1 (Dec 13, 2022)
+
 * Changes
   * Support for Python 3.7 has been dropped, in accordance with JAX's
     {ref}`version-support-policy`.
@@ -18,13 +23,14 @@ Remember to align the itemized text with the first line of an item within a list
     breaking change to the `pjit` API.  The [jax.Array migration
     guide](https://jax.readthedocs.io/en/latest/jax_array_migration.html) can
     help you migrate your codebase to `jax.Array`. You can also look at the
-    [Parallelism with
-    JAX](https://jax.readthedocs.io/en/latest/notebooks/Parallelism_with_JAX.html)
+    [Distributed arrays and automatic parallelization](https://jax.readthedocs.io/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html)
     tutorial to understand the new concepts.
   * `PartitionSpec` and `Mesh` are now out of experimental. The new API endpoints
     are `jax.sharding.PartitionSpec` and `jax.sharding.Mesh`.
     `jax.experimental.maps.Mesh` and `jax.experimental.PartitionSpec` are
     deprecated and will be removed in 3 months.
+  * `with_sharding_constraint`s new public endpoint is
+    `jax.lax.with_sharding_constraint`.
   * If using ABSL flags together with `jax.config`, the ABSL flag values are no
     longer read or written after the JAX configuration options are initially
     populated from the ABSL flags. This change improves performance of reading
@@ -38,7 +44,8 @@ Remember to align the itemized text with the first line of an item within a list
     It will be removed in a future release, in accordance with the {ref}`api-compatibility`
     policy. It can be replaced with `jnp.sort(a, axis=0)`.
 
-## jaxlib 0.4.0
+## jaxlib 0.4.1 (Dec 13, 2022)
+
 * Changes
   * Support for Python 3.7 has been dropped, in accordance with JAX's
     {ref}`version-support-policy`.
@@ -50,6 +57,13 @@ Remember to align the itemized text with the first line of an item within a list
   * The deprecated method `.block_host_until_ready()` has been removed. Use
     `.block_until_ready()` instead.
 
+## jax 0.4.0 (Dec 12, 2022)
+
+* The release was yanked.
+
+## jaxlib 0.4.0 (Dec 12, 2022)
+
+* The release was yanked.
 
 ## jax 0.3.25 (Nov 15, 2022)
 * Changes

@@ -20,7 +20,6 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 import collections
 import functools
 from functools import partial
-import logging
 import operator
 import re
 
@@ -29,12 +28,11 @@ from jax import core
 from jax.experimental import jax2tf
 from jax.experimental.jax2tf import shape_poly
 from jax import lax
-from jax import linear_util as lu
 import jax.numpy as jnp
+from jax import random
 from jax._src import test_util as jtu
 from jax._src.lax import lax as lax_internal
 from jax._src.lax import control_flow as lax_control_flow
-from jax._src import util
 import numpy as np
 
 from jax.experimental.jax2tf.tests import tf_test_util
@@ -723,6 +721,70 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
         input_signature=[tf.TensorSpec([None, None])],
         polymorphic_shapes=["w, h"])
 
+  def test_non_trivial_polynomials(self):
+    if config.jax_dynamic_shapes:
+      raise unittest.SkipTest("--jax_dynamic_shapes supports only trivial polynomials")
+    # We can handle non-trivial polynomials in the input shape,
+    # as long as all variables also occur in trivial polynoamials
+    self.CheckShapePolymorphism(
+        lambda x, y: x + y.reshape((-1,)),
+        input_signature=[tf.TensorSpec([None]), tf.TensorSpec([None, None])],
+        polymorphic_shapes=["b * b", "b, b"])
+
+  def test_unused_args(self):
+    # Tests with functions that do not use their inputs.
+
+    # First arg unused, not polymorphic
+    self.CheckShapePolymorphism(
+        lambda x_unused, y: y * 2.0,
+        input_signature=[tf.TensorSpec([]), tf.TensorSpec([None])],
+        polymorphic_shapes=[None, "b"])
+
+    # Some args unused, not polymorphic
+    self.CheckShapePolymorphism(
+        lambda x_unused, y, z_unused, w: jnp.concatenate([y, w]),
+        input_signature=[tf.TensorSpec([]), tf.TensorSpec([None]),
+                         tf.TensorSpec([]), tf.TensorSpec([None])],
+        polymorphic_shapes=[None, "b1", None, "b2"])
+
+    # A polymorphic arg is not used, but the dimension var appears
+    # in a used arg also
+    self.CheckShapePolymorphism(
+        lambda x_unused, y: y * 2.0,
+        input_signature=[tf.TensorSpec([None]), tf.TensorSpec([None])],
+        polymorphic_shapes=["b", "b"])
+
+    # A polymorphic arg is not used, and the dimension var does not appear
+    # elsewhere.
+    if config.jax2tf_default_experimental_native_lowering:
+      with self.assertRaisesRegex(ValueError,
+                                  "The following dimension variables cannot be computed"):
+        self.CheckShapePolymorphism(
+            lambda x_unused, y: y * 2.0,
+            input_signature=[tf.TensorSpec([None]), tf.TensorSpec([None])],
+            polymorphic_shapes=["b1", "b2"])
+    else:
+      self.CheckShapePolymorphism(
+          lambda x_unused, y: y * 2.0,
+          input_signature=[tf.TensorSpec([None]), tf.TensorSpec([None])],
+          polymorphic_shapes=["b1", "b2"])
+
+    # A polymorphic arg is not used, and the dimension var does appear
+    # elsewhere but not as a trivial monomial.
+    if config.jax2tf_default_experimental_native_lowering:
+      with self.assertRaisesRegex(ValueError,
+                                  "The following dimension variables cannot be computed"):
+        self.CheckShapePolymorphism(
+            lambda x_unused, y: y * 2.0,
+            input_signature=[tf.TensorSpec([None]), tf.TensorSpec([None])],
+            polymorphic_shapes=["b1", "b1 * b1"])
+    else:
+      self.CheckShapePolymorphism(
+          lambda x_unused, y: y * 2.0,
+          input_signature=[tf.TensorSpec([None]), tf.TensorSpec([None])],
+          polymorphic_shapes=["b1", "b1 * b1"])
+
+
   def test_with_custom_vjp(self):
     """Shape-polymorphic custom VJP."""
 
@@ -894,6 +956,30 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
     self.assertAllClose(g_tf[0][1], (xi * 2).astype(yf.dtype))
     self.assertAllClose(g_tf[1], np.zeros_like(zb))
 
+  def test_prng(self):
+    # The PRNG implementation uses opaque types, test shape polymorphism
+    try:
+      prev_custom_prng = config.jax_enable_custom_prng
+      config.update("jax_enable_custom_prng", True)
+
+      def f_jax(x):  # x: f32[b1, b2]
+        key = random.PRNGKey(123)  #  key
+        # Exercise key operations that have custom lowering rules
+        broadcast_keys = lax.broadcast_in_dim(key, x.shape, ())  # key[b1, b2]
+        gather_keys = lax.broadcast_in_dim(broadcast_keys[0], (1, x.shape[1]), (1,))  # : key[1, b2]
+        slice_keys1 = lax.slice(broadcast_keys, (0, 0), (1, x.shape[1]), (1, 1))  # key[1, b2]
+        slice_keys2 = lax.dynamic_slice(broadcast_keys, (0, 0), slice_sizes=(1, x.shape[1]))  # key[1, b2]
+        upd1 = lax.dynamic_update_slice(slice_keys2, slice_keys1, start_indices=(0, 0))  # key[1, b2]
+        _ = lax.dynamic_update_slice(upd1, gather_keys, start_indices=(0, 0))
+        return x
+
+      self.CheckShapePolymorphism(f_jax,
+                                  input_signature=[tf.TensorSpec([None, None], dtype=tf.float32)],
+                                  polymorphic_shapes=["b1, b2"])
+    finally:
+      config.update("jax_enable_custom_prng", prev_custom_prng)
+
+
   def test_saved_model(self):
     f_jax = jnp.sin
     f_tf = jax2tf.convert(f_jax, polymorphic_shapes=["(b, ...)"])
@@ -1041,6 +1127,11 @@ class ShapePolyTest(tf_test_util.JaxToTfTestCase):
     f_tf = tf.function(
         jax2tf.convert(f_jax, polymorphic_shapes=["b, b"])).get_concrete_function(tf.TensorSpec([None, None], dtype=np.float32))
     self.assertEqual(1, f_tf(x45))
+
+    x = np.ones((5,), dtype=np.float32)
+    with self.assertRaisesRegex(ValueError,
+                                "Cannot solve for values of dimension variables"):
+      jax2tf.convert(lambda x: x, polymorphic_shapes=["a + b"])(x)
 
 
 class DimAsValueTest(tf_test_util.JaxToTfTestCase):
@@ -2113,7 +2204,7 @@ class ShapePolyVmapPrimitivesTest(tf_test_util.JaxToTfTestCase):
   # to parameterized below.
   @primitive_harness.parameterized(
       _flatten_harnesses(_POLY_SHAPE_VMAP_TEST_HARNESSES),
-      #one_containing="gather_from_slicing_name=[0,1]_enable_xla=True_poly_axes=[0]"
+      one_containing=""
   )
   def test_vmap_prim(self, harness: Harness):
     return _test_one_harness(self, harness)

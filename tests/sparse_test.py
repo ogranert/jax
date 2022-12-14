@@ -151,7 +151,7 @@ class cuSparseTest(sptu.SparseTestCase):
       return self.assertWarns(sparse.CuSparseEfficiencyWarning)
     return contextlib.nullcontext()
 
-  def gpu_matmul_warning_context(self, dtype):
+  def gpu_matmul_dtype_warning_context(self, dtype):
     if jtu.device_under_test() == "gpu" and dtype not in [np.float32, np.float64, np.complex64, np.complex128]:
       return self.assertWarns(sparse.CuSparseEfficiencyWarning)
     return contextlib.nullcontext()
@@ -318,7 +318,7 @@ class cuSparseTest(sptu.SparseTestCase):
     matvec = lambda *args: sparse.csr_matvec(*args, shape=M.shape, transpose=transpose)
 
     self.assertAllClose(op(M) @ v, matvec(*args), rtol=MATMUL_TOL)
-    with self.gpu_matmul_warning_context(dtype):
+    with self.gpu_matmul_dtype_warning_context(dtype):
       self.assertAllClose(op(M) @ v, jit(matvec)(*args), rtol=MATMUL_TOL)
 
   @jtu.sample_product(
@@ -338,7 +338,7 @@ class cuSparseTest(sptu.SparseTestCase):
     matmat = lambda *args: sparse.csr_matmat(*args, shape=shape, transpose=transpose)
 
     self.assertAllClose(op(M) @ B, matmat(*args), rtol=MATMUL_TOL)
-    with self.gpu_matmul_warning_context(dtype):
+    with self.gpu_matmul_dtype_warning_context(dtype):
       self.assertAllClose(op(M) @ B, jit(matmat)(*args), rtol=MATMUL_TOL)
 
   @jtu.sample_product(
@@ -397,7 +397,7 @@ class cuSparseTest(sptu.SparseTestCase):
     matvec = lambda *args: sparse_coo._coo_matvec(*args, spinfo=sparse_coo.COOInfo(shape=M.shape, rows_sorted=True), transpose=transpose)
 
     self.assertAllClose(op(M) @ v, matvec(*args), rtol=MATMUL_TOL)
-    with self.gpu_matmul_warning_context(dtype):
+    with self.gpu_matmul_dtype_warning_context(dtype):
       self.assertAllClose(op(M) @ v, jit(matvec)(*args), rtol=MATMUL_TOL)
 
   @jtu.sample_product(
@@ -418,7 +418,7 @@ class cuSparseTest(sptu.SparseTestCase):
     matmat = lambda *args: sparse_coo._coo_matmat(*args, spinfo=sparse_coo.COOInfo(shape=shape, rows_sorted=True), transpose=transpose)
 
     self.assertAllClose(op(M) @ B, matmat(*args), rtol=MATMUL_TOL)
-    with self.gpu_matmul_warning_context(dtype):
+    with self.gpu_matmul_dtype_warning_context(dtype):
       self.assertAllClose(op(M) @ B, jit(matmat)(*args), rtol=MATMUL_TOL)
 
   def test_coo_matmat_layout(self):
@@ -654,28 +654,10 @@ class cuSparseTest(sptu.SparseTestCase):
 
 class BCOOTest(sptu.SparseTestCase):
 
-  def test_vmappable(self):
-    """Test does not depend on batching rules of BCOO primitives."""
-    M = jnp.arange(9).reshape((3, 3))
-
-    def fromdense_1d(x):
-      assert x.ndim == 1
-      ind = jnp.where(x != 0, size=3)[0]
-      val = x[ind]
-      return sparse.BCOO((val, ind[:, None]), shape=x.shape)
-
-    with self.subTest('_bcoo_from_elt'):
-      self.assertEqual(M.shape, vmap(fromdense_1d)(M).shape)
-
-    def todense_1d(bcoo_mat):
-      assert bcoo_mat.ndim == 1
-      assert bcoo_mat.n_sparse == 1
-      x = jnp.empty(bcoo_mat.shape, dtype=bcoo_mat.dtype)
-      return x.at[bcoo_mat.indices.ravel()].set(bcoo_mat.data)
-
-    with self.subTest('_bcoo_to_elt'):
-      bcoo_mat = sparse.BCOO.fromdense(M, n_batch=1)
-      self.assertEqual(bcoo_mat.shape, vmap(todense_1d)(bcoo_mat).shape)
+  def gpu_matmul_warning_context(self, msg):
+    if GPU_LOWERING_ENABLED and config.jax_bcoo_cusparse_lowering:
+      return self.assertWarnsRegex(sparse.CuSparseEfficiencyWarning, msg)
+    return contextlib.nullcontext()
 
   def test_repr(self):
     x = sparse.BCOO.fromdense(jnp.arange(5, dtype='float32'))
@@ -687,7 +669,8 @@ class BCOOTest(sptu.SparseTestCase):
     y = sparse.BCOO.fromdense(jnp.arange(6, dtype='float32').reshape(2, 3), n_batch=1, n_dense=1)
     self.assertEqual(repr(y), "BCOO(float32[2, 3], nse=1, n_batch=1, n_dense=1)")
 
-    M_invalid = sparse.BCOO(([], []), shape=(100,))
+    M_invalid = sparse.BCOO.fromdense(jnp.arange(6, dtype='float32').reshape(2, 3))
+    M_invalid.indices = jnp.array([])
     self.assertEqual(repr(M_invalid), "BCOO(<invalid>)")
 
     @jit
@@ -1166,10 +1149,8 @@ class BCOOTest(sptu.SparseTestCase):
     else:
       lhs_bcoo, lhs, rhs = args_maker()
       matmat_expected = f_dense(lhs_bcoo, lhs, rhs)
-      with self.assertWarnsRegex(
-          sparse.CuSparseEfficiencyWarning,
-          "bcoo_dot_general GPU lowering currently does not support this "
-          "batch-mode computation.*"):
+      with self.gpu_matmul_warning_context(
+          "bcoo_dot_general GPU lowering currently does not support this batch-mode computation.*"):
         matmat_default_lowering_fallback = jit(f_sparse)(lhs_bcoo, lhs, rhs)
       self.assertAllClose(matmat_expected, matmat_default_lowering_fallback,
                           atol=1E-6, rtol=1E-6)
@@ -1204,13 +1185,9 @@ class BCOOTest(sptu.SparseTestCase):
     sp_matmat = jit(partial(sparse_bcoo.bcoo_dot_general,
                             dimension_numbers=dimension_numbers))
 
-    if config.jax_bcoo_cusparse_lowering:
-      with self.assertWarnsRegex(
-          sparse.CuSparseEfficiencyWarning,
-          "bcoo_dot_general GPU lowering currently does not support this "
-          "batch-mode computation.*"):
-        matmat_default_lowering_fallback = sp_matmat(lhs_bcoo, rhs)
-
+    with self.gpu_matmul_warning_context(
+        "bcoo_dot_general GPU lowering currently does not support this batch-mode computation.*"):
+      matmat_default_lowering_fallback = sp_matmat(lhs_bcoo, rhs)
     self.assertArraysEqual(matmat_expected, matmat_default_lowering_fallback)
 
   @unittest.skipIf(not GPU_LOWERING_ENABLED, "test requires cusparse/hipsparse")
@@ -1236,14 +1213,11 @@ class BCOOTest(sptu.SparseTestCase):
 
     matmat_expected = lax.dot_general(lhs_mat_dense, rhs,
                                       dimension_numbers=dimension_numbers_2d)
-    if config.jax_bcoo_cusparse_lowering:
-      with self.assertWarnsRegex(
-          sparse.CuSparseEfficiencyWarning,
+    with self.subTest(msg="2D"):
+      with self.gpu_matmul_warning_context(
           "bcoo_dot_general GPU lowering requires matrices with sorted indices*"):
         matmat_unsorted_fallback = sp_matmat(lhs_mat_bcoo_unsorted, rhs)
-
-      with self.subTest(msg="2D"):
-        self.assertArraysEqual(matmat_expected, matmat_unsorted_fallback)
+      self.assertArraysEqual(matmat_expected, matmat_unsorted_fallback)
 
     lhs_vec_dense = jnp.array([0, 1, 0, 2, 0], dtype=jnp.float32)
     lhs_vec_bcoo = sparse.BCOO.fromdense(lhs_vec_dense, nse=5)
@@ -1260,14 +1234,11 @@ class BCOOTest(sptu.SparseTestCase):
     vecmat_expected = lax.dot_general(lhs_vec_dense, rhs,
                                       dimension_numbers=dimension_numbers_1d)
 
-    if config.jax_bcoo_cusparse_lowering:
-      with self.assertWarnsRegex(
-          sparse.CuSparseEfficiencyWarning,
+    with self.subTest(msg="1D"):
+      with self.gpu_matmul_warning_context(
           "bcoo_dot_general GPU lowering requires matrices with sorted indices*"):
         vecmat_unsorted_fallback = sp_vecmat(lhs_vec_bcoo_unsorted, rhs)
-
-      with self.subTest(msg="1D"):
-        self.assertArraysEqual(vecmat_expected, vecmat_unsorted_fallback)
+      self.assertArraysEqual(vecmat_expected, vecmat_unsorted_fallback)
 
   @jtu.sample_product(
     props=_generate_bcoo_dot_general_properties(
@@ -2298,32 +2269,6 @@ class BCOOTest(sptu.SparseTestCase):
 
 # TODO(tianjianlu): Unify the testing for BCOOTest and BCSRTest.
 class BCSRTest(sptu.SparseTestCase):
-  def test_vmappable(self):
-    """Test does not depend on batching rules of BCSR primitives."""
-    M = jnp.arange(36).reshape((4, 3, 3))
-
-    def fromdense_2d(x):
-      assert x.ndim == 2
-      row, col = jnp.where(x != 0, size=3)
-      val = x[row, col]
-      indices = col
-      indptr = jnp.zeros(x.shape[0] + 1, dtype=int).at[1:].set(
-        jnp.cumsum(jnp.bincount(row, length=x.shape[0])))
-      return sparse.BCSR((val, indices, indptr), shape=x.shape)
-
-    with self.subTest('_bcsr_from_elt'):
-      self.assertEqual(M.shape, vmap(fromdense_2d)(M).shape)
-
-    def todense_2d(bcsr_mat):
-      assert bcsr_mat.ndim == 2
-      assert bcsr_mat.n_sparse == 2
-      x = jnp.empty(bcsr_mat.shape, dtype=bcsr_mat.dtype)
-      row, col = sparse_util._csr_to_coo(bcsr_mat.indices, bcsr_mat.indptr)
-      return x.at[row, col].set(bcsr_mat.data)
-
-    with self.subTest('_bcsr_to_elt'):
-      bcsr_mat = sparse.BCSR.fromdense(M, n_batch=1)
-      self.assertEqual(bcsr_mat.shape, vmap(todense_2d)(bcsr_mat).shape)
 
   @jtu.sample_product(
     [dict(shape=shape, n_batch=n_batch)
@@ -2455,6 +2400,44 @@ class SparseObjectTest(sptu.SparseTestCase):
     self.assertEqual(M.dtype, M_out.dtype)
     self.assertEqual(M.shape, M_out.shape)
     self.assertEqual(M.nse, M_out.nse)
+
+  @parameterized.named_parameters(
+    {"testcase_name": f"_{cls.__name__}", "cls": cls}
+    for cls in [sparse.BCOO, sparse.BCSR])
+  def test_vmappable(self, cls):
+    # Note: test should avoid dependence on batching rules of BCOO/BCSR primitives
+    M = jnp.arange(24).reshape((2, 3, 4))
+    Msp = cls.fromdense(M, n_batch=1)
+
+    def from_elt(x):
+      assert x.ndim == 2
+      return sparse.empty(x.shape, x.dtype, sparse_format=cls.__name__.lower())
+
+    with self.subTest('from_elt'):
+      M_out = vmap(from_elt)(M)
+      self.assertIsInstance(M_out, cls)
+      self.assertEqual(M_out.n_batch, 1)
+      self.assertEqual(M.shape, M_out.shape)
+
+    def to_elt(x):
+      assert x.ndim == 2
+      assert x.n_sparse == 2
+      return jnp.empty(x.shape, x.dtype)
+
+    with self.subTest('to_elt'):
+      M_out = vmap(to_elt)(Msp)
+      self.assertIsInstance(M_out, jnp.ndarray)
+      self.assertEqual(Msp.shape, M_out.shape)
+
+    with self.subTest('axis_None'):
+      x, y = vmap(lambda *args: args, in_axes=(0, None), out_axes=(0, None))(Msp, Msp)
+      self.assertIsInstance(x, cls)
+      self.assertEqual(x.n_batch, 1)
+      self.assertEqual(x.shape, Msp.shape)
+
+      self.assertIsInstance(y, cls)
+      self.assertEqual(y.n_batch, 1)
+      self.assertEqual(y.shape, Msp.shape)
 
   @parameterized.named_parameters(
     {"testcase_name": f"_{cls.__name__}", "cls": cls}

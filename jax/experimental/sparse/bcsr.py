@@ -25,7 +25,7 @@ from jax import core
 from jax import tree_util
 from jax.experimental.sparse._base import JAXSparse
 from jax.experimental.sparse import bcoo
-from jax.experimental.sparse.util import _broadcasting_vmap, _count_stored_elements, _csr_to_coo, _safe_asarray
+from jax.experimental.sparse.util import _broadcasting_vmap, _count_stored_elements, _csr_to_coo
 import jax.numpy as jnp
 from jax.util import split_list, safe_zip
 from jax.interpreters import batching
@@ -320,8 +320,9 @@ class BCSR(JAXSparse):
   def __init__(self, args, *, shape):
     # JAX transforms will sometimes instantiate pytrees with null values, so we
     # must catch that in the initialization of inputs.
-    self.data, self.indices, self.indptr = _safe_asarray(args)
+    self.data, self.indices, self.indptr = map(jnp.asarray, args)
     super().__init__(args, shape=shape)
+    _validate_bcsr(self.data, self.indices, self.indptr, self.shape)
 
   def __repr__(self):
     name = self.__class__.__name__
@@ -347,6 +348,15 @@ class BCSR(JAXSparse):
 
   def tree_flatten(self):
     return (self.data, self.indices, self.indptr), {'shape': self.shape}
+
+  @classmethod
+  def tree_unflatten(cls, aux_data, children):
+    obj = object.__new__(cls)
+    obj.data, obj.indices, obj.indptr = children
+    if aux_data.keys() != {'shape'}:
+      raise ValueError(f"BCSR.tree_unflatten: invalid {aux_data=}")
+    obj.__dict__.update(**aux_data)
+    return obj
 
   @classmethod
   def _empty(cls, shape, *, dtype=None, index_dtype='int32', n_dense=0,
@@ -408,6 +418,8 @@ def _bcsr_to_elt(cont, _, val, axis):
 
 
 def _bcsr_from_elt(cont, axis_size, elt, axis):
+  if axis is None:
+    return elt
   if axis > elt.n_batch:
     raise ValueError(f"BCSR: cannot add out_axis={axis} for BCSR array with "
                      f"n_batch={elt.n_batch}. BCSR batch axes must be a "

@@ -14,7 +14,6 @@
 
 from functools import partial
 import inspect
-import unittest
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -24,7 +23,6 @@ from jax import dtypes
 from jax._src import lib as jaxlib
 from jax import numpy as jnp
 from jax._src import test_util as jtu
-from jax._src.lib import xla_extension_version
 from jax.config import config
 import numpy as np
 
@@ -40,6 +38,16 @@ class JaxJitTest(jtu.JaxTestCase):
     self.assertTrue(
         jaxlib.jax_jit._is_float0(np.zeros((5, 5), dtype=jax.float0)))
     self.assertFalse(jaxlib.jax_jit._is_float0(np.zeros((5, 5))))
+
+  @parameterized.parameters([jax.device_put, _cpp_device_put])
+  def test_device_put_on_numpy_masked_array(self, device_put_function):
+    # TODO(jakevdp): add appropriate logic to jaxlib device_put and update this test.
+    if device_put_function is _cpp_device_put:
+      self.skipTest("cpp device_put does not yet reject masked arrays.")
+    device = jax.devices()[0]
+    value = np.ma.array([1, 2, 3], mask=[True, False, True])
+    with self.assertRaisesRegex(ValueError, "numpy masked arrays are not supported"):
+      device_put_function(value, device=device)
 
   @parameterized.parameters([jax.device_put, _cpp_device_put])
   def test_device_put_on_numpy_scalars(self, device_put_function):
@@ -71,7 +79,6 @@ class JaxJitTest(jtu.JaxTestCase):
                                                             dtype=dtype))
 
   @parameterized.parameters([jax.device_put, _cpp_device_put])
-  @unittest.skipIf(xla_extension_version < 99, "C++ jax.Array is not available")
   def test_device_put_on_buffers(self, device_put_function):
     device = jax.devices()[0]
     jitted_f = jax.jit(lambda x: x + 1)
@@ -86,7 +93,6 @@ class JaxJitTest(jtu.JaxTestCase):
       np.testing.assert_array_equal(output_buffer, np.array(value + 1))
 
   @parameterized.parameters([jax.device_put, _cpp_device_put])
-  @unittest.skipIf(xla_extension_version < 99, "C++ jax.Array is not available")
   def test_device_put_on_sharded_device_array(self, device_put_function):
     device = jax.devices()[0]
 

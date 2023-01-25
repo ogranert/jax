@@ -53,6 +53,7 @@ from jax._src.api_util import _ensure_index_tuple
 from jax._src.lax.lax import (_array_copy, _sort_lt_comparator,
                               _sort_le_comparator, PrecisionLike)
 from jax._src.lax import lax as lax_internal
+from jax._src.lib import xla_client
 from jax._src.numpy.ndarray import ndarray
 from jax._src.numpy.reductions import (  # noqa: F401
   _ensure_optional_axes, _reduction_dims,
@@ -189,6 +190,9 @@ int8 = _make_scalar_type(np.int8)
 int16 = _make_scalar_type(np.int16)
 int32 = _make_scalar_type(np.int32)
 int64 = _make_scalar_type(np.int64)
+if xla_client._version >= 117:
+  float8_e4m3fn = _make_scalar_type(dtypes.float8_e4m3fn)
+  float8_e5m2 = _make_scalar_type(dtypes.float8_e5m2)
 bfloat16 = _make_scalar_type(dtypes.bfloat16)
 float16 = _make_scalar_type(np.float16)
 float32 = single = _make_scalar_type(np.float32)
@@ -908,6 +912,9 @@ def squeeze(a: ArrayLike, axis: Optional[Union[int, Tuple[int, ...]]] = None) ->
 def _squeeze(a: Array, axis: Tuple[int]) -> Array:
   if axis is None:
     a_shape = shape(a)
+    if not core.is_constant_shape(a_shape):
+      # We do not even know the rank of the output if the input shape is not known
+      raise ValueError("jnp.squeeze with axis=None is not supported with shape polymorphism")
     axis = tuple(i for i, d in enumerate(a_shape) if d == 1)
   return lax.squeeze(a, axis)
 
@@ -1190,13 +1197,13 @@ def _split(op: str, ary: ArrayLike, indices_or_sections: Union[int, ArrayLike],
                                                  f"in jax.numpy.{op} argument 1")
     part_size, r = _divmod(size, indices_or_sections)  # type: ignore[misc]
     if r == 0:
-      split_indices = np.arange(indices_or_sections + 1,
-                                dtype=np.int64) * part_size
+      split_indices = [np.int64(i) * part_size  # type: ignore
+                       for i in range(indices_or_sections + 1)]  # type: ignore
     elif op == "array_split":
-      split_indices = np.concatenate(
-          [np.arange(r + 1, dtype=np.int64) * (part_size + 1),
-           np.arange(indices_or_sections - r, dtype=np.int64) * part_size
-           + ((r + 1) * (part_size + 1) - 1)])
+      split_indices = (
+        [np.int64(i) * (part_size + 1) for i in range(r + 1)] +  # type: ignore
+        [np.int64(i) * part_size + ((r + 1) * (part_size + 1) - 1)
+         for i in range(indices_or_sections - r)])
     else:
       raise ValueError("array split does not result in an equal division")
   starts, ends = [0] * ndim(ary), shape(ary)
@@ -1395,27 +1402,41 @@ PadStatFunc = Callable[..., Array]
 
 
 def _broadcast_to_pairs(nvals: PadValueLike, nd: int, name: str) -> PadValue:
-  nvals = np.asarray(tree_map(
-    lambda x: core.concrete_or_error(None, x, context=f"{name} argument of jnp.pad"),
-    nvals))
-  if nvals.dtype.kind == 'O':
-    raise TypeError(f'`{name}` entries must be the same shape.')
+  try:
+    nvals = np.asarray(tree_map(
+      lambda x: core.concrete_or_error(None, x, context=f"{name} argument of jnp.pad"),
+      nvals))
+  except ValueError as e:
+    # In numpy 1.24
+    if "array has an inhomogeneous shape" in str(e):
+      raise TypeError(f'`{name}` entries must be the same shape: {nvals}') from e
+    raise
+
+  def as_scalar_dim(v):
+    if core.is_special_dim_size(v) or not np.shape(v):
+      return v
+    else:
+      raise TypeError(f'`{name}` entries must be the same shape: {nvals}')
 
   if nvals.shape == (nd, 2):
     # ((before_1, after_1), ..., (before_N, after_N))
-    return tuple((nval[0], nval[1]) for nval in nvals)
+    return tuple((as_scalar_dim(nval[0]), as_scalar_dim(nval[1])) for nval in nvals)
   elif nvals.shape == (1, 2):
     # ((before, after),)
-    return tuple((nvals[0, 0], nvals[0, 1]) for i in range(nd))
+    v1_2 = as_scalar_dim(nvals[0, 0]), as_scalar_dim(nvals[0, 1])
+    return tuple(v1_2 for i in range(nd))
   elif nvals.shape == (2,):
     # (before, after)  (not in the numpy docstring but works anyway)
-    return tuple((nvals[0], nvals[1]) for i in range(nd))
+    v1_2 = as_scalar_dim(nvals[0]), as_scalar_dim(nvals[1])
+    return tuple(v1_2 for i in range(nd))
   elif nvals.shape == (1,):
     # (pad,)
-    return tuple((nvals[0], nvals[0]) for i in range(nd))
+    v = as_scalar_dim(nvals[0])
+    return tuple((v, v) for i in range(nd))
   elif nvals.shape == ():
     # pad
-    return tuple((nvals.flat[0], nvals.flat[0]) for i in range(nd))
+    v = as_scalar_dim(nvals.flat[0])
+    return tuple((v, v) for i in range(nd))
   else:
     raise ValueError(f"jnp.pad: {name} with {nd=} has unsupported shape {nvals.shape}. "
                      f"Valid shapes are ({nd}, 2), (1, 2), (2,), (1,), or ().")
@@ -1683,7 +1704,8 @@ def pad(array: ArrayLike, pad_width: PadValueLike[int],
         mode: Union[str, Callable[..., Any]] = "constant", **kwargs) -> Array:
   _check_arraylike("pad", array)
   pad_width = _broadcast_to_pairs(pad_width, ndim(array), "pad_width")
-  if pad_width and np.array(pad_width).dtype.kind != 'i':
+  if pad_width and not _all(core.is_dim(p[0]) and core.is_dim(p[1])
+                            for p in pad_width):
     raise TypeError('`pad_width` must be of integral type.')
 
   if callable(mode):

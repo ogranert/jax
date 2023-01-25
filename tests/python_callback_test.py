@@ -24,12 +24,18 @@ from jax import lax
 from jax import tree_util
 from jax._src import debugging
 from jax._src import dispatch
+from jax._src import sharding
 from jax._src import test_util as jtu
 from jax._src import util
 from jax._src.lib import xla_bridge
+from jax._src.lib import xla_client
 from jax.config import config
 from jax.experimental import maps
+from jax.experimental import pjit
 from jax.interpreters import mlir
+from jax.experimental.maps import Mesh
+from jax.experimental.maps import xmap
+from jax.experimental import io_callback
 import jax.numpy as jnp
 import numpy as np
 
@@ -122,6 +128,7 @@ mlir.register_lowering(callback_p, callback_lowering, platform="gpu")
 mlir.register_lowering(callback_p, callback_lowering, platform="tpu")
 
 
+@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # host callback
 class PythonCallbackTest(jtu.JaxTestCase):
 
   def tearDown(self):
@@ -451,6 +458,7 @@ class PythonCallbackTest(jtu.JaxTestCase):
         out,
         np.arange(2 * jax.local_device_count()).reshape([-1, 2]) + 1.)
 
+@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # host callback
 class PurePythonCallbackTest(jtu.JaxTestCase):
 
   def tearDown(self):
@@ -621,7 +629,6 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
       self.assertTupleEqual(x.shape, (4,))
       return np.sin(x)
 
-
     @jax.jit
     @jax.vmap
     def g(x):
@@ -661,6 +668,54 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
       return jax.pure_callback(np.sin, x, x)
     out = f(jnp.arange(float(jax.local_device_count())))
     np.testing.assert_allclose(out, np.sin(np.arange(jax.local_device_count())))
+
+  def test_can_pjit_pure_callback_under_hard_xmap(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest(
+          'Host callback not supported for runtime type: stream_executor.'
+      )
+
+    if not hasattr(xla_client.OpSharding.Type, 'MANUAL'):
+      raise unittest.SkipTest('Manual partitioning needed for pure_callback')
+
+    jtu.set_spmd_lowering_flag(True)
+    jtu.set_spmd_manual_lowering_flag(True)
+    try:
+      mesh = Mesh(np.array(jax.devices()), axis_names=('x',))
+
+      spec = pjit.PartitionSpec('x')
+
+      def f(x):
+        axis_resources = {v: v for v in mesh.axis_names}
+        return xmap(
+            lambda x: jax.pure_callback(np.sin, x, x),
+            in_axes=(('x',),),
+            out_axes=('x',),
+            axis_resources=axis_resources,
+            axis_sizes=mesh.shape,
+        )(x)
+
+      def without_xmap_f(x):
+        return jax.pure_callback(np.sin, x, x)
+
+      with mesh:
+        inp = jnp.arange(float(jax.local_device_count()))
+        out = pjit.pjit(f, in_axis_resources=spec, out_axis_resources=spec)(inp)
+        np.testing.assert_allclose(
+            out, np.sin(np.arange(jax.local_device_count()))
+        )
+
+        if jax.local_device_count() > 1:
+          with self.assertRaisesRegex(
+              NotImplementedError, 'when all mesh axes are partitioned manually'
+          ):
+            pjit.pjit(
+                without_xmap_f, in_axis_resources=spec, out_axis_resources=spec
+            )(inp)
+
+    finally:
+      jtu.restore_spmd_manual_lowering_flag()
+      jtu.restore_spmd_lowering_flag()
 
   def test_cant_take_grad_of_pure_callback(self):
 
@@ -824,6 +879,158 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
 
     x = np.arange(6, dtype=np.int32).reshape((3, 2))
     np.testing.assert_allclose(g(x), x)
+
+class IOPythonCallbackTest(jtu.JaxTestCase):
+
+  def setUp(self):
+    super().setUp()
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
+
+  def tearDown(self):
+    super().tearDown()
+    dispatch.runtime_tokens.clear()
+
+  def test_io_callback_can_mutate_state(self):
+    x = 0
+    def cb():
+      nonlocal x
+      x += 1
+      return np.array(x, np.int32)
+
+    def f():
+      return io_callback(cb, jax.ShapeDtypeStruct((), jnp.int32))
+    f()
+    jax.effects_barrier()
+    self.assertEqual(x, 1)
+    f()
+    jax.effects_barrier()
+    self.assertEqual(x, 2)
+
+  def test_io_callback_can_be_batched_if_unordered(self):
+    _mut = 0
+    def cb(x):
+      nonlocal _mut
+      _mut += 1
+      return x
+
+    x = jnp.arange(4)
+    def f(x):
+      return io_callback(cb, jax.ShapeDtypeStruct((), x.dtype), x)
+    jax.vmap(f)(x)
+    jax.effects_barrier()
+    self.assertEqual(_mut, 4)
+    jax.vmap(f)(x)
+    jax.effects_barrier()
+    self.assertEqual(_mut, 8)
+
+  def test_cannot_call_ordered_io_in_pmap(self):
+    def f(x):
+      return io_callback(
+          lambda x: x, jax.ShapeDtypeStruct((), jnp.int32), x, ordered=True)
+    with self.assertRaisesRegex(
+        ValueError, "Ordered effects not supported in `pmap`"):
+      jax.pmap(f)(jnp.arange(jax.local_device_count()))
+
+  def test_cannot_call_ordered_io_in_xmap(self):
+    def f(x):
+      return io_callback(
+          lambda x: x, jax.ShapeDtypeStruct((), jnp.int32), x, ordered=True)
+    with self.assertRaisesRegex(
+        ValueError, "Cannot `vmap` ordered IO callback"):
+      maps.xmap(f, in_axes=([0],), out_axes=[0])(jnp.arange(16))
+
+  def test_cannot_call_ordered_io_in_vmap(self):
+    def f(x):
+      return io_callback(
+          lambda x: x, jax.ShapeDtypeStruct((), jnp.int32), x, ordered=True)
+    with self.assertRaisesRegex(
+        ValueError, "Cannot `vmap` ordered IO callback"):
+      jax.vmap(f)(jnp.arange(4))
+
+  def test_cannot_use_io_callback_in_jvp(self):
+    def f(x):
+      return io_callback(lambda x: x, jax.ShapeDtypeStruct((), jnp.float32), x)
+    with self.assertRaisesRegex(
+        ValueError, "IO callbacks do not support JVP."):
+      jax.jvp(f, (0.,), (1.,))
+
+  def test_cannot_use_io_callback_in_linearize(self):
+    def f(x):
+      return io_callback(lambda x: x, jax.ShapeDtypeStruct((), jnp.float32), x)
+    with self.assertRaisesRegex(
+        ValueError, "IO callbacks do not support JVP."):
+      jax.linearize(f, 0.)
+
+  def test_cannot_use_io_callback_in_transpose(self):
+    x = jnp.array(1.)
+
+    def f(x):
+      return io_callback(lambda x: x, jax.ShapeDtypeStruct((), x.dtype), x)
+    with self.assertRaisesRegex(
+        ValueError, "IO callbacks do not support transpose."):
+      jax.linear_transpose(f, x)(x)
+
+  def test_cannot_vmap_of_cond_io_callback(self):
+    def f(pred):
+      def true_fun():
+        io_callback(lambda: print("true"), None)
+      def false_fun():
+        io_callback(lambda: print("false"), None)
+      return lax.cond(pred, false_fun, true_fun)
+    with self.assertRaisesRegex(NotImplementedError,
+        "IO effect not supported in vmap-of-cond."):
+      jax.vmap(f)(jnp.array([True, True]))
+
+  def test_cannot_vmap_of_while_io_callback(self):
+    def check(x):
+      assert np.all(x < 5)
+
+    def f(i):
+      def cond(i):
+        return i < 5
+      def body(i):
+        io_callback(check, None, i)
+        return i + 1
+      return lax.while_loop(cond, body, i)
+    with self.assertRaisesRegex(NotImplementedError,
+        "IO effect not supported in vmap-of-while."):
+      jax.vmap(f)(jnp.array([0, 4]))
+
+  def test_cannot_use_io_callback_in_checkpoint(self):
+    @jax.grad
+    @jax.checkpoint
+    def f(x, y):
+      io_callback(lambda x: x, y, y)
+      return x
+
+    with self.assertRaisesRegex(NotImplementedError,
+        "Effects not supported in partial-eval of `checkpoint`"):
+      f(2., 3.)
+
+  def test_can_use_io_callback_in_pjit(self):
+
+    _mut = 0
+    def _cb(x):
+      nonlocal _mut
+      _mut = x.sum()
+
+    def f(x):
+      io_callback(_cb, None, x)
+      return x
+
+    mesh = maps.Mesh(np.array(jax.devices()), ['dev'])
+    if config.jax_array:
+      spec = sharding.NamedSharding(mesh, pjit.PartitionSpec('dev'))
+      out_spec = sharding.NamedSharding(mesh, pjit.PartitionSpec())
+    else:
+      spec = pjit.PartitionSpec('dev')
+      out_spec = pjit.PartitionSpec()
+    f = pjit.pjit(f, in_axis_resources=spec, out_axis_resources=out_spec)
+    with mesh:
+      f(jnp.arange(mesh.size))
+      jax.effects_barrier()
+    self.assertEqual(_mut, jnp.arange(mesh.size).sum())
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

@@ -19,22 +19,22 @@ import sys
 
 from setuptools import setup, find_packages
 
-_current_jaxlib_version = '0.4.1'
+_current_jaxlib_version = '0.4.2'
 # The following should be updated with each new jaxlib release.
 _latest_jaxlib_version_on_pypi = '0.4.1'
 _available_cuda_versions = ['11']
 _default_cuda_version = '11'
 _available_cudnn_versions = ['82', '86']
 _default_cudnn_version = '86'
-_libtpu_version = '0.1.dev20221212'
+_libtpu_version = '0.1.dev20230124'
 
 _dct = {}
-with open('jax/version.py') as f:
+with open('jax/version.py', encoding='utf-8') as f:
   exec(f.read(), _dct)
 __version__ = _dct['__version__']
 _minimum_jaxlib_version = _dct['_minimum_jaxlib_version']
 
-with open('README.md') as f:
+with open('README.md', encoding='utf-8') as f:
   _long_description = f.read()
 
 if 'PROTOC' in os.environ and os.path.exists(os.environ['PROTOC']):

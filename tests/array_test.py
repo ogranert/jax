@@ -35,7 +35,6 @@ from jax.experimental.serialize_executable import (
 from jax._src import sharding
 from jax._src import array
 from jax._src import prng
-from jax._src.lib import xla_extension_version
 from jax.experimental import maps
 
 from jax.config import config
@@ -612,9 +611,6 @@ class JaxArrayTest(jtu.JaxTestCase):
   # defragment API
   @jtu.skip_on_devices('cpu')  # defragment not implemented for TFRT CPU
   def test_defragment(self):
-    if xc._version < 105:
-      self.skipTest('Test needs jaxlib 0.3.25 or greater to pass')
-
     # Create a few arrays
     global_mesh = jtu.create_global_mesh((4, 2), ('x', 'y'))
     shape = (8, 2)
@@ -841,6 +837,55 @@ class ShardingTest(jtu.JaxTestCase):
     self.assertIn('device_ids', mesh_repr)
     self.assertIn('axis_names', mesh_repr)
 
+  def test_are_shardings_equivalent(self):
+    mesh = jtu.create_global_mesh((1,), ('x'))
+    mesh2 = jtu.create_global_mesh((2, 1), ('x', 'y'))
+
+    s1 = jax.sharding.NamedSharding(mesh, P('x'))
+    s2 = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+
+    self.assertTrue(s1.is_equivalent_to(s2, 2))
+
+    s3 = jax.pmap(lambda x: x)(jnp.arange(jax.device_count())).sharding
+    s4 = jax.pmap(lambda x: x)(jnp.arange(jax.device_count())).sharding
+    self.assertTrue(s3.is_equivalent_to(s4, 2))
+
+    self.assertFalse(s1.is_equivalent_to(s3, 2))
+    self.assertFalse(s2.is_equivalent_to(s3, 2))
+
+    s5 = jax.sharding.NamedSharding(mesh2, P('x', 'y'))
+
+    op1 = xc.OpSharding()
+    op1.type = xc.OpSharding.Type.REPLICATED
+    s6 = jax.sharding.OpShardingSharding([jax.devices()[0]], op1)
+
+    s7 = jax.sharding.OpShardingSharding(jax.devices(), op1)
+
+    # The OpSharding is replicated but the Sharding itself are on different
+    # devices.
+    self.assertFalse(s6.is_equivalent_to(s7, 2))
+
+    op2 = xc.OpSharding()
+    op2.type = xc.OpSharding.Type.OTHER
+    op2.tile_assignment_devices = [0, 1]
+    op2.tile_assignment_dimensions = [2, 1]
+    s8 = jax.sharding.OpShardingSharding(list(mesh2.devices.flat), op2)
+
+    self.assertTrue(s1.is_equivalent_to(s6, 2))
+    self.assertTrue(s5.is_equivalent_to(s8, 2))
+    self.assertFalse(s5.is_equivalent_to(s2, 2))
+
+    s9 = jax.sharding.NamedSharding(mesh2, P('y'))
+
+    op3 = xc.OpSharding()
+    op3.type = xc.OpSharding.Type.OTHER
+    op3.tile_assignment_devices = [0, 1]
+    op3.tile_assignment_dimensions = [1, 1, 2]
+    op3.replicate_on_last_tile_dim = True
+    s10 = jax.sharding.OpShardingSharding(list(mesh2.devices.flat), op3)
+
+    self.assertTrue(s9.is_equivalent_to(s10, 2))
+
 
 @jtu.with_config(jax_array=True)
 class RngShardingTest(jtu.JaxTestCase):
@@ -913,8 +958,6 @@ class RngShardingTest(jtu.JaxTestCase):
     y_ref1 = f(jax.device_put(x, jax.devices()[0]))
     self.assertArraysEqual(y, y_ref1)
 
-  @unittest.skipIf(xla_extension_version < 106,
-                   'Pjit pickling requires newer jaxlib.')
   def test_pickle_pjit_lower(self):
     example_exe = jax.jit(lambda x: x * x).lower(
         jax.core.ShapedArray(

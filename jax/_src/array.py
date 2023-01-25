@@ -19,10 +19,10 @@ import numpy as np
 import functools
 from typing import Sequence, Tuple, Callable, Union, Optional, cast, List
 
-from jax import core
 from jax._src import abstract_arrays
 from jax._src import api_util
 from jax._src import basearray
+from jax._src import core
 from jax._src import dispatch
 from jax._src import dtypes
 from jax._src.config import config
@@ -55,10 +55,10 @@ class Shard:
 
   def __init__(self, device: Device, sharding: Sharding, global_shape: Shape,
                data: Optional[ArrayImpl] = None):
-    self.device = device
+    self._device = device
     self._sharding = sharding
     self._global_shape = global_shape
-    self.data = data
+    self._data = data
 
   def __repr__(self):
     try:
@@ -83,6 +83,14 @@ class Shard:
   def replica_id(self) -> int:
     return device_replica_id_map(self._sharding, self._global_shape)[self.device]
 
+  @property
+  def device(self):
+    return self._device
+
+  @property
+  def data(self):
+    return self._data
+
 
 def _reconstruct_array(fun, args, arr_state, aval_state):
   """Method to reconstruct a device array from a serialized state."""
@@ -99,7 +107,7 @@ def _single_device_array_from_buf(buf, committed):
                    committed=committed, _skip_checks=True)
 
 
-@use_cpp_class(xc.ArrayImpl if xc._version >= 99 else None)
+@use_cpp_class(xc.ArrayImpl)
 class ArrayImpl(basearray.Array):
   # TODO(yashkatariya): Add __slots__ here.
 
@@ -612,9 +620,8 @@ core.pytype_aval_mappings[ArrayImpl] = abstract_arrays.canonical_concrete_aval
 xla.pytype_aval_mappings[ArrayImpl] = op.attrgetter('aval')
 xla.canonicalize_dtype_handlers[ArrayImpl] = pxla.identity
 api_util._shaped_abstractify_handlers[ArrayImpl] = op.attrgetter('aval')
-if xc._version >= 96:
-  # TODO(jakevdp) replace this with true inheritance at the C++ level.
-  basearray.Array.register(ArrayImpl)
+# TODO(jakevdp) replace this with true inheritance at the C++ level.
+basearray.Array.register(ArrayImpl)
 
 
 def _array_mlir_constant_handler(val, canonicalize_types=True):
@@ -623,22 +630,9 @@ def _array_mlir_constant_handler(val, canonicalize_types=True):
 mlir.register_constant_handler(ArrayImpl, _array_mlir_constant_handler)
 
 
-def _array_pmap_shard_arg(x, devices, indices, mode):
-  if dispatch.is_single_device_sharding(x.sharding):
-    return pxla._shard_device_array(x, devices, indices, mode)
+def _array_shard_arg(x, devices, indices):
+  x._check_if_deleted()
 
-  # If the sharding of Array does not match pmap's sharding then take the slow
-  # path which is similar to what SDA does. This slow path reroute only happens
-  # for `pmap`.
-  x_indices = tuple(x.sharding.addressable_devices_indices_map(x.shape).values())
-  if indices == x_indices:
-    return [buf if buf.device() == d else buf.copy_to_device(d)
-            for buf, d in safe_zip(x._arrays, devices)]
-  else:
-    return pxla._shard_sharded_device_array_slow_path(x, devices, indices, mode)
-
-
-def _array_rest_shard_arg(x: ArrayImpl, devices, indices, mode):
   x_indices = x.sharding.addressable_devices_indices_map(x.shape).values()
   if not x.is_fully_addressable:
     if tuple(x_indices) == tuple(indices):
@@ -651,20 +645,11 @@ def _array_rest_shard_arg(x: ArrayImpl, devices, indices, mode):
       return [buf if buf.device() == d else buf.copy_to_device(d)
               for buf, d in safe_zip(x._arrays, devices)]
     # Resharding starts here:
-    if isinstance(x.sharding, PmapSharding):
-      return pxla.device_put(x._value, devices, replicate=True)
     if dispatch.is_single_device_sharding(x.sharding):
-      return pxla._shard_device_array(x, devices, indices, mode)
+      return pxla._shard_device_array(x, devices, indices)
     else:
-      return pxla._shard_sharded_device_array_slow_path(x, devices, indices, mode)
+      return pxla._shard_sharded_device_array_slow_path(x, devices, indices)
 
-
-def _array_shard_arg(x, devices, indices, mode):
-  x._check_if_deleted()
-  if mode == pxla.InputsHandlerMode.pmap:
-    return _array_pmap_shard_arg(x, devices, indices, mode)
-  else:
-    return _array_rest_shard_arg(x, devices, indices, mode)
 pxla.shard_arg_handlers[ArrayImpl] = _array_shard_arg
 
 

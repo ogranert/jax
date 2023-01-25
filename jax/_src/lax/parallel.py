@@ -23,23 +23,22 @@ import warnings
 
 import numpy as np
 
-from jax import core
 from jax import tree_util
-from jax.core import ShapedArray, AxisName, raise_to_shaped
 from jax.interpreters import ad
 from jax.interpreters import mlir
 from jax.interpreters import xla
 from jax.interpreters import pxla
 from jax.interpreters import batching
+from jax._src import core
 from jax._src import dtypes
+from jax._src.core import ShapedArray, AxisName, raise_to_shaped
 from jax._src.lax import lax
 from jax._src.lax import slicing
 from jax._src.numpy import lax_numpy
 import jax._src.util as util
 from jax._src.util import unzip2, prod, canonicalize_axis, safe_map, safe_zip, moveaxis
 from jax._src.lib.mlir import ir
-from jax._src.lib import mlir_api_version
-from jax._src.lib.mlir.dialects import mhlo
+from jax._src.lib.mlir.dialects import hlo, use_stablehlo
 
 unsafe_map, map = map, safe_map  # type: ignore
 
@@ -63,20 +62,53 @@ def psum(x, axis_name, *, axis_index_groups=None):
       two and last two replicas). Groups must cover all axis indices exactly
       once.
 
-
   Returns:
     Array(s) with the same shape as ``x`` representing the result of an
     all-reduce sum along the axis ``axis_name``.
 
-  For example, with 4 XLA devices available:
+  Examples:
+    For example, with 4 XLA devices available:
 
-  >>> x = np.arange(4)
-  >>> y = jax.pmap(lambda x: jax.lax.psum(x, 'i'), axis_name='i')(x)
-  >>> print(y)
-  [6 6 6 6]
-  >>> y = jax.pmap(lambda x: x / jax.lax.psum(x, 'i'), axis_name='i')(x)
-  >>> print(y)
-  [0.         0.16666667 0.33333334 0.5       ]
+    >>> x = np.arange(4)
+    >>> y = jax.pmap(lambda x: jax.lax.psum(x, 'i'), axis_name='i')(x)
+    >>> print(y)
+    [6 6 6 6]
+    >>> y = jax.pmap(lambda x: x / jax.lax.psum(x, 'i'), axis_name='i')(x)
+    >>> print(y)
+    [0.         0.16666667 0.33333334 0.5       ]
+
+    Suppose we want to perform ``psum`` among two groups, one with ``device0`` and ``device1``, the other with `device2` and `device3`,
+
+    >>> y = jax.pmap(lambda x: jax.lax.psum(x, 'i', axis_index_groups=[[0, 1], [2, 3]]), axis_name='i')(x)
+    >>> print(y)
+    [1 1 5 5]
+
+    An example using 2D-shaped x. Each row is data from one device.
+
+    >>> x = np.arange(16).reshape(4, 4)
+    >>> print(x)
+    [[ 0  1  2  3]
+     [ 4  5  6  7]
+     [ 8  9 10 11]
+     [12 13 14 15]]
+
+    Full ``psum`` across all devices:
+
+    >>> y = jax.pmap(lambda x: jax.lax.psum(x, 'i'), axis_name='i')(x)
+    >>> print(y)
+    [[24 28 32 36]
+     [24 28 32 36]
+     [24 28 32 36]
+     [24 28 32 36]]
+
+    Perform ``psum`` among two groups:
+
+    >>> y = jax.pmap(lambda x: jax.lax.psum(x, 'i', axis_index_groups=[[0, 1], [2, 3]]), axis_name='i')(x)
+    >>> print(y)
+    [[ 4  6  8 10]
+     [ 4  6  8 10]
+     [20 22 24 26]
+     [20 22 24 26]]
   """
   if not isinstance(axis_name, (tuple, list)):
     axis_name = (axis_name,)
@@ -219,7 +251,7 @@ def ppermute(x, axis_name, perm):
   If ``x`` is a pytree then the result is equivalent to mapping this function to
   each leaf in the tree.
 
-  This function is an analog of the CollectivePermute XLA HLO.
+  This function is an analog of the CollectivePermute HLO.
 
   Args:
     x: array(s) with a mapped axis named ``axis_name``.
@@ -661,7 +693,7 @@ def _replica_groups(axis_env, axis_name, axis_index_groups):
                       for axis_index_group in axis_index_groups]
   return replica_groups
 
-def _replica_groups_mhlo(replica_groups: Sequence[Sequence[int]]
+def _replica_groups_hlo(replica_groups: Sequence[Sequence[int]]
                         ) -> ir.DenseIntElementsAttr:
   # Uneven replica groups are padded with -1.
   groups = np.array(list(itertools.zip_longest(*replica_groups, fillvalue=-1)),
@@ -711,7 +743,7 @@ def _allreduce_lowering(prim, pos_fn, ctx, *args, axes, axis_index_groups):
   if not named_axes:
     return args
 
-  replica_groups = _replica_groups_mhlo(
+  replica_groups = _replica_groups_hlo(
       _replica_groups(ctx.module_context.axis_env, named_axes,
                       axis_index_groups))
   axis_context = ctx.module_context.axis_context
@@ -722,12 +754,12 @@ def _allreduce_lowering(prim, pos_fn, ctx, *args, axes, axis_index_groups):
     if is_spmd:
       channel = ctx.module_context.new_channel()
       other_args = dict(
-          channel_handle=mhlo.ChannelHandle.get(
+          channel_handle=hlo.ChannelHandle.get(
               channel, mlir.DEVICE_TO_DEVICE_TYPE),
           use_global_device_ids=ir.BoolAttr.get(True))
     else:
       other_args = {}
-    op = mhlo.AllReduceOp(
+    op = hlo.AllReduceOp(
         x.type, x, replica_groups=replica_groups, **other_args)
     scalar_aval = core.ShapedArray((), aval.dtype)
     scalar_type = mlir.aval_to_ir_type(scalar_aval)
@@ -738,7 +770,7 @@ def _allreduce_lowering(prim, pos_fn, ctx, *args, axes, axis_index_groups):
                                 avals_in=[scalar_aval] * 2, avals_out=[scalar_aval])
       out_nodes = lower_reducer(
           reducer_ctx, *([a] for a in reducer_block.arguments))
-      mhlo.ReturnOp(util.flatten(out_nodes))
+      hlo.ReturnOp(util.flatten(out_nodes))
     return op.result
 
   return [all_reduce(aval, x) for aval, x in zip(ctx.avals_in, args)]
@@ -846,14 +878,14 @@ def _ppermute_lowering(ctx, x, *, axis_name, perm):
 
   axis_context = ctx.module_context.axis_context
   is_manual = isinstance(axis_context, mlir.SPMDAxisContext) and axis_context.manual_axes
-  if is_manual and mlir_api_version >= 35:
+  if is_manual:
     channel = ctx.module_context.new_channel()
     other_args = dict(
-        channel_handle=mhlo.ChannelHandle.get(channel, mlir.DEVICE_TO_DEVICE_TYPE))
+        channel_handle=hlo.ChannelHandle.get(channel, mlir.DEVICE_TO_DEVICE_TYPE))
   else:
     other_args = {}
 
-  return mhlo.CollectivePermuteOp(
+  return hlo.CollectivePermuteOp(
       x, mlir.dense_int_elements(full_perm), **other_args).results
 
 def _ppermute_transpose_rule(t, x, perm, axis_name):
@@ -943,7 +975,6 @@ def _all_to_all_lowering(ctx, x, *,
     split_count = len(replica_groups[0])
     if not all(split_count == len(g) for g in replica_groups):
       raise ValueError('Replica groups must be equally sized')
-    operand = [x] if mlir_api_version >= 38 else x
     is_spmd = isinstance(ctx.module_context.axis_context,
                          (mlir.SPMDAxisContext, mlir.ShardingContext))
     if is_spmd:
@@ -952,16 +983,16 @@ def _all_to_all_lowering(ctx, x, *,
       # of partitions - and XLA is configured with only a single replica.
       channel = ctx.module_context.new_channel()
       other_args = dict(
-          channel_handle=mhlo.ChannelHandle.get(channel,
-                                                mlir.DEVICE_TO_DEVICE_TYPE))
+          channel_handle=hlo.ChannelHandle.get(channel,
+                                               mlir.DEVICE_TO_DEVICE_TYPE))
     else:
       other_args = {}
-    return mhlo.AllToAllOp(
-        operand,
+    return hlo.AllToAllOp(
+        x if use_stablehlo else [x],
         split_dimension=mlir.i64_attr(split_axis),
         concat_dimension=mlir.i64_attr(concat_axis),
         split_count=mlir.i64_attr(split_count),
-        replica_groups=_replica_groups_mhlo(replica_groups),
+        replica_groups=_replica_groups_hlo(replica_groups),
         **other_args).results
   else:
     warnings.warn(
@@ -1184,7 +1215,7 @@ def _all_gather_lowering(ctx, x, *, all_gather_dimension, axis_name,
       new_shape = list(x_aval.shape)
       new_shape.insert(all_gather_dimension, 1)
       broadcast_dimensions = [i for i in range(len(new_shape)) if i != all_gather_dimension]
-      x = mhlo.BroadcastInDimOp(
+      x = hlo.BroadcastInDimOp(
           mlir.aval_to_ir_type(x_aval.update(shape=new_shape)), x,
           mlir.dense_int_elements(broadcast_dimensions))
     replica_groups = _replica_groups(ctx.module_context.axis_env, axis_name,
@@ -1195,15 +1226,15 @@ def _all_gather_lowering(ctx, x, *, all_gather_dimension, axis_name,
       # of partitions - and XLA is configured with only a single replica.
       channel = ctx.module_context.new_channel()
       other_args = dict(
-          channel_handle=mhlo.ChannelHandle.get(
+          channel_handle=hlo.ChannelHandle.get(
               channel, mlir.DEVICE_TO_DEVICE_TYPE),
           use_global_device_ids=ir.BoolAttr.get(True))
     else:
       other_args = {}
-    return mhlo.AllGatherOp(
+    return hlo.AllGatherOp(
         mlir.aval_to_ir_type(out_aval),
         x, all_gather_dim=mlir.i64_attr(all_gather_dimension),
-        replica_groups=_replica_groups_mhlo(replica_groups),
+        replica_groups=_replica_groups_hlo(replica_groups),
         **other_args).results
   else:
     lowering = mlir.lower_fun(_all_gather_via_psum, multiple_results=False)
@@ -1328,16 +1359,16 @@ def _reduce_scatter_lowering(prim, reducer, ctx, x,
       # of partitions - and XLA is configured with only a single replica.
       channel = ctx.module_context.new_channel()
       other_args = dict(
-          channel_handle=mhlo.ChannelHandle.get(
+          channel_handle=hlo.ChannelHandle.get(
               channel, mlir.DEVICE_TO_DEVICE_TYPE),
           use_global_device_ids=ir.BoolAttr.get(True))
     else:
       other_args = {}
-    op = mhlo.ReduceScatterOp(
+    op = hlo.ReduceScatterOp(
         mlir.aval_to_ir_type(x_aval.update(shape=scatter_out_shape)),
         x,
         scatter_dimension=mlir.i64_attr(scatter_dimension),
-        replica_groups=_replica_groups_mhlo(replica_groups),
+        replica_groups=_replica_groups_hlo(replica_groups),
         **other_args)
     scalar_type = mlir.aval_to_ir_type(scalar_aval)
     reducer_block = op.regions[0].blocks.append(scalar_type, scalar_type)
@@ -1348,12 +1379,12 @@ def _reduce_scatter_lowering(prim, reducer, ctx, x,
                                 avals_out=[scalar_aval])
       out_nodes = lower_reducer(
           reducer_ctx, *([a] for a in reducer_block.arguments))
-      mhlo.ReturnOp(util.flatten(out_nodes))
+      hlo.ReturnOp(util.flatten(out_nodes))
 
     if tiled:
       return op.results
     else:
-      return mhlo.ReshapeOp(mlir.aval_to_ir_type(aval_out), op.result).results
+      return hlo.ReshapeOp(mlir.aval_to_ir_type(aval_out), op.result).results
   else:
     return mlir.lower_fun(_reduce_scatter_via_reducer, multiple_results=False)(
         ctx, x,
@@ -1479,7 +1510,7 @@ def psum_scatter(x, axis_name, *, scatter_dimension=0, axis_index_groups=None, t
 
   For example, with 4 XLA devices available:
 
-  >>> x = np.arange(16).reshape(4,4)
+  >>> x = np.arange(16).reshape(4, 4)
   >>> print(x)
   [[ 0  1  2  3]
    [ 4  5  6  7]
@@ -1522,7 +1553,7 @@ def psum_scatter(x, axis_name, *, scatter_dimension=0, axis_index_groups=None, t
   return tree_util.tree_map(bind, x)
 
 
-def _build_axis_index_lowering_mhlo(ctx, axis_name, axis_env):
+def _build_axis_index_lowering_hlo(ctx, axis_name, axis_env):
   if isinstance(axis_name, tuple):
     assert axis_name, 'empty axis name'
     if len(axis_name) > 1:
@@ -1538,22 +1569,18 @@ def _build_axis_index_lowering_mhlo(ctx, axis_name, axis_env):
   is_spmd = isinstance(axis_context,
                        (mlir.SPMDAxisContext, mlir.ShardingContext))
   if is_spmd:
-    if mlir_api_version >= 39:
-      device_id = mhlo.PartitionIdOp()
-    else:
-      device_id = mhlo.PartitionIdOp(
-          ir.RankedTensorType.get([], ir.IntegerType.get_unsigned(32)))
+    device_id = hlo.PartitionIdOp()
   else:
-    device_id = mhlo.ReplicaIdOp()
-  unsigned_index = mhlo.RemOp(mhlo.DivOp(device_id, div), mod)
-  return mhlo.ConvertOp(
+    device_id = hlo.ReplicaIdOp()
+  unsigned_index = hlo.RemOp(hlo.DivOp(device_id, div), mod)
+  return hlo.ConvertOp(
       ir.RankedTensorType.get([], ir.IntegerType.get_signless(32)),
       unsigned_index).result
 
 def _axis_index_lowering(ctx, *, axis_name):
   return [
-      _build_axis_index_lowering_mhlo(ctx, axis_name,
-                                      ctx.module_context.axis_env)
+      _build_axis_index_lowering_hlo(ctx, axis_name,
+                                     ctx.module_context.axis_env)
   ]
 
 

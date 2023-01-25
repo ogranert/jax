@@ -18,7 +18,6 @@ import functools
 from functools import partial
 import itertools
 import operator
-import unittest
 from unittest import SkipTest
 
 from absl.testing import absltest
@@ -33,7 +32,6 @@ from jax import numpy as jnp
 
 from jax._src import dtypes
 from jax._src import test_util as jtu
-from jax._src.lib import xla_extension_version
 
 from jax.config import config
 config.parse_flags_with_absl()
@@ -160,7 +158,7 @@ JAX_ONE_TO_ONE_OP_RECORDS = [
     op_record("arctan", 1, number_dtypes, all_shapes, jtu.rand_small, ["rev"],
               inexact=True),
     op_record("arctan2", 2, float_dtypes, all_shapes, jtu.rand_small, ["rev"],
-              inexact=True),
+              inexact=True, check_dtypes=False),
     op_record("arcsinh", 1, number_dtypes, all_shapes, jtu.rand_default, ["rev"],
               inexact=True, tolerance={np.complex64: 2E-4, np.complex128: 2E-14}),
     op_record("arccosh", 1, number_dtypes, all_shapes, jtu.rand_default, ["rev"],
@@ -242,9 +240,9 @@ JAX_COMPOUND_OP_RECORDS = [
     op_record("rad2deg", 1, float_dtypes, all_shapes, jtu.rand_default, []),
     op_record("ravel", 1, all_dtypes, all_shapes, jtu.rand_default, ["rev"]),
     op_record("real", 1, number_dtypes, all_shapes, jtu.rand_some_inf, []),
-    op_record("remainder", 2, default_dtypes, all_shapes, jtu.rand_nonzero, [],
+    op_record("remainder", 2, default_dtypes, all_shapes, jtu.rand_some_zero, [],
               tolerance={np.float16: 1e-2}),
-    op_record("mod", 2, default_dtypes, all_shapes, jtu.rand_nonzero, []),
+    op_record("mod", 2, default_dtypes, all_shapes, jtu.rand_some_zero, []),
     op_record("modf", 1, float_dtypes, all_shapes, jtu.rand_default, []),
     op_record("modf", 1, int_dtypes + unsigned_dtypes, all_shapes,
               jtu.rand_default, [], check_dtypes=False),
@@ -492,7 +490,6 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
     name=[rec.name for rec in JAX_OPERATOR_OVERLOADS if rec.nargs == 2],
     othertype=[dict, list, tuple, set],
   )
-  @unittest.skipIf(xla_extension_version < 99, "C++ jax.Array is not available")
   def testOperatorOverloadErrors(self, name, othertype):
     # Test that binary operators with builtin collections raise a TypeError
     # and report the types in the correct order.
@@ -512,7 +509,6 @@ class JaxNumpyOperatorTests(jtu.JaxTestCase):
     name=[rec.name for rec in JAX_RIGHT_OPERATOR_OVERLOADS if rec.nargs == 2],
     othertype=[dict, list, tuple, set],
   )
-  @unittest.skipIf(xla_extension_version < 99, "C++ jax.Array is not available")
   def testRightOperatorOverloadErrors(self, name, othertype):
     # Test that binary operators with builtin collections raise a TypeError
     # and report the types in the correct order.

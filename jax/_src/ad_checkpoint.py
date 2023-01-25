@@ -18,8 +18,7 @@ from typing import (Callable, Optional, List, Tuple, Sequence, Set, Union, Any,
 import types
 
 import jax
-from jax import core
-from jax import linear_util as lu
+from jax._src import linear_util as lu
 from jax.interpreters import ad
 from jax.interpreters import batching
 from jax.interpreters import mlir
@@ -27,13 +26,15 @@ from jax.interpreters import partial_eval as pe
 from jax.interpreters import xla
 from jax.tree_util import tree_flatten, tree_unflatten
 from jax._src import ad_util
+from jax._src import core
 from jax._src import util
 from jax._src import source_info_util
 from jax._src import traceback_util
 from jax._src.api_util import flatten_fun, shaped_abstractify
 from jax._src.lax import lax as lax_internal
 from jax._src.lax import convolution as lax_convolution
-from jax._src.lib.mlir.dialects import mhlo
+from jax._src.lib import xla_client as xc
+from jax._src.lib.mlir.dialects import hlo
 from jax._src.traceback_util import api_boundary
 from jax._src.util import (unzip2, wraps, split_list, partition_list, safe_map,
                            safe_zip, merge_lists, weakref_lru_cache)
@@ -70,8 +71,17 @@ def dot_with_no_batch_dims(prim, *_, **params) -> bool:
 
 name_p = core.Primitive('name')
 
+def save_anything_except_these_names(*names_not_to_save):
+  """Save any values (not just named ones) excluding the names given."""
+  names_not_to_save = frozenset(names_not_to_save)
+  def policy(prim, *_, **params):
+    if prim is name_p:
+      return params['name'] not in names_not_to_save
+    return True  # allow saving anything which is not named
+  return policy
+
 def save_any_names_but_these(*names_not_to_save):
-  # Save named values, excluding the names given.
+  """Save only named values, excluding the names given."""
   names_not_to_save = frozenset(names_not_to_save)
   def policy(prim, *_, **params):
     if prim is name_p:
@@ -80,7 +90,7 @@ def save_any_names_but_these(*names_not_to_save):
   return policy
 
 def save_only_these_names(*names_which_can_be_saved):
-  # Save named values, only among the names given.
+  """Save only named values, and only among the names given."""
   names_which_can_be_saved = set(names_which_can_be_saved)
   def policy(prim, *_, **params):
     if prim is name_p:
@@ -102,6 +112,7 @@ checkpoint_policies = types.SimpleNamespace(
     nothing_saveable=nothing_saveable,
     checkpoint_dots=checkpoint_dots,
     checkpoint_dots_with_no_batch_dims=dot_with_no_batch_dims,
+    save_anything_except_these_names=save_anything_except_these_names,
     save_any_names_but_these=save_any_names_but_these,
     save_only_these_names=save_only_these_names,
     save_from_both_policies=save_from_both_policies)
@@ -395,8 +406,12 @@ def saved_residuals(f, *args, **kwargs) -> List[Tuple[core.AbstractValue, str]]:
       if v in res_vars:
         if eqn.primitive is name_p:
           results.append((v.aval, f"named '{eqn.params['name']}' from {src}"))
+        elif str(eqn.primitive) == 'xla_call':
+          results.append((v.aval,
+                          f"output of jitted function '{eqn.params['name']}' "
+                          f"from {src}"))
         else:
-          results.append((v.aval, f'from {src}'))
+          results.append((v.aval, f'output of {eqn.primitive.name} from {src}'))
 
   assert len(results) == len(jaxpr.outvars)
   return results
@@ -621,7 +636,10 @@ def _optimization_barrier_lowering_rule(ctx, *args):
   barrier_types = map(mlir.aval_to_ir_types, ctx.avals_in)
   flat_barrier_types = util.flatten(barrier_types)
   flat_args = mlir.flatten_lowering_ir_args(args)
-  barrier_op = mhlo.OptimizationBarrierOp(flat_barrier_types, flat_args)
+  if xc.mlir_api_version < 40:
+    barrier_op = hlo.OptimizationBarrierOp(flat_barrier_types, flat_args)
+  else:
+    barrier_op = hlo.OptimizationBarrierOp(flat_args)
   return util.unflatten(barrier_op.results, map(len, barrier_types))
 
 def _optimization_barrier(arg):

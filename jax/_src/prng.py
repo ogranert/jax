@@ -22,7 +22,6 @@ import numpy as np
 
 import jax
 from jax import lax
-from jax import core
 from jax import numpy as jnp
 from jax.config import config
 from jax.dtypes import float0
@@ -35,16 +34,17 @@ from jax._src import basearray
 from jax._src.sharding import (
     NamedSharding, PmapSharding, OpShardingSharding)
 
+from jax._src import core
 from jax._src import dispatch
 from jax._src import dtypes
+from jax._src import pretty_printer as pp
 from jax._src.api import jit, vmap
 from jax._src.lax import lax as lax_internal
 from jax._src.lax import utils as lax_utils
-from jax._src.lib.mlir.dialects import mhlo
+from jax._src.lib.mlir.dialects import hlo
 from jax._src.numpy import lax_numpy
-import jax._src.pretty_printer as pp
 from jax._src.util import canonicalize_axis, prod, safe_map, safe_zip
-from jax._src.lib import gpu_prng
+from jax._src.lib import gpu_prng, xla_extension_version
 
 map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
@@ -443,7 +443,7 @@ class KeyTyRules:
     key_shape = aval_out.dtype.impl.key_shape
     trailing_dims = [aval_out.ndim + i for i in range(len(key_shape))]
     perm = [*permutation, *trailing_dims]
-    return mhlo.TransposeOp(x, mlir.dense_int_elements(perm)).result
+    return hlo.TransposeOp(x, mlir.dense_int_elements(perm)).result
 
   @staticmethod
   def gather_mlir(ctx, avals_in, aval_out, x, indices, *,
@@ -503,7 +503,7 @@ def device_put_key_array(x: PRNGKeyArray, device):
   return dispatch.device_put(x.unsafe_raw_array(), device)
 dispatch.device_put_handlers[PRNGKeyArray] = device_put_key_array
 
-def key_array_shard_arg_handler(x: PRNGKeyArray, devices, indices, mode):
+def key_array_shard_arg_handler(x: PRNGKeyArray, devices, indices):
   # TODO(frostig): Remove the need for `core.get_aval`.
   key_shape = core.get_aval(x).dtype.impl.key_shape
   arr = x.unsafe_raw_array()
@@ -512,7 +512,7 @@ def key_array_shard_arg_handler(x: PRNGKeyArray, devices, indices, mode):
   # sharded. This is only true when enable_custom_prng is True.
   trailing_inds = [slice(None)] * len(key_shape)
   phys_indices = [(*inds, *trailing_inds) for inds in indices]
-  return pxla.shard_arg_handlers[type(arr)](arr, devices, phys_indices, mode)
+  return pxla.shard_arg_handlers[type(arr)](arr, devices, phys_indices)
 pxla.shard_arg_handlers[PRNGKeyArray] = key_array_shard_arg_handler
 
 
@@ -940,7 +940,7 @@ def _threefry2x32_lowering(key1, key2, x1, x2, use_rolled_loops=True):
   return tuple(x)
 
 
-def _threefry2x32_gpu_lowering(threefry2x32_lowering, ctx, k1, k2, x1, x2):
+def _threefry2x32_gpu_lowering(lowering_func, ctx, k1, k2, x1, x2):
   aval_out, _ = ctx.avals_out
   k1_aval, k2_aval, x1_aval, x2_aval = ctx.avals_in
   rank = len(aval_out.shape)
@@ -950,10 +950,24 @@ def _threefry2x32_gpu_lowering(threefry2x32_lowering, ctx, k1, k2, x1, x2):
   def _broadcast(x, aval):
     return mlir.broadcast_in_dim(ctx, x, aval_out,
                                  broadcast_dimensions=range(rank - len(aval.shape), rank))
-  return threefry2x32_lowering(
-          (_broadcast(k1, k1_aval), _broadcast(k2, k2_aval)),
-          (_broadcast(x1, x1_aval), _broadcast(x2, x2_aval)))
 
+  if xla_extension_version >= 113:
+    out_len = reduce(op.mul, aval_out.shape, 1)
+    if not core.is_constant_dim(out_len):
+      length = mlir.shape_tensor(mlir.eval_dynamic_shape(ctx, [out_len]))
+      length = mlir.hlo.ConvertOp(
+          mlir.ir.RankedTensorType.get((1,), mlir.ir.IntegerType.get_signless(64)),
+          length).result
+    else:
+      length = int(out_len)  # will be passed statically
+
+    return lowering_func(
+            (_broadcast(k1, k1_aval), _broadcast(k2, k2_aval)),
+            (_broadcast(x1, x1_aval), _broadcast(x2, x2_aval)), length)
+  else:
+    return lowering_func(
+            (_broadcast(k1, k1_aval), _broadcast(k2, k2_aval)),
+            (_broadcast(x1, x1_aval), _broadcast(x2, x2_aval)))
 
 threefry2x32_p = core.Primitive("threefry2x32")
 threefry2x32_p.multiple_results = True
@@ -1041,27 +1055,27 @@ def bcast_iotas_to_reshaped_iota(add, mul, shape, iotas):
 
 def iota_2x32_shape_lowering(ctx, *, shape):
   def _add(x, y):
-    return mlir.mhlo.AddOp(x, y).result
+    return mlir.hlo.AddOp(x, y).result
 
   def _mul(x, y):
     x_const = mlir.ir_constant(np.array(x, np.dtype('uint64')),
                                canonicalize_types=False)
-    x_bcast = mlir.mhlo.BroadcastOp(x_const, mlir.dense_int_elements(shape))
-    return mlir.mhlo.MulOp(x_bcast, y).result
+    x_bcast = mlir.hlo.BroadcastOp(x_const, mlir.dense_int_elements(shape))
+    return mlir.hlo.MulOp(x_bcast, y).result
 
   assert len(shape) > 0
   aval_out, _ = ctx.avals_out
   aval_u64 = core.ShapedArray(shape, np.dtype('uint64'))
-  iotas = [mlir.mhlo.IotaOp(mlir.aval_to_ir_type(aval_u64),
+  iotas = [mlir.hlo.IotaOp(mlir.aval_to_ir_type(aval_u64),
                             mlir.i64_attr(dimension)).result
            for dimension in range(len(shape))]
   counts = bcast_iotas_to_reshaped_iota(_add, _mul, shape, iotas)
   shift = mlir.ir_constant(np.array(32, np.dtype('uint64')),
                            canonicalize_types=False)
-  shift = mlir.mhlo.BroadcastOp(shift, mlir.dense_int_elements(shape)).result
-  counts_shifted = mlir.mhlo.ShiftRightLogicalOp(counts, shift).result
-  counts_lo = mlir.mhlo.ConvertOp(mlir.aval_to_ir_type(aval_out), counts).result
-  counts_hi = mlir.mhlo.ConvertOp(mlir.aval_to_ir_type(aval_out),
+  shift = mlir.hlo.BroadcastOp(shift, mlir.dense_int_elements(shape)).result
+  counts_shifted = mlir.hlo.ShiftRightLogicalOp(counts, shift).result
+  counts_lo = mlir.hlo.ConvertOp(mlir.aval_to_ir_type(aval_out), counts).result
+  counts_hi = mlir.hlo.ConvertOp(mlir.aval_to_ir_type(aval_out),
                                   counts_shifted).result
   return counts_hi, counts_lo
 mlir.register_lowering(iota_2x32_shape_p, iota_2x32_shape_lowering)

@@ -12,29 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import threading
 import contextlib
 import numpy as np
 import itertools as it
 from collections import OrderedDict, abc
 from typing import (Callable, Iterable, Tuple, Optional, Dict, Any, Set,
                     NamedTuple, Union, Sequence)
-from warnings import warn
 from functools import wraps, partial, partialmethod, lru_cache
-from enum import Enum
 
 from jax import numpy as jnp
 from jax import core
-from jax import linear_util as lu
+from jax._src import linear_util as lu
 from jax import stages
-from jax._src.api import _check_callable, _check_arg
 from jax._src import dispatch
 from jax.tree_util import (tree_flatten, tree_unflatten, all_leaves, tree_map,
-                           tree_leaves, treedef_tuple)
-from jax._src.tree_util import _replace_nones
+                           treedef_tuple)
 from jax._src.api_util import (flatten_fun_nokwargs, flatten_axes,
                                _ensure_index_tuple, donation_vector,
-                               shaped_abstractify)
+                               shaped_abstractify, check_callable)
 from jax._src import source_info_util
 from jax._src import traceback_util
 from jax._src.config import config
@@ -48,8 +43,6 @@ from jax.interpreters import pxla
 from jax.interpreters import xla
 from jax.interpreters import batching
 from jax.interpreters import ad
-from jax._src.lib import xla_bridge as xb
-from jax._src.lib import xla_client as xc
 from jax._src.util import (safe_map, safe_zip, HashableFunction, unzip2, unzip3,
                            as_hashable_function, distributed_debug_log,
                            tuple_insert, moveaxis, split_list, wrap_name,
@@ -62,27 +55,8 @@ traceback_util.register_exclusion(__file__)
 map, unsafe_map = safe_map, map
 zip = safe_zip
 
-
-class _PositionalSemantics(Enum):
-  """Indicates whether the positional shapes of inputs should be interpreted as
-  global or local with respect to the multi-host mesh.
-
-  While named axes are always associated with global sizes, the outermost pjit
-  is the boundary between the local shapes in the outer scope and global
-  positional shapes in its inner scope. pjits nested inside that one should not
-  attempt to increase the sizes of avals again, and xmap has to take this into
-  account when inferring the global size of a named axis.
-  """
-  LOCAL = 0
-  GLOBAL = 1
-
-
-class _PSThreadLocalState(threading.local):
-
-  def __init__(self):
-    self.val = _PositionalSemantics.LOCAL
-
-_positional_semantics = _PSThreadLocalState()
+_PositionalSemantics = pxla._PositionalSemantics
+_positional_semantics = pxla._positional_semantics
 
 
 class FrozenDict(abc.Mapping):
@@ -397,7 +371,7 @@ def xmap(fun: Callable,
       should not reuse buffers that you donate to a computation, JAX will raise
       an error if you try to.
 
-      For more details on buffer donation see the [FAQ](https://jax.readthedocs.io/en/latest/faq.html#buffer-donation).
+      For more details on buffer donation see the `FAQ <https://jax.readthedocs.io/en/latest/faq.html#buffer-donation>`_.
 
     backend: This is an experimental feature and the API is likely to change.
       Optional, a string representing the XLA backend. 'cpu', 'gpu', or 'tpu'.
@@ -459,7 +433,7 @@ def xmap(fun: Callable,
     specified. This is in line with the current multi-host :py:func:`pmap`
     programming model.
   """
-  _check_callable(fun)
+  check_callable(fun)
 
   if isinstance(in_axes, list) and not _is_axes_leaf(in_axes):
     # To be a tree prefix of the positional args tuple, in_axes can never be a
@@ -622,7 +596,7 @@ def xmap(fun: Callable,
   @wraps(fun)
   @decorate_serial
   def fun_mapped(*args):
-    tree_map(_check_arg, args)
+    tree_map(dispatch.check_arg, args)
     fun_flat, args_flat, params, _, out_tree = infer_params(*args)
     out_flat = xmap_p.bind(fun_flat, *args_flat, **params)
     return verify_outputs(out_flat, out_tree, params)
@@ -729,9 +703,14 @@ def make_xmap_callable(fun: lu.WrappedFun,
         use_spmd_lowering, global_in_avals,
         tiling_method=tiling_method, in_is_global=in_is_global)
   else:
-    return dispatch.lower_xla_callable(
-        f, None, backend, name, donated_invars, False, True,
-        *[(a, None) for a in in_avals])
+    if config.jax_array:
+      return dispatch.sharded_lowering(
+          f, None, backend, name, donated_invars, False, True,
+          *[(a, None) for a in in_avals])
+    else:
+      return dispatch.lower_xla_callable(
+          f, None, backend, name, donated_invars, False, True,
+          *[(a, None) for a in in_avals])
 
 class EvaluationPlan(NamedTuple):
   """Encapsulates preprocessing common to top-level xmap invocations and its translation rule."""
@@ -1323,10 +1302,13 @@ def _xmap_lowering_rule(ctx, *args, **kwargs):
       return _xmap_lowering_rule_spmd_manual(ctx, *args, **kwargs)
     else:
       return _xmap_lowering_rule_spmd(ctx, *args, **kwargs)
-  elif isinstance(ctx.module_context.axis_context, mlir.ReplicaAxisContext):
+  # Here ShardingContext is used in place of ReplicaAxisContext because when
+  # axis_resources and mesh is not used with xmap, `make_xmap_callable` will
+  # go via `dispatch.sharded_lowering` path which sets the context to
+  # ShardingContext. mlir.ShardingContext is not used for SPMD.
+  elif isinstance(ctx.module_context.axis_context,
+                  (mlir.ReplicaAxisContext, mlir.ShardingContext)):
     return _xmap_lowering_rule_replica(ctx, *args, **kwargs)
-  elif isinstance(ctx.module_context.axis_context, mlir.ShardingContext):
-    raise ValueError('ShardingContext cannot be used with xmap.')
   else:
     raise AssertionError("Unrecognized axis context type!")
 mlir.register_lowering(xmap_p, _xmap_lowering_rule)

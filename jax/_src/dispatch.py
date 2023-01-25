@@ -32,8 +32,7 @@ import warnings
 import numpy as np
 
 import jax
-from jax import core
-from jax import linear_util as lu
+from jax._src import linear_util as lu
 from jax.errors import UnexpectedTracerError
 from jax.monitoring import record_event_duration_secs
 import jax.interpreters.ad as ad
@@ -43,6 +42,7 @@ import jax.interpreters.xla as xla
 from jax.interpreters import pxla
 import jax.interpreters.partial_eval as pe
 from jax._src import array
+from jax._src import core
 from jax._src import device_array
 from jax._src import dtypes
 from jax._src import profiler
@@ -53,7 +53,7 @@ from jax._src.sharding import (PmapSharding, SingleDeviceSharding,
 from jax._src.abstract_arrays import array_types
 from jax._src.config import config, flags
 from jax._src.lib.mlir import ir
-from jax._src.lib import can_execute_with_token
+from jax._src.lib.mlir.dialects import use_stablehlo
 from jax._src.lib import xla_bridge as xb
 from jax._src.lib import xla_client as xc
 import jax._src.util as util
@@ -67,7 +67,7 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_string(
     'jax_dump_ir_to', os.getenv('JAX_DUMP_IR_TO', ''),
-    help="Path to which HLO/MHLO IR that is emitted by JAX as input to the "
+    help="Path to which the IR that is emitted by JAX as input to the "
          "compiler should be dumped as text files. Optional. If omitted, JAX "
          "will not dump IR.")
 
@@ -286,7 +286,7 @@ def _xla_call_impl(fun: lu.WrappedFun, *args, device, backend, name,
            "decorator were removed) was called in an attempt to get a more "
            "precise error message. However, the de-optimized function did not "
            "produce invalid values during its execution. This behavior can "
-           "result from `jit` optimizations causing the invalud value to be "
+           "result from `jit` optimizations causing the invalid value to be "
            "produced. It may also arise from having nan/inf constants as "
            "outputs, like `jax.jit(lambda ...: jax.numpy.nan)(...)`. "
            "\n\n"
@@ -385,14 +385,13 @@ def log_elapsed_time(fmt: str, event: Optional[str] = None):
 
 
 def should_tuple_args(num_args: int, platform: str):
-  # CPU does not need a tuple as it uses a buffer table
+  # CPU and GPU do not need tuples as they use host-side data structures that
+  # do not have small bounds.
   # TPU only needs a tuple for very long lists
-  if platform == "cpu":
-    return False
-  elif platform == "tpu":
+  if platform == "tpu":
     return num_args > 2000
   else:
-    return num_args > 100
+    return False
 
 
 def raise_warnings_or_errors_for_jit_of_pmap(nreps, backend, name, jaxpr):
@@ -611,6 +610,22 @@ def apply_outfeed_rewriter(jaxpr: core.Jaxpr) -> core.Jaxpr:
     return outfeed_rewriter(jaxpr)
   else:
     return jaxpr
+
+
+# TODO(mattjj,necula): this duplicates code in core.valid_jaxtype, but one
+# internal user relies on it for duck-typing. must fix downstream user!
+def _valid_jaxtype(arg):
+  try:
+    xla.abstractify(arg)  # faster than core.get_aval
+  except TypeError:
+    return core.valid_jaxtype(arg)
+  else:
+    return True
+
+def check_arg(arg):
+  if not (isinstance(arg, core.Tracer) or _valid_jaxtype(arg)):
+    raise TypeError(f"Argument '{arg}' of type {type(arg)} is not a valid "
+                    "JAX type.")
 
 
 def jaxpr_replicas(jaxpr) -> int:
@@ -858,16 +873,10 @@ def _add_tokens(has_unordered_effects: bool, ordered_effects: List[core.Effect],
   tokens_flat = flatten(tokens)
   input_bufs = [*tokens_flat, *input_bufs]
   def _remove_tokens(output_bufs, runtime_token):
-    # TODO(sharadmv): simplify when minimum jaxlib version is bumped
-    num_output_tokens = len(ordered_effects) + (not can_execute_with_token and
-        has_unordered_effects)
+    num_output_tokens = len(ordered_effects)
     token_bufs, output_bufs = util.split_list(output_bufs, [num_output_tokens])
     if has_unordered_effects or has_host_callbacks:
-      if can_execute_with_token:
-        runtime_tokens.set_output_runtime_token(device, runtime_token)
-      else:
-        output_token_buf, *token_bufs = token_bufs
-        runtime_tokens.set_output_token(device, output_token_buf)
+      runtime_tokens.set_output_runtime_token(device, runtime_token)
     for eff, token_buf in zip(ordered_effects, token_bufs):
       runtime_tokens.update_token(eff, token_buf)
     return output_bufs
@@ -888,11 +897,7 @@ def _execute_compiled(name: str, compiled: XlaLoadedExecutable,
     in_flat, token_handler = _add_tokens(
         has_unordered_effects, ordered_effects, has_host_callbacks, device,
         in_flat)
-    if can_execute_with_token:
-      out_flat, runtime_token = compiled.execute_with_token(in_flat)
-    else:
-      out_flat = compiled.execute(in_flat)
-      runtime_token = None
+    out_flat, runtime_token = compiled.execute_with_token(in_flat)
   else:
     out_flat = compiled.execute(in_flat)
   check_special(name, out_flat)
@@ -951,7 +956,7 @@ class XlaComputation(stages.XlaLowering):
   _executable: Optional[XlaCompiledComputation]
   _donated_invars: Optional[Sequence[bool]]
 
-  def __init__(self, name: str, hlo, is_trivial: bool,
+  def __init__(self, name: str, hlo: Optional[ir.Module], is_trivial: bool,
                donated_invars: Optional[Sequence[bool]],
                in_type: Optional[pe.InputType],
                out_type: Optional[pe.OutputType],
@@ -973,20 +978,25 @@ class XlaComputation(stages.XlaLowering):
   def hlo(self) -> xc.XlaComputation:
     if self.is_trivial():
       raise ValueError("A trivial computation has no HLO")
-    if isinstance(self._hlo, xc.XlaComputation):
-      return self._hlo
     return xe.mlir.mlir_module_to_xla_computation(
         mlir.module_to_string(self._hlo),
         use_tuple_args=self.compile_args["tuple_args"])
 
   def mhlo(self) -> ir.Module:
-    if self.is_trivial():
-      raise ValueError("A trivial computation has no MHLO")
-    if isinstance(self._hlo, xc.XlaComputation):
-      module_str = xe.mlir.xla_computation_to_mlir_module(self._hlo)
-      with mlir.make_ir_context():
-        return ir.Module.parse(module_str)
-    return self._hlo
+    if use_stablehlo:
+      return super().mhlo()
+    else:
+      if self.is_trivial():
+        raise ValueError("A trivial computation has no MHLO")
+      return self._hlo
+
+  def stablehlo(self) -> ir.Module:
+    if use_stablehlo:
+      if self.is_trivial():
+        raise ValueError("A trivial computation has no StableHLO")
+      return self._hlo
+    else:
+      return super().stablehlo()
 
   def compile(self) -> XlaCompiledComputation:
     if self._executable is None:
@@ -1044,10 +1054,7 @@ def compile_or_get_cached(backend, computation: ir.Module, compile_options,
   # (avoiding the overhead of back and forth conversions)
   serialized_computation: Union[str, bytes, ir.Module]
   if getattr(backend, "needs_str_ir", True):
-    if xc.mlir_api_version >= 34:
-      serialized_computation = mlir.module_to_bytecode(computation)
-    else:
-      serialized_computation = mlir.module_to_string(computation)
+    serialized_computation = mlir.module_to_bytecode(computation)
   else:
     serialized_computation = computation
 
@@ -1155,8 +1162,6 @@ def get_buffer_counts(out_avals, ordered_effects, has_unordered_effects):
   if ordered_effects or has_unordered_effects:
     num_output_tokens = len(ordered_effects)
     # TODO(sharadmv): remove check when minimum jaxlib version is bumped
-    if not can_execute_with_token:
-      num_output_tokens += has_unordered_effects
     buffer_counts = ([1] * num_output_tokens) + buffer_counts
   return buffer_counts
 
@@ -1270,6 +1275,10 @@ def device_put(x, device: Optional[Device] = None) -> Tuple[Any, ...]:
 # TODO(phawkins): update users.
 xla.device_put = device_put
 
+def _device_put_masked_array(x, device: Optional[Device]):
+  raise ValueError("numpy masked arrays are not supported as direct inputs to JAX functions. "
+                   "Use arr.filled() to convert the value to a standard numpy array.")
+
 def _device_put_array(x, device: Optional[Device]):
   backend = xb.get_device_backend(device)
   if x.dtype == dtypes.float0:
@@ -1288,6 +1297,7 @@ _scalar_types = dtypes.python_scalar_dtypes.keys()
 
 device_put_handlers: Dict[Any, Callable[[Any, Optional[Device]],
                                         Tuple[Any, ...]]] = {}
+device_put_handlers[np.ma.MaskedArray] = _device_put_masked_array
 device_put_handlers.update((t, _device_put_array) for t in array_types)
 device_put_handlers.update((t, _device_put_scalar) for t in _scalar_types)
 device_put_handlers[core.Token] = _device_put_token
@@ -1393,8 +1403,7 @@ def _device_put_impl(
     arg_handler = pxla.shard_arg_handlers[type(x)]
     result_handler = pxla.global_aval_to_result_handler(a, s, True, False)
     map_ = s.devices_indices_map(x.shape)  # type: ignore
-    return result_handler(arg_handler(x, list(map_), list(map_.values()),
-                                      pxla.InputsHandlerMode.pjit_or_xmap))
+    return result_handler(arg_handler(x, list(map_), list(map_.values())))
 
   # Only `Device` exists below. `Sharding` instance is handled above.
   if isinstance(x, array.ArrayImpl):

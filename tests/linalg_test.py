@@ -16,7 +16,6 @@
 
 from functools import partial
 import itertools
-import unittest
 
 import numpy as np
 import scipy
@@ -30,7 +29,6 @@ from jax import jit, grad, jvp, vmap
 from jax import lax
 from jax import numpy as jnp
 from jax import scipy as jsp
-from jax._src.lib import version as jaxlib_version
 from jax._src import test_util as jtu
 
 from jax.config import config
@@ -339,6 +337,7 @@ class NumpyLinalgTest(jtu.JaxTestCase):
     dtype=float_types + complex_types,
     lower=[True, False],
   )
+  @jtu.skip_on_devices("rocm")
   def testEighIdentity(self, n, dtype, lower):
     tol = 1e-3
     uplo = "L" if lower else "U"
@@ -1317,7 +1316,6 @@ class ScipyLinalgTest(jtu.JaxTestCase):
       calc_q=[False, True],
   )
   @jtu.skip_on_devices("gpu", "tpu")
-  @unittest.skipIf(jaxlib_version < (0, 3, 25), "Test requires jaxlib 0.3.25")
   def testHessenberg(self, shape, dtype, calc_q):
     rng = jtu.rand_default(self.rng())
     jsp_func = partial(jax.scipy.linalg.hessenberg, calc_q=calc_q)
@@ -1340,8 +1338,7 @@ class ScipyLinalgTest(jtu.JaxTestCase):
       dtype=float_types + complex_types,
       lower=[False, True],
   )
-  @unittest.skipIf(jaxlib_version < (0, 3, 25), "Test requires jaxlib 0.3.25")
-  @jtu.skip_on_devices("tpu")
+  @jtu.skip_on_devices("tpu","rocm")
   def testTridiagonal(self, shape, dtype, lower):
     rng = jtu.rand_default(self.rng())
     def jax_func(a):
@@ -1598,6 +1595,7 @@ class ScipyLinalgTest(jtu.JaxTestCase):
   @jtu.sample_product(
     shape=[(), (3,), (1, 4), (1, 5, 9), (11, 0, 13)],
     dtype=float_types + complex_types + int_types)
+  @jtu.skip_on_devices("rocm")
   def testToeplitzSymmetricConstruction(self, shape, dtype):
     if (dtype in [np.float64, np.complex128]
         and not config.x64_enabled):

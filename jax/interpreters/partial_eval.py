@@ -26,24 +26,27 @@ from weakref import ref
 
 import numpy as np
 
-from jax import core
-from jax import linear_util as lu
+from jax._src import linear_util as lu
+from jax.config import config
 from jax._src import api_util
+from jax._src import core
 from jax._src import dtypes
 from jax._src import profiler
+from jax._src import source_info_util
 from jax._src.api_util import flattened_fun_in_tree, flatten_fun_nokwargs
+from jax._src.core import (Trace, Tracer, Jaxpr, Literal, get_aval,
+                           AbstractValue, ClosedJaxpr, new_jaxpr_eqn,
+                           ConcreteArray, Var, DropVar,
+                           raise_to_shaped, Atom, JaxprEqn, Primitive,
+                           ShapedArray, DShapedArray, mapped_aval,
+                           unmapped_aval, DBIdx, InDBIdx, OutDBIdx,
+                           InputType, OutputType, get_referent)
 from jax._src.tree_util import (PyTreeDef, treedef_tuple, tree_unflatten,
                                 tree_leaves)
 from jax._src.util import (unzip2, safe_zip, safe_map, toposort, split_list,
                            merge_lists, partition_list, OrderedSet,
                            as_hashable_function, weakref_lru_cache)
-from jax.core import (Trace, Tracer, Jaxpr, Literal, get_aval, AbstractValue,
-                      ClosedJaxpr, new_jaxpr_eqn, ConcreteArray, Var, DropVar,
-                      raise_to_shaped, Atom, JaxprEqn, Primitive, ShapedArray,
-                      DShapedArray, mapped_aval, unmapped_aval, DBIdx, InDBIdx,
-                      OutDBIdx, InputType, OutputType, get_referent)
-from jax._src import source_info_util
-from jax.config import config
+
 
 map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
@@ -714,7 +717,7 @@ class JaxprTracer(Tracer):
     if self.pval.is_known():
       return get_referent(self.pval.get_known())
     elif isinstance(self.recipe, (FreeVar, ConstVar, Literal)):
-      return get_referent(self.recipe.val)
+      return get_referent(self.recipe.val)  # pytype: disable=attribute-error
     else:
       return self
 
@@ -1254,34 +1257,37 @@ def call_partial_eval_custom_rule(
   return eqn_known, eqn_staged, unks_out, inst_out, new_inst + residuals
 
 def closed_call_partial_eval_custom_rule(
-    jaxpr_param_name: str,
+    jaxpr_param_name: str, params_updater: ParamsUpdater,
     saveable: Callable[..., bool], unks_in: List[bool], inst_in: List[bool],
     eqn: JaxprEqn, *, res_aval: ResAvalUpdater = _default_res_aval_updater,
   ) -> Tuple[JaxprEqn, JaxprEqn, Sequence[bool], Sequence[bool], List[Var]]:
   # TODO(sharadmv,mattjj): dedup this rule with call_partial_eval_custom_rule.
   closed_jaxpr = eqn.params[jaxpr_param_name]
-  jaxpr = convert_constvars_jaxpr(closed_jaxpr.jaxpr)
-  unks_in = [False] * len(closed_jaxpr.consts) + list(unks_in)
-  inst_in = [False] * len(closed_jaxpr.consts) + list(inst_in)
-  jaxpr_known, jaxpr_staged, unks_out, inst_out, num_res = \
-      partial_eval_jaxpr_custom(jaxpr, unks_in, inst_in, False, False, saveable)
+  jaxpr_known_, jaxpr_staged_, unks_out, inst_out, num_res = \
+      partial_eval_jaxpr_custom(closed_jaxpr.jaxpr, unks_in, inst_in,
+                                False, False, saveable)
+  # Forming these fresh ClosedJaxprs defeats caching, but caller handles caching
+  jaxpr_known = core.ClosedJaxpr(jaxpr_known_, closed_jaxpr.consts)
+  jaxpr_staged = core.ClosedJaxpr(jaxpr_staged_, closed_jaxpr.consts)
   ins_known, _ = partition_list(unks_in, eqn.invars)
   out_binders_known, _ = partition_list(unks_out, eqn.outvars)
   _, ins_staged = partition_list(inst_in, eqn.invars)
   _, out_binders_staged = partition_list(inst_out, eqn.outvars)
-  newvar = core.gensym([jaxpr_known, jaxpr_staged])
-  params_known = {**eqn.params, jaxpr_param_name: core.ClosedJaxpr(jaxpr_known,
-    ())}
-  params_staged = {**eqn.params, jaxpr_param_name:
-      core.ClosedJaxpr(jaxpr_staged, ())}
-  residuals = [newvar(res_aval(params_known, var.aval))
-               for var in jaxpr_staged.invars[:num_res]]
+  newvar = core.gensym([jaxpr_known.jaxpr, jaxpr_staged.jaxpr])
+  params_known = {**eqn.params, jaxpr_param_name: jaxpr_known}
+  params_staged = {**eqn.params, jaxpr_param_name: jaxpr_staged}
+  params_known, params_staged = params_updater(
+      unks_in, inst_in, map(op.not_, unks_out), inst_out, num_res, params_known,
+      params_staged)
+  residuals = [newvar(res_aval(params_known, a))
+               for a in jaxpr_staged.in_avals[:num_res]]
   eqn_known = new_jaxpr_eqn(ins_known, [*out_binders_known, *residuals],
-                            eqn.primitive, params_known, jaxpr_known.effects, eqn.source_info)
+                            eqn.primitive, params_known, jaxpr_known.effects,
+                            eqn.source_info)
   eqn_staged = new_jaxpr_eqn([*residuals, *ins_staged], out_binders_staged,
-                             eqn.primitive, params_staged,
-                             jaxpr_staged.effects, eqn.source_info)
-  assert len(eqn_staged.invars) == len(jaxpr_staged.invars)
+                             eqn.primitive, params_staged, jaxpr_staged.effects,
+                             eqn.source_info)
+  assert len(eqn_staged.invars) == len(jaxpr_staged.in_avals)
   new_inst = [x for x, inst in zip(eqn.invars, inst_in)
               if type(x) is Var and not inst]
   return eqn_known, eqn_staged, unks_out, inst_out, new_inst + residuals
@@ -1290,7 +1296,8 @@ partial_eval_jaxpr_custom_rules[core.call_p] = \
     partial(call_partial_eval_custom_rule, 'call_jaxpr',
             lambda _, __, ___, ____, _____, x, y: (x, y))
 partial_eval_jaxpr_custom_rules[core.closed_call_p] = \
-    partial(closed_call_partial_eval_custom_rule, 'call_jaxpr')
+    partial(closed_call_partial_eval_custom_rule, 'call_jaxpr',
+            lambda _, __, ___, ____, _____, x, y: (x, y))
 
 
 def _jaxpr_forwarding(jaxpr: Jaxpr) -> List[Optional[int]]:
@@ -1298,7 +1305,8 @@ def _jaxpr_forwarding(jaxpr: Jaxpr) -> List[Optional[int]]:
   fwds: Dict[Var, Var] = dict(zip(jaxpr.invars, jaxpr.invars))
   for eqn in jaxpr.eqns:
     if eqn.primitive in forwarding_rules:
-      eqn = eqn.replace(invars=[fwds.get(v, v) for v in eqn.invars])  # type: ignore
+      eqn = eqn.replace(invars=[a if type(a) is Literal else fwds.get(a, a)  # type: ignore
+                                for a in eqn.invars])
       fwd_vars, _ = forwarding_rules[eqn.primitive](eqn)
       for v_orig, v_new in zip(eqn.outvars, fwd_vars):
         if v_new is not None:
@@ -1774,7 +1782,7 @@ class DynamicJaxprTrace(core.Trace):
     reduced_in_avals = [core.mapped_aval(axis_size, in_axis, a)
                         if in_axis is not None else a
                         for a, in_axis in zip(in_avals, params['in_axes'])]
-    with core.extend_axis_env(axis_name, axis_size, None):  # type: ignore
+    with core.extend_axis_env(axis_name, params["global_axis_size"], None):  # type: ignore
       with core.new_sublevel():
         jaxpr, reduced_out_avals, consts = trace_to_subjaxpr_dynamic(
             f, self.main, reduced_in_avals, debug_info=debug_info_final(f, map_primitive.name))
@@ -2406,11 +2414,11 @@ def _substitute_axis_sizes(env: Dict, aval: AbstractValue) -> AbstractValue:
 
 def _is_bint_axis_size(d: Union[int, core.DArray, core.Var]) -> bool:
   if isinstance(d, core.DArray):
-    assert not d.shape
-    return type(d.dtype) is core.bint
+    assert not d.shape                 # pytype: disable=attribute-error
+    return type(d.dtype) is core.bint  # pytype: disable=attribute-error
   elif isinstance(d, core.Var):
-    return (isinstance(d.aval, core.DShapedArray) and
-            type(d.aval.dtype) is core.bint)
+    return (isinstance(d.aval, core.DShapedArray) and  # pytype: disable=attribute-error
+            type(d.aval.dtype) is core.bint)           # pytype: disable=attribute-error
   return False
 
 

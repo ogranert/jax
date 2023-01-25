@@ -40,13 +40,14 @@ from jax.interpreters import mlir
 from jax.interpreters import batching
 from jax.interpreters import pxla
 from jax._src import array
-from jax._src.lib.mlir.dialects import mhlo
+from jax._src.lib.mlir.dialects import hlo
 from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import test_util as jtu
 from jax._src import lax_reference
 from jax._src.util import prod
 from jax._src.lax import lax as lax_internal
+from jax._src.lib import xla_client as xc
 
 from jax.config import config
 config.parse_flags_with_absl()
@@ -2225,7 +2226,7 @@ class LaxTest(jtu.JaxTestCase):
           ((10,), np.array([[0], [0], [0]]), (3, 2), lax.ScatterDimensionNumbers(
             update_window_dims=(1,), inserted_window_dims=(),
             scatter_dims_to_operand_dims=(0,))),
-          ((10, 5,), np.array([[0], [2], [1]]), (3, 3), lax.ScatterDimensionNumbers(
+          ((10, 5,), np.array([[0], [2], [1]], dtype=np.uint64), (3, 3), lax.ScatterDimensionNumbers(
             update_window_dims=(1,), inserted_window_dims=(0,),
             scatter_dims_to_operand_dims=(0,))),
     ]],
@@ -2866,37 +2867,40 @@ class FooTyRules:
     start_indices = (*start_indices, 0)
     limit_indices = (*limit_indices, 2)
     strides = (*strides, 1)
-    return mhlo.SliceOp(x,
-                        mlir.dense_int_elements(start_indices),
-                        mlir.dense_int_elements(limit_indices),
-                        mlir.dense_int_elements(strides)).result
+    return hlo.SliceOp(x,
+                       mlir.dense_int_elements(start_indices),
+                       mlir.dense_int_elements(limit_indices),
+                       mlir.dense_int_elements(strides)).result
 
   @staticmethod
   def dynamic_slice_mlir(ctx, aval_out, x, start_indices):
     dtype = dtypes.canonicalize_dtype(np.dtype('int64'))
     start_indices = (*start_indices, mlir.ir_constant(np.array(0, dtype=dtype)))
     slice_sizes_ = mlir.dense_int_elements((*aval_out.shape, 2))
-    return mhlo.DynamicSliceOp(x, start_indices, slice_sizes_).result
+    return hlo.DynamicSliceOp(x, start_indices, slice_sizes_).result
 
   @staticmethod
   def dynamic_update_slice_mlir(ctx, aval_out, x, update, *start_indices):
     aval_out, = ctx.avals_out
     dtype = dtypes.canonicalize_dtype(np.dtype('int64'))
     start_indices = (*start_indices, mlir.ir_constant(np.array(0, dtype=dtype)))
-    return mhlo.DynamicUpdateSliceOp(mlir.aval_to_ir_type(aval_out), x, update,
-                                     start_indices).result
+    if xc.mlir_api_version < 40:
+      return hlo.DynamicUpdateSliceOp(
+          mlir.aval_to_ir_type(aval_out), x, update, start_indices).result
+    else:
+      return hlo.DynamicUpdateSliceOp(x, update, start_indices).result
 
   @staticmethod
   def broadcast_in_dim_mlir(ctx, aval_out, x, broadcast_dimensions):
     broadcast_dimensions = [*broadcast_dimensions, aval_out.ndim]
-    return mhlo.BroadcastInDimOp(
+    return hlo.BroadcastInDimOp(
         mlir.aval_to_ir_type(aval_out), x,
         mlir.dense_int_elements(broadcast_dimensions)).result
 
   @staticmethod
   def transpose_mlir(ctx, aval_out, x, *, permutation):
     perm = [*permutation, len(permutation)]
-    return mhlo.TransposeOp(x, mlir.dense_int_elements(perm)).result
+    return hlo.TransposeOp(x, mlir.dense_int_elements(perm)).result
 
   @staticmethod
   def gather_mlir(ctx, avals_in, aval_out, x, indices, *,
@@ -2976,7 +2980,7 @@ def device_put_foo_array(x: FooArray, device):
     return array._device_put_array(x.data, device)
   return dispatch._device_put_array(x.data, device)
 
-def shard_foo_array_handler(x, devices, indices, mode):
+def shard_foo_array_handler(x, devices, indices):
   device, = devices
   if isinstance(x.data, array.ArrayImpl):
     return dispatch._device_put_jax_array(x.data, device)

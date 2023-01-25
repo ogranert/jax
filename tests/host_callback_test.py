@@ -36,6 +36,7 @@ from jax.experimental import maps
 from jax.experimental import pjit
 from jax import lax
 from jax import numpy as jnp
+from jax._src import lib as jaxlib
 from jax._src import test_util as jtu
 from jax import tree_util
 from jax._src.lib import xla_client
@@ -57,7 +58,7 @@ class _TestingOutputStream:
     self._test_method_name = None
 
   def write(self, what: str) -> None:
-    print(f"output_stream[{self._test_method_name}]: {what}", end="")
+    logging.info(f"output_stream[{self._test_method_name}]: {what}")
     self._output.append(what)
 
   @property
@@ -100,11 +101,19 @@ def fun1_equiv(a):  # Numerical equivalent of fun1
   return (a * 2.) ** 2
 
 
-def maybe_print(do_print: bool, arg, what: str, tap_with_device: Optional[bool] = False):
+def maybe_print(do_print: bool,
+                arg,
+                what: str,
+                tap_with_device: Optional[bool] = False,
+                device_index: int = 0):
   """Conditionally print on testing_string"""
   if do_print:
-    return hcb.id_print(arg, what=what,
-                        output_stream=testing_stream, tap_with_device=tap_with_device)
+    return hcb.id_print(
+        arg,
+        what=what,
+        output_stream=testing_stream,
+        tap_with_device=tap_with_device,
+        device_index=device_index)
   else:
     return arg
 
@@ -167,9 +176,8 @@ def helper_set_hlo_dump():
 
 def helper_print_optimized_hlo(fun, *args):
   backend = xla_bridge.get_backend(platform=jtu.device_under_test())
-  c = jax.xla_computation(fun, backend=backend.platform)(*args)
-  print(re.sub(r", metadata.*", "",
-               backend.compile(c).hlo_modules()[0].to_string()))
+  c = jax.jit(fun, backend=backend.platform).lower(*args)
+  logging.info(re.sub(r", metadata.*", "", c.compile().as_text()))
 
 
 def helper_log_ir(name,
@@ -177,30 +185,13 @@ def helper_log_ir(name,
                   *args,
                   num_partitions=None,
                   strip_metadata=False):
-  print(f"Jaxpr[{name}]: {jax.make_jaxpr(f_jax)(*args)}")
-  jax_comp = f_jax.lower(*args).compiler_ir(dialect="hlo")
-  print(f"HLO[{name}]: {jax_comp.as_hlo_text()}")
-
-  backend = xla_bridge.get_backend()
-  if num_partitions is not None:
-    num_replicas = 1
-    device_assignment = np.array(jax.devices()[:num_partitions * num_replicas])
-    device_assignment = np.reshape(device_assignment, (-1, num_partitions))
-    use_spmd_partitioning = num_partitions > 1
-    compile_options = xla_bridge.get_compile_options(
-        num_replicas=num_replicas,
-        num_partitions=num_partitions,
-        device_assignment=device_assignment,
-        use_spmd_partitioning=use_spmd_partitioning,
-    )
-  else:
-    compile_options = None
-  jax_optimized_hlo = backend.compile(
-      jax_comp, compile_options).hlo_modules()[0].to_string()
+  logging.info(f"Jaxpr[{name}]: {jax.make_jaxpr(f_jax)(*args)}")
+  jax_comp = f_jax.lower(*args)
+  logging.info(f"HLO[{name}]: {jax_comp.compiler_ir(dialect='hlo').as_hlo_text()}")
+  jax_optimized_hlo = jax_comp.compile().as_text()
   if strip_metadata:
     jax_optimized_hlo = re.sub(r", metadata.*", "", jax_optimized_hlo)
-  print(f"Optimized HLO[{name}] for "
-               f"platform {backend.platform}: {jax_optimized_hlo}")
+  logging.info(f"Optimized HLO[{name}]: {jax_optimized_hlo}")
 
 
 prev_xla_flags = None
@@ -243,6 +234,7 @@ def assertMultiDeviceOutputEqual(tst: jtu.JaxTestCase,
   return assertMultiLineStrippedEqual(tst, expected, what)
 
 
+@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # crashes runtime
 class HostCallbackTapTest(jtu.JaxTestCase):
 
   def setUp(self):
@@ -903,12 +895,14 @@ class HostCallbackTapTest(jtu.JaxTestCase):
 
     treedef = tree_util.tree_structure(arg)
     if FLAGS.jax_host_callback_ad_transforms:
-      assertMultiLineStrippedEqual(self, f"""
+      assertMultiLineStrippedEqual(
+          self, f"""
         {{ lambda ; a:f32[]. let
             b:f32[] = mul a 3.00
             c:f32[] = outside_call[
               arg_treedef={treedef}
               callback=...
+              device_index=0
               identity=True
               transforms=()
             ] b
@@ -923,12 +917,14 @@ class HostCallbackTapTest(jtu.JaxTestCase):
             f:f32[] = mul e 3.00
           in (f,) }}""", jaxpr)
     else:
-      assertMultiLineStrippedEqual(self, f"""
+      assertMultiLineStrippedEqual(
+          self, f"""
         {{ lambda ; a:f32[]. let
             b:f32[] = mul a 3.00
             c:f32[] = outside_call[
               arg_treedef={treedef}
               callback=...
+              device_index=0
               identity=True
             ] b
             _:f32[] = mul 2.00 c
@@ -1694,28 +1690,33 @@ class HostCallbackTapTest(jtu.JaxTestCase):
     assertMultiLineStrippedEqual(self, """
         TBD""", testing_stream.output)
 
-  @jtu.skip_on_devices("cpu", "gpu")
-  # TODO(necula): file XLA:GPU bug for the 'Sharding' CustomCall
-  def test_tap_pjit(self):
+  @jtu.sample_product(device_index=[0, 1])
+  def test_tap_pjit(self, device_index=0):
+    if (device_index != 0 and
+        not FLAGS.jax_host_callback_outfeed and
+        jtu.device_under_test() == "cpu"):
+      raise SkipTest("device_index works only with outfeed")
+
     devices = np.array(local_devices())
     nr_devices = len(devices)
     if nr_devices < 2:
       raise SkipTest("test requires at least 2 devices")
 
-    print(f"test_tap_pjit is running on devices {devices}.")
+    logging.info(f"test_tap_pjit is running on devices {devices}.")
     # x: i32[D, 3] = [[0, 1, 2], [10, 11, 12], ...]
     # y: i32[3, 4]
     x = jnp.arange(100, dtype=jnp.int32).reshape((10, 10))[:nr_devices, :3]
     y = jnp.ones((3, 4), np.int32)
 
     @partial(jax.named_call, name="fun1")  # for xprof debugging
-    def fun1(x, do_print=False):
+    def fun1(x):
       z = jnp.dot(x, y)
-      return maybe_print(do_print, z, "z", tap_with_device=True)
+      return hcb.id_print(z, what="z",
+                          output_stream=testing_stream,
+                          tap_with_device=True, device_index=device_index)
 
-    res0 = fun1(x, do_print=False)
     pjit_fun1 = pjit.pjit(
-        partial(fun1, do_print=True),
+        fun1,
         in_axis_resources=(P("d"),),
         out_axis_resources=P("d"))
 
@@ -1728,14 +1729,14 @@ class HostCallbackTapTest(jtu.JaxTestCase):
           num_partitions=nr_devices)
       res = pjit_fun1(x)
 
-    self.assertAllClose(res0, res)
+    self.assertAllClose(jnp.dot(x, y), res)
     hcb.barrier_wait("before check")
 
     # Assertion text is for 2 devices (also works for 1 device)
     # Note that a single call is made.
     assertMultiDeviceOutputEqual(
-        self, """
-       device: cpu:0 what: z
+        self, f"""
+       device: cpu:{device_index} what: z
        [[ 3  3  3  3]
         [33 33 33 33]]""")
 
@@ -1877,11 +1878,15 @@ class HostCallbackTapTest(jtu.JaxTestCase):
     comp = xla_client.XlaBuilder(self._testMethodName)
     token = hcb.xops.CreateToken(comp)
     hcb._initialize_outfeed_receiver()  # Needed if this is the sole test
+    if jaxlib.xla_extension_version >= 112:
+      args = [0]
+    else:
+      args = []
     with self.assertRaisesRegex(RuntimeError,
                                 "Consumer ID cannot be a reserved value: 0"):
       hcb._callback_handler_data.receiver.add_outfeed(
           comp, token, 0,
-          [xops.Constant(comp, np.zeros((2, 3), dtype=np.float32))])
+          [xops.Constant(comp, np.zeros((2, 3), dtype=np.float32))], *args)
 
   def test_tap_error_different_shapes(self):
     """Try to register different shapes for the same consumer ID."""
@@ -1890,19 +1895,23 @@ class HostCallbackTapTest(jtu.JaxTestCase):
     comp = xla_client.XlaBuilder(self._testMethodName)
     token = hcb.xops.CreateToken(comp)
     hcb._initialize_outfeed_receiver()  # Needed if this is the sole test
+    if jaxlib.xla_extension_version >= 112:
+      args = [0]
+    else:
+      args = []
     hcb._callback_handler_data.receiver.add_outfeed(
         comp, token, 123,
-        [xops.Constant(comp, np.zeros((2, 3), dtype=np.float32))])
+        [xops.Constant(comp, np.zeros((2, 3), dtype=np.float32))], *args)
     with self.assertRaisesRegex(
         RuntimeError, ".*does not match previous shape element_type.*"):
       hcb._callback_handler_data.receiver.add_outfeed(
           comp, token, 123,
-          [xops.Constant(comp, np.zeros((2, 3), dtype=np.int32))])
+          [xops.Constant(comp, np.zeros((2, 3), dtype=np.int32))], *args)
     with self.assertRaisesRegex(
         RuntimeError, ".*does not match previous shape element_type.*"):
       hcb._callback_handler_data.receiver.add_outfeed(
           comp, token, 123,
-          [xops.Constant(comp, np.zeros((2,), dtype=np.float32))])
+          [xops.Constant(comp, np.zeros((2,), dtype=np.float32))], *args)
 
   def test_tap_id_tap_removed_kwargs(self):
     def func(x, transforms, y):
@@ -2024,6 +2033,7 @@ class HostCallbackTapTest(jtu.JaxTestCase):
     self.assertMultiLineStrippedEqual(expected, testing_stream.output)
 
 
+@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # crashes runtime
 class HostCallbackCallTest(jtu.JaxTestCase):
   """Tests for hcb.call"""
 
@@ -2302,15 +2312,15 @@ class HostCallbackCallTest(jtu.JaxTestCase):
                                 "batching rules are implemented only for id_tap, not for call"):
       jax.vmap(fun)(np.ones((2, 3)))
 
-  @jtu.skip_on_devices("cpu", "gpu")
-  # TODO(necula): file XLA:GPU bug for the 'Sharding' CustomCall
-  def test_call_pjit(self):
+  @jtu.sample_product(device_index=[0, 1])
+  @jtu.skip_on_devices("cpu")  # TODO: RET_CHECK failure
+  def test_call_pjit(self, device_index=0):
     devices = np.array(local_devices())
     nr_devices = len(devices)
     if nr_devices < 2:
       raise SkipTest("test requires at least 2 devices")
 
-    print(f"test_call_pjit is running on devices {devices}.")
+    logging.info(f"test_call_pjit is running on devices {devices}.")
     # x: i32[D, 3] = [[0, 1, 2], [10, 11, 12], ...]
     # y: i32[3, 4]
     x = jnp.arange(100, dtype=jnp.int32).reshape((10, 10))[:nr_devices, :3]
@@ -2323,7 +2333,8 @@ class HostCallbackCallTest(jtu.JaxTestCase):
     def fun(x):
       xy = jnp.dot(x, y)
       return hcb.call(
-          callback_x5_func, xy, result_shape=xy, call_with_device=True)
+          callback_x5_func, xy, result_shape=xy, call_with_device=True,
+          device_index=device_index)
 
     pjit_fun = pjit.pjit(
         fun, in_axis_resources=(P("d"),), out_axis_resources=P("d"))
@@ -2343,8 +2354,8 @@ class HostCallbackCallTest(jtu.JaxTestCase):
     hcb.barrier_wait("before assertion")
     # Assertion text is for 2 devices (also works for 1 device)
     assertMultiDeviceOutputEqual(
-        self, """
-        device: cpu:0
+        self, f"""
+        device: cpu:{device_index}
          Called with [[ 3  3  3  3]
          [33 33 33 33]]""")
 
@@ -2452,6 +2463,7 @@ def call_jax_other_device(jax_outside_fun, arg, *, device):
   return make_call(arg)
 
 
+@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # crashes runtime
 class CallJaxTest(jtu.JaxTestCase):
   """Tests using `call_jax_other_device`."""
 
@@ -2526,6 +2538,7 @@ class CallJaxTest(jtu.JaxTestCase):
     self.assertAllClose(res_jax, res_outside)
 
 
+@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # crashes runtime
 class OutfeedRewriterTest(jtu.JaxTestCase):
 
   def setUp(self):

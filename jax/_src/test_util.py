@@ -32,20 +32,21 @@ import numpy as np
 import numpy.random as npr
 
 import jax
-from jax._src import api
-from jax import core
-from jax._src import dtypes as _dtypes
 from jax import lax
+from jax.interpreters import mlir
+from jax.tree_util import tree_map, tree_all, tree_flatten, tree_unflatten
+from jax._src import api
+from jax._src import core
+from jax._src import dispatch
+from jax._src import dtypes as _dtypes
 from jax._src.config import flags, bool_env, config
 from jax._src.numpy.lax_numpy import _promote_dtypes, _promote_dtypes_inexact
 from jax._src.util import prod, unzip2
-from jax.tree_util import tree_map, tree_all, tree_flatten, tree_unflatten
 from jax._src.lib import xla_bridge
-from jax._src import dispatch
 from jax._src.public_test_util import (  # noqa: F401
     _assert_numpy_allclose, _check_dtypes_match, _default_tolerance, _dtype, check_close, check_grads,
     check_jvp, check_vjp, default_gradient_tolerance, default_tolerance, device_under_test, tolerance)
-from jax.interpreters import mlir
+
 
 # This submodule includes private test utilities that are not exported to
 # jax.test_util. Functionality appearing here is for internal use only, and
@@ -308,7 +309,7 @@ def skip_on_xla_cpu_mlir(test_method):
   @functools.wraps(test_method)
   def test_method_wrapper(self, *args, **kwargs):
     xla_flags = os.getenv('XLA_FLAGS') or ''
-    if '--xla_cpu_use_xla_runtime' in xla_flags or '--xla_cpu_enable_mlir_lowering' in xla_flags:
+    if '--xla_cpu_use_xla_runtime' in xla_flags:
       test_name = getattr(test_method, '__name__', '[unknown test]')
       raise unittest.SkipTest(
           f'{test_name} not supported on XLA:CPU MLIR')
@@ -329,6 +330,17 @@ def skip_on_flag(flag_name, skip_value):
       return test_method(self, *args, **kwargs)
     return test_method_wrapper
   return skip
+
+
+def pytest_mark_if_available(marker: str):
+  """A decorator for test classes or methods to pytest.mark if installed."""
+  def wrap(func_or_class):
+    try:
+      import pytest
+    except ImportError:
+      return func_or_class
+    return getattr(pytest.mark, marker)(func_or_class)
+  return wrap
 
 
 def format_test_name_suffix(opname, shapes, dtypes):

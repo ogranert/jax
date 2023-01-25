@@ -119,7 +119,7 @@ def initialize(coordinator_address: Optional[str] = None,
     * it performs health checking, ensuring that all processes shut down if any process dies, and
     * it is used for distributed checkpointing.
 
-  If you are using TPU or Slurm, all arguments are optional: if omitted, they
+  If you are using TPU, Slurm, or Open MPI, all arguments are optional: if omitted, they
   will be chosen automatically.
 
   Otherwise, you must provide the ``coordinator_address``,
@@ -131,6 +131,8 @@ def initialize(coordinator_address: Optional[str] = None,
       port does not matter, so long as the port is available on the coordinator
       and all processes agree on the port.
       May be ``None`` only on supported environments, in which case it will be chosen automatically.
+      Note that special addresses like ``localhost`` or ``127.0.0.1`` usually mean that the program
+      will bind to a local interface and are not suitable when running in a multi-host environment.
     num_processes: Number of processes. May be ``None`` only on supported environments, in
       which case it will be chosen automatically.
     process_id: The ID number of the current process. The ``process_id`` values across
@@ -138,7 +140,7 @@ def initialize(coordinator_address: Optional[str] = None,
       May be ``None`` only on supported environments; if ``None`` it will be chosen automatically.
     local_device_ids: Restricts the visible devices of the current process to ``local_device_ids``.
       If ``None``, defaults to all local devices being visible to the process except when processes
-      are launched via Slurm on GPUs. In that case, it will default to a single device per process.
+      are launched via Slurm and Open MPI on GPUs. In that case, it will default to a single device per process.
 
   Raises:
     RuntimeError: If :func:`~jax.distributed.initialize` is called more than once.

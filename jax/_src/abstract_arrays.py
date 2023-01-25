@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from functools import partial
+from typing import Set
 
 import numpy as np
 
 from jax._src import ad_util
-from jax import core
+from jax._src import core
 from jax._src import dtypes
 
 from jax._src import traceback_util
@@ -37,19 +40,25 @@ def zeros_like_array(x):
   aval = ShapedArray(np.shape(x), dtype, weak_type=weak_type)
   return ad_util.zeros_like_aval(aval)
 
-numpy_scalar_types = {
+numpy_scalar_types: Set[type] = {  # pylint: disable=g-bare-generic
     np.int8, np.int16, np.int32, np.int64,
     np.uint8, np.uint16, np.uint32, np.uint64,
-    dtypes.bfloat16, np.float16, np.float32, np.float64,
     np.complex64, np.complex128,
     np.bool_, np.longlong, np.intc,
-}
+} | set(np.dtype(dt).type for dt in dtypes._float_types)
 
-array_types = {np.ndarray} | numpy_scalar_types
+array_types: Set[type] = {np.ndarray} | numpy_scalar_types  # pylint: disable=g-bare-generic
 
 def canonical_concrete_aval(val, weak_type=None):
   return ConcreteArray(dtypes.canonicalize_dtype(np.result_type(val)), val,
                        weak_type=weak_type)
+
+def masked_array_error(*args, **kwargs):
+  raise ValueError("numpy masked arrays are not supported as direct inputs to JAX functions. "
+                   "Use arr.filled() to convert the value to a standard numpy array.")
+
+core.pytype_aval_mappings[np.ma.MaskedArray] = masked_array_error
+ad_util.jaxval_zeros_likers[np.ma.MaskedArray] = masked_array_error
 
 for t in array_types:
   core.pytype_aval_mappings[t] = canonical_concrete_aval
@@ -64,7 +73,8 @@ def _zeros_like_python_scalar(t, x):
 
 def _make_concrete_python_scalar(t, x):
   dtype = dtypes._scalar_type_to_dtype(t, x)
-  return canonical_concrete_aval(np.array(x, dtype=dtype), weak_type=True)
+  weak_type = dtypes.is_weakly_typed(x)
+  return canonical_concrete_aval(np.array(x, dtype=dtype), weak_type=weak_type)
 
 for t in dtypes.python_scalar_dtypes:
   core.pytype_aval_mappings[t] = partial(_make_concrete_python_scalar, t)

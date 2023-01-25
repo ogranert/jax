@@ -14,6 +14,7 @@
 
 import contextlib
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -39,11 +40,6 @@ try:
   import portpicker
 except ImportError:
   portpicker = None
-
-try:
-  import pytest
-except ImportError:
-  pytest = None
 
 config.parse_flags_with_absl()
 
@@ -187,14 +183,50 @@ class MultiProcessGpuTest(jtu.JaxTestCase):
         for proc in subprocesses:
           proc.kill()
 
+  def test_gpu_ompi_distributed_initialize(self):
+    if jtu.device_under_test() != 'gpu':
+      raise unittest.SkipTest('Tests only for GPU.')
+    if shutil.which('mpirun') is None:
+      raise unittest.SkipTest('Tests only for MPI (mpirun not found).')
+
+    num_gpus = 4
+    num_gpus_per_task = 1
+
+    with contextlib.ExitStack() as exit_stack:
+      args = [
+          'mpirun',
+          '--oversubscribe',
+          '--allow-run-as-root',
+          '-n',
+          str(num_gpus),
+          sys.executable,
+          '-c',
+          ('import jax, os; '
+          'jax.distributed.initialize(); '
+          'print(f\'{jax.local_device_count()},{jax.device_count()}\' if jax.process_index() == 0 else \'\', end="")'
+          )
+      ]
+      env = os.environ.copy()
+      # In case the job was launched via Slurm,
+      # prevent OpenMPI from detecting Slurm environment
+      env.pop('SLURM_JOBID', None)
+      proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, universal_newlines=True)
+      proc = exit_stack.enter_context(proc)
+
+      try:
+        out, _ = proc.communicate()
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(out, f'{num_gpus_per_task},{num_gpus}')
+      finally:
+        proc.kill()
+
+
 @unittest.skipIf(
     os.environ.get("SLURM_JOB_NUM_NODES", None) != "2",
     "Slurm environment with at least two nodes needed!")
-@unittest.skipIf(not pytest, "Test requires pytest markers")
+@jtu.pytest_mark_if_available('SlurmMultiNodeGpuTest')
 class SlurmMultiNodeGpuTest(jtu.JaxTestCase):
-
-  if pytest is not None:
-    pytestmark = pytest.mark.SlurmMultiNodeGpuTest
 
   def sorted_devices(self):
     devices = sorted(jax.devices(), key=lambda d: (d.id, d.host_id))
@@ -509,7 +541,7 @@ class SlurmMultiNodeGpuTest(jtu.JaxTestCase):
       inp_aval = jax.ShapedArray((8, 2), jnp.int32)
       # `ShapedArray` is considered global when lowered and compiled.
       # Hence it can bypass the contiguous mesh restriction.
-      compiled = f.lower(inp_aval, gda1, _global_avals=True).compile()
+      compiled = f.lower(inp_aval, gda1).compile()
       out1, out2 = compiled(gda1, gda1)
       self.assertIsInstance(out1, global_device_array.GlobalDeviceArray)
       self.assertEqual(out1.shape, (8, 2))

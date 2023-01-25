@@ -125,17 +125,20 @@ this function that does accept sparse matrices:
     >>> f_sp(M_sp, y)
     Array([17.635532,  5.158883, 17.09438 ,  7.591674], dtype=float32)
 
-Currently support for :func:`sparsify` is limited to a couple dozen primitives, including:
+Support for :func:`sparsify` includes a large number of the most common primitives, including:
 
-- generalized matrix-matrix products (:obj:`~jax.lax.dot_general_p`)
-- generalized array transpose (:obj:`~jax.lax.transpose_p`)
-- zero-preserving elementwise binary operations (:obj:`~jax.lax.add_p`, :obj:`~jax.lax.mul_p`)
-- zero-preserving elementwise unary operations (:obj:`~jax.lax.abs_p`, :obj:`jax.lax.neg_p`, etc.)
+- generalized (batched) matrix products & einstein summations (:obj:`~jax.lax.dot_general_p`)
+- zero-preserving elementwise binary operations (e.g. :obj:`~jax.lax.add_p`, :obj:`~jax.lax.mul_p`, etc.)
+- zero-preserving elementwise unary operations (e.g. :obj:`~jax.lax.abs_p`, :obj:`jax.lax.neg_p`, etc.)
 - summation reductions (:obj:`lax.reduce_sum_p`)
+- general indexing operations (:obj:`lax.slice_p`, `lax.dynamic_slice_p`, `lax.gather_p`)
+- concatenation and stacking (:obj:`lax.concatenate_p`)
+- transposition & reshaping ((:obj:`~jax.lax.transpose_p`, :obj:`lax.reshape_p`, :obj:`lax.squeeze_p`)
 - some higher-order functions (:obj:`lax.cond_p`, :obj:`lax.while_p`, :obj:`lax.scan_p`)
 
-This initial support is enough to enable some surprisingly sophisticated workflows, as the
-next section will show.
+Nearly any :mod:`jax.numpy` function that lowers to these supported primitives can be used
+within a sparsify transform to operate on sparse arrays. This set of primitives is enough
+to enable relatively sophisticated sparse workflows, as the next section will show.
 
 Example: sparse logistic regression
 -----------------------------------
@@ -183,7 +186,13 @@ To fit the same model on sparse data, we can apply the :func:`sparsify` transfor
      -0.670236    0.03132951 -0.05356663]
 """
 
+# Note: import <name> as <name> is required for names to be exported.
+# See PEP 484 & https://github.com/google/jax/issues/7570
+
 from jax.experimental.sparse.ad import (
+    jacfwd as jacfwd,
+    jacobian as jacobian,
+    jacrev as jacrev,
     grad as grad,
     value_and_grad as value_and_grad,
 )
@@ -220,6 +229,8 @@ from jax.experimental.sparse.bcoo import (
 )
 
 from jax.experimental.sparse.bcsr import (
+    bcsr_dot_general as bcsr_dot_general,
+    bcsr_dot_general_p as bcsr_dot_general_p,
     bcsr_extract as bcsr_extract,
     bcsr_extract_p as bcsr_extract_p,
     bcsr_fromdense as bcsr_fromdense,
@@ -277,4 +288,4 @@ from jax.experimental.sparse.transform import (
     SparseTracer as SparseTracer,
 )
 
-from jax.experimental.sparse import linalg
+from jax.experimental.sparse import linalg as linalg

@@ -27,8 +27,6 @@ from jax._src.lib import xla_client as xc
 from jax._src.config import config
 from jax.interpreters import pxla, xla, mlir
 from jax._src.util import prod, safe_zip
-from jax._src.api import device_put
-from jax._src.lib import xla_extension_version
 from jax.interpreters.pxla import PartitionSpec
 
 Shape = Tuple[int, ...]
@@ -191,7 +189,7 @@ class GlobalDeviceArray:
         partitioned.
 
       For more information, please see:
-      https://jax.readthedocs.io/en/latest/jax-101/08-pjit.html#more-information-on-partitionspec
+      https://jax.readthedocs.io/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html
     device_buffers: DeviceArrays that are on the local devices of ``global_mesh``.
 
   Attributes:
@@ -471,11 +469,7 @@ class GlobalDeviceArray:
 
   def delete(self):
     if self._sharded_buffer:
-      if xla_extension_version >= 101:
-        self._sharded_buffer.delete()
-      else:
-        for b in self._sharded_buffer.get_device_buffers():
-          b.delete()
+      self._sharded_buffer.delete()
       self._sharded_buffer = None
     if self._maybe_device_buffers:
       for b in self._maybe_device_buffers:
@@ -525,7 +519,7 @@ class GlobalDeviceArray:
         global_shape, global_mesh, mesh_axes)
     local_devices = global_mesh.local_devices
     dbs = [
-        device_put(data_callback(global_indices_rid[device][0]), device)
+        jax.device_put(data_callback(global_indices_rid[device][0]), device)
         for device in local_devices
     ]
     return cls(global_shape, global_mesh, mesh_axes, dbs,
@@ -658,10 +652,8 @@ def _gda_mlir_constant_handler(val, canonicalize_types=True):
 mlir.register_constant_handler(GlobalDeviceArray, _gda_mlir_constant_handler)
 
 
-def _gda_shard_arg(x, devices, indices, mode):
+def _gda_shard_arg(x, devices, indices):
   x._check_if_deleted()
-  if mode == pxla.InputsHandlerMode.pmap:
-    raise RuntimeError('GDA is not supported with pmap.')
   # self._sharded_buffer can be None if _DeviceArray is used.
   if x._sharded_buffer is None:
     return x._device_buffers

@@ -27,13 +27,16 @@ from typing import (Any, Callable, Dict, List, NamedTuple, Optional,
 import numpy as np
 
 from jax.config import config
-from jax import core
+from jax.interpreters import partial_eval as pe
+from jax.interpreters import ad
+
+from jax._src import core
 from jax._src import device_array
 from jax._src import dtypes
+from jax._src import pretty_printer as pp
 from jax._src import source_info_util
 from jax._src.abstract_arrays import numpy_scalar_types
-from jax.core import (ConcreteArray, ShapedArray, str_eqn_compact)
-import jax._src.pretty_printer as pp
+from jax._src.core import ConcreteArray, ShapedArray, str_eqn_compact
 from jax._src.util import (prod, new_name_stack, safe_zip, safe_map,
                            partition_list)
 
@@ -44,9 +47,6 @@ from jax._src.typing import Shape
 
 from jax._src.lib import xla_bridge as xb
 from jax._src.lib import xla_client as xc
-from jax._src.lib import xla_extension_version
-from jax.interpreters import partial_eval as pe
-from jax.interpreters import ad
 
 map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
@@ -63,10 +63,7 @@ XlaOp = xc.XlaOp
 XlaShape = xc.Shape
 XlaBuilder = xc.XlaBuilder
 XlaLoadedExecutable = Any
-if xla_extension_version >= 98:
-  XlaLoadedExecutable = xc.LoadedExecutable  # type:ignore
-else:
-  XlaLoadedExecutable = xc.Executable  # type:ignore
+XlaLoadedExecutable = xc.LoadedExecutable  # type:ignore
 
 # apply_primitive is defined in jax._src.dispatch.
 apply_primitive: Callable
@@ -246,6 +243,9 @@ def canonicalize_dtype(x):
     return canonicalize_dtype(x.__jax_array__())
   raise TypeError(f"No canonicalize_dtype handler for type: {type(x)}")
 
+def _canonicalize_masked_array_dtype(x):
+  raise ValueError("numpy masked arrays are not supported as direct inputs to JAX functions. "
+                   "Use arr.filled() to convert the value to a standard numpy array.")
 
 def _canonicalize_ndarray_dtype(x):
   return np.asarray(x, dtypes.canonicalize_dtype(x.dtype))
@@ -263,6 +263,7 @@ for t in device_array.device_array_types:
 canonicalize_dtype_handlers.update(
     (t, _canonicalize_ndarray_dtype) for t in numpy_scalar_types)
 canonicalize_dtype_handlers[np.ndarray] = _canonicalize_ndarray_dtype
+canonicalize_dtype_handlers[np.ma.MaskedArray] = _canonicalize_masked_array_dtype
 canonicalize_dtype_handlers.update(
     (t, partial(_canonicalize_python_scalar_dtype, t)) for t in _scalar_types)
 canonicalize_dtype_handlers[core.Token] = identity
@@ -586,6 +587,6 @@ def lower_fun(fun: Callable, *, multiple_results: bool, backend=None,
   def f(*args, **kw):
     raise RuntimeError("XLA translation rules are deprecated and "
                        "jax.interpreters.xla.lower_fun is no longer supported. "
-                       "Add an MLIR (MHLO) lowering via jax.interpreters.mlir "
+                       "Add an MLIR lowering via jax.interpreters.mlir "
                        "instead.")
   return f

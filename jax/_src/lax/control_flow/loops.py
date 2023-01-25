@@ -21,7 +21,7 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple, TypeVar
 import jax
 import weakref
 from jax import core
-from jax import linear_util as lu
+from jax._src import linear_util as lu
 from jax.config import config
 from jax.core import ConcreteArray, ShapedArray, raise_to_shaped
 from jax.interpreters import ad
@@ -41,8 +41,9 @@ from jax._src import util
 from jax._src.lax import lax
 from jax._src.lax import slicing
 from jax._src.lax import windowed_reductions
+from jax._src.lib import xla_client as xc
 from jax._src.lib.mlir import ir
-from jax._src.lib.mlir.dialects import mhlo
+from jax._src.lib.mlir.dialects import hlo
 from jax._src.numpy.ufuncs import logaddexp
 from jax._src.traceback_util import api_boundary
 from jax._src.util import (
@@ -145,7 +146,7 @@ def scan(f: Callable[[Carry, X], Tuple[Carry, Y]],
   output arrays. (None is actually an empty pytree.)
 
   Also unlike that Python version, :func:`~scan` is a JAX primitive and is
-  lowered to a single XLA While HLO. That makes it useful for reducing
+  lowered to a single WhileOp. That makes it useful for reducing
   compilation times for JIT-compiled functions, since native Python
   loop constructs in an :func:`~jax.jit` function are unrolled, leading to large
   XLA computations.
@@ -578,8 +579,8 @@ def _scan_partial_eval(trace, *tracers, reverse, length, num_consts, num_carry,
   # Drop any extensive output we can instead get by forwarding an input.
   # TODO(mattjj): use pe.dce_jaxpr here, though need a fixpoint
   jaxpr_known_, () = jaxpr_known.jaxpr, jaxpr_known.consts
-  jaxpr_known_.outvars = [x for x, i in zip(jaxpr_known_.outvars, fwds_known)
-                          if i is None]
+  jaxpr_known_ = jaxpr_known_.replace(
+    outvars=[x for x, i in zip(jaxpr_known_.outvars, fwds_known) if i is None])
   jaxpr_known = core.ClosedJaxpr(jaxpr_known_, ())
   del jaxpr_known_
   # We use `fwds_known` below when forming the output of scanning jaxpr_known.
@@ -1040,7 +1041,7 @@ def while_loop(cond_fun: Callable[[T], BooleanNumeric],
       return val
 
   Unlike that Python version, ``while_loop`` is a JAX primitive and is lowered
-  to a single XLA While HLO. That makes it useful for reducing compilation times
+  to a single WhileOp. That makes it useful for reducing compilation times
   for jit-compiled functions, since native Python loop constructs in an ``@jit``
   function are unrolled, leading to large XLA computations.
 
@@ -1142,6 +1143,12 @@ def _while_loop_abstract_eval(*args, cond_jaxpr, body_jaxpr, **kwargs):
 def _while_loop_batching_rule(axis_size, axis_name, main_type, args, dims,
                               cond_nconsts, cond_jaxpr,
                               body_nconsts, body_jaxpr):
+  from jax._src.callback import _IOEffect, _OrderedIOEffect
+  if any(eff in branch.effects for eff in [_IOEffect, _OrderedIOEffect]
+      for branch in [body_jaxpr, cond_jaxpr]):
+    raise NotImplementedError(
+        "IO effect not supported in vmap-of-while.")
+
   orig_batched = [d is not batching.not_mapped for d in dims]
   cconst_bat, bconst_bat, init_bat = split_list(orig_batched, [cond_nconsts, body_nconsts])
   cconsts, bconsts, init = split_list(args, [cond_nconsts, body_nconsts])
@@ -1320,7 +1327,9 @@ def _while_partial_eval(trace: pe.JaxprTrace, *tracers: pe.Tracer, cond_nconsts:
   body_nconsts_known = len(body_consts_uk) - sum(body_consts_uk)
   num_known_outs = len(carry_uk) - sum(carry_uk)
   # TODO(mattjj): use pe.dce_jaxpr to drop res computations and not just outputs
-  body_jaxpr_known.jaxpr.outvars = body_jaxpr_known.jaxpr.outvars[:num_known_outs]
+  body_jaxpr_known = body_jaxpr_known.replace(
+    jaxpr=body_jaxpr_known.jaxpr.replace(
+      outvars=body_jaxpr_known.jaxpr.outvars[:num_known_outs]))
   out_known = while_p.bind(
       *in_consts, cond_nconsts=cond_nconsts_known, cond_jaxpr=cond_jaxpr_known,
       body_nconsts=body_nconsts_known, body_jaxpr=body_jaxpr_known)
@@ -1419,7 +1428,7 @@ def _while_transpose_error(*_, **kwargs):
 #     break
 #   token, x = body(token, x)
 # ```
-# Unfortunately, with an MHLO while we can't (1) return multiple values
+# Unfortunately, with a WhileOp we can't (1) return multiple values
 # from a `cond` and (2) can't break a while loop. We thus adopt the
 # following rewrite strategy:
 # ```
@@ -1470,7 +1479,7 @@ def _while_lowering(ctx, *args, cond_jaxpr, body_jaxpr, cond_nconsts,
   args = [*tokens, *args]
 
   flat_args = mlir.flatten_lowering_ir_args(args)
-  while_op = mhlo.WhileOp(flat_loop_carry_types, flat_args)
+  while_op = hlo.WhileOp(flat_loop_carry_types, flat_args)
 
   # Loop condition
   cond_block = while_op.regions[0].blocks.append(*flat_loop_carry_types)
@@ -1497,12 +1506,12 @@ def _while_lowering(ctx, *args, cond_jaxpr, body_jaxpr, cond_nconsts,
           tokens_in=mlir.TokenSet(),
           tokens_out=None)
       pred, = lax._unary_reduce_lower(
-          mhlo.OrOp,
+          hlo.OrOp,
           lambda dtype: np.array(False, dtype),
           pred_ctx,
           pred,
           axes=tuple(range(len(pred_aval.shape))))
-    mhlo.ReturnOp([pred])
+    hlo.ReturnOp([pred])
 
   # Loop body
   body_block = while_op.regions[1].blocks.append(*flat_loop_carry_types)
@@ -1530,11 +1539,11 @@ def _while_lowering(ctx, *args, cond_jaxpr, body_jaxpr, cond_nconsts,
           _map(mlir.ir_constants, cond_jaxpr.consts),
           *(x + z), dim_var_values=ctx.dim_var_values)
       new_z = _map(
-          partial(_pred_bcast_select_mhlo, ctx, pred_aval, body_pred), new_z, z,
+          partial(_pred_bcast_select_hlo, ctx, pred_aval, body_pred), new_z, z,
           body_jaxpr.out_avals)
 
-    mhlo.ReturnOp([*util.flatten(out_tokens), *util.flatten(x),
-                   *util.flatten(y), *util.flatten(new_z)])
+    hlo.ReturnOp([*util.flatten(out_tokens), *util.flatten(x),
+                  *util.flatten(y), *util.flatten(new_z)])
 
   outputs = util.unflatten(while_op.results, _map(len, loop_carry_types))
   tokens, _, _, z = util.split_list(outputs, [num_tokens, cond_nconsts, body_nconsts])
@@ -1565,13 +1574,16 @@ mlir.register_lowering(while_p, _while_lowering)
 core.custom_typechecks[while_p] = _while_typecheck
 
 
-def _pred_bcast_select_mhlo(ctx,
+def _pred_bcast_select_hlo(ctx,
     pred_aval: core.ShapedArray, pred: ir.Value, xs: Sequence[ir.Value],
     ys: Sequence[ir.Value], x_y_aval: core.AbstractValue) -> Sequence[ir.Value]:
   if x_y_aval is core.abstract_token:
     x, = xs
     y, = ys
-    return [mhlo.AfterAllOp(mlir.aval_to_ir_type(x_y_aval), [x, y]).result]
+    if xc.mlir_api_version < 40:
+      return [hlo.AfterAllOp(mlir.aval_to_ir_type(x_y_aval), [x, y]).result]
+    else:
+      return [hlo.AfterAllOp([x, y]).result]
   else:
     assert isinstance(x_y_aval, core.ShapedArray), x_y_aval
     x, = xs
@@ -1585,7 +1597,7 @@ def _pred_bcast_select_mhlo(ctx,
       x_y_shape = x_y_aval.shape
     bcast_pred = mlir.broadcast_in_dim(ctx, pred, core.DShapedArray(x_y_shape, np.dtype(np.bool_)),
                                        broadcast_dimensions=list(range(len(pred_aval.shape))))
-    return mhlo.SelectOp(bcast_pred, x, y).results
+    return hlo.SelectOp(bcast_pred, x, y).results
 
 ### fori_loop
 
@@ -1697,7 +1709,7 @@ def fori_loop(lower, upper, body_fun, init_val):
                               (lower, upper, init_val))
   return result
 
-### map and miscellanous rules
+### map and miscellaneous rules
 
 @api_boundary
 def map(f, xs):

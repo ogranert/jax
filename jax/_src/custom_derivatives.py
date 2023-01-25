@@ -17,18 +17,18 @@ import inspect
 from typing import (Callable, Generic, Optional, Sequence, Tuple, TypeVar, Set,
                     Any)
 
-from jax import core
-from jax import linear_util as lu
+from jax._src import linear_util as lu
 from jax.custom_transpose import custom_transpose
 from jax.tree_util import (tree_flatten, tree_unflatten, tree_map,
                            treedef_is_leaf, treedef_tuple,
                            register_pytree_node_class, tree_leaves)
+from jax._src import core
 from jax._src import custom_api_util
 from jax._src import dtypes
 from jax._src.lax import lax
 from jax._src.util import cache, safe_zip, safe_map, split_list, Unhashable
 from jax._src.api_util import argnums_partial, flatten_fun_nokwargs
-from jax.core import raise_to_shaped
+from jax._src.core import raise_to_shaped
 from jax.errors import UnexpectedTracerError
 from jax._src.ad_util import Zero, zeros_like_aval, stop_gradient_p
 from jax.interpreters import partial_eval as pe
@@ -857,12 +857,12 @@ def custom_gradient(fun):
 
   >>> @jax.custom_gradient
   ... def f(x, y):
-  ...   return x * y, lambda g: (y, x)
+  ...   return x * y, lambda g: (g * y, g * x)
   ...
   >>> print(f(3., 4.))
   12.0
   >>> print(jax.grad(f, argnums=(0, 1))(3., 4.))
-  (4.0, 3.0)
+  (Array(4., dtype=float32, weak_type=True), Array(3., dtype=float32, weak_type=True))
   """
   @custom_vjp
   def wrapped_fun(*args, **kwargs):
@@ -1205,8 +1205,8 @@ unreachable_p.def_impl(unreachable_impl)
 
 # Translation raises an exception
 # TODO(frostig,mattjj): We have no good way to translate a function
-# that errs. Since MHLO lowering over-approximates concrete evaluation,
-# we err on MHLO lowering for the time being.
+# that errs. Since MLIR lowering over-approximates concrete evaluation,
+# we err on MLIR lowering for the time being.
 mlir.register_lowering(unreachable_p, unreachable_impl)
 
 # Abstract evaluation proceeds without issue, to allow for staging

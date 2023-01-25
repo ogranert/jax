@@ -16,7 +16,6 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax._src import test_util as jtu
-from jax._src.lib import xla_extension_version
 from jax.experimental import rnn
 
 from jax._src.config import config
@@ -34,11 +33,9 @@ class RnnTest(jtu.JaxTestCase):
       num_layers=[1, 4],
       bidirectional=[True, False],
   )
-  @jtu.skip_on_devices("cpu", "tpu")
+  @jtu.skip_on_devices("cpu", "tpu","rocm")
   def test_lstm(self, batch_size: int, seq_len: int, input_size: int,
                 hidden_size: int, num_layers: int, bidirectional: bool):
-    if xla_extension_version < 109:
-      self.skipTest('rnn module added at xla_extension_version 109')
     batch_size = 6
     seq_len = 7
     input_size = 8

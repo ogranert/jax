@@ -23,19 +23,19 @@ from jax.interpreters import batching
 from jax.interpreters import mlir
 from jax.interpreters import xla
 
-from jax import core
-from jax.core import (ShapedArray, ConcreteArray)
 from jax import tree_util
 
 from jax._src import ad_util
+from jax._src import core
 from jax._src import dtypes
-import jax._src.lax.lax as lax
-import jax._src.lax.convolution as convolution
-import jax._src.lax.slicing as slicing
+from jax._src import util
+from jax._src.core import ShapedArray, ConcreteArray
+from jax._src.lax import lax
+from jax._src.lax import convolution
+from jax._src.lax import slicing
 from jax._src.lib.mlir import ir
-from jax._src.lib.mlir.dialects import mhlo
+from jax._src.lib.mlir.dialects import hlo
 from jax._src.numpy.ufuncs import logaddexp
-import jax._src.util as util
 
 map = util.safe_map
 zip = util.safe_zip
@@ -316,7 +316,7 @@ def _generic_reduce_window_lower(ctx, *args, jaxpr, consts,
   operands, init_values = util.split_list(args, [len(args) // 2])
   _, init_value_avals = util.split_list(ctx.avals_in, [len(operands)])
   scalar_types = [mlir.aval_to_ir_type(aval) for aval in init_value_avals]
-  rw = mhlo.ReduceWindowOp(
+  rw = hlo.ReduceWindowOp(
       map(mlir.aval_to_ir_type, ctx.avals_out),
       operands,
       init_values,
@@ -333,7 +333,7 @@ def _generic_reduce_window_lower(ctx, *args, jaxpr, consts,
     out_nodes, _ = mlir.jaxpr_subcomp(ctx.module_context, jaxpr,
         mlir.TokenSet(), consts, *([a] for a in reducer.arguments),
         dim_var_values=ctx.dim_var_values)
-    mhlo.ReturnOp(util.flatten(out_nodes))
+    hlo.ReturnOp(util.flatten(out_nodes))
   return rw.results
 
 mlir.register_lowering(reduce_window_p, _generic_reduce_window_lower)
@@ -468,7 +468,7 @@ def _reduce_window_lower(
   operand_aval, = ctx.avals_in
   scalar_aval = operand_aval.update(shape=())
   scalar_type = mlir.aval_to_ir_type(scalar_aval)
-  rw = mhlo.ReduceWindowOp(
+  rw = hlo.ReduceWindowOp(
       mlir.aval_to_ir_types(aval_out), [operand],
       [mlir.full_like_aval(ctx, init_value(scalar_aval.dtype), scalar_aval)],
       mlir.dense_int_elements(window_dimensions),
@@ -479,15 +479,15 @@ def _reduce_window_lower(
                                           shape=(len(padding), 2)))
   reducer = rw.regions[0].blocks.append(scalar_type, scalar_type)
   with ir.InsertionPoint(reducer):
-    mhlo.ReturnOp(reduce_op(*reducer.arguments))
+    hlo.ReturnOp(reduce_op(*reducer.arguments))
   return rw.results
 
 mlir.register_lowering(reduce_window_sum_p, partial(
-    _reduce_window_lower, mhlo.AddOp, lambda _: 0))
+    _reduce_window_lower, hlo.AddOp, lambda _: 0))
 mlir.register_lowering(reduce_window_min_p, partial(
-    _reduce_window_lower, mlir.min_mhlo, lax._get_min_identity))
+    _reduce_window_lower, mlir.min_hlo, lax._get_min_identity))
 mlir.register_lowering(reduce_window_max_p, partial(
-    _reduce_window_lower, mlir.max_mhlo, lax._get_max_identity))
+    _reduce_window_lower, mlir.max_hlo, lax._get_max_identity))
 
 
 
@@ -514,7 +514,7 @@ def _select_and_scatter_lower(
   aval_out, = ctx.avals_out
   scalar_aval = operand_aval.update(shape=())
   scalar_type = mlir.aval_to_ir_type(scalar_aval)
-  op = mhlo.SelectAndScatterOp(
+  op = hlo.SelectAndScatterOp(
       mlir.aval_to_ir_type(aval_out),
       operand,
       source,
@@ -531,7 +531,7 @@ def _select_and_scatter_lower(
                                       mlir.TokenSet(), select_consts,
                                       *([a] for a in select.arguments),
                                       dim_var_values=ctx.dim_var_values)
-    mhlo.ReturnOp(util.flatten(out_nodes))
+    hlo.ReturnOp(util.flatten(out_nodes))
   scatter = op.scatter.blocks.append(scalar_type, scalar_type)
   with ir.InsertionPoint(scatter):
     if scatter_jaxpr.effects:
@@ -540,7 +540,7 @@ def _select_and_scatter_lower(
                                       mlir.TokenSet(), scatter_consts,
                                       *([a] for a in scatter.arguments),
                                       dim_var_values=ctx.dim_var_values)
-    mhlo.ReturnOp(util.flatten(out_nodes))
+    hlo.ReturnOp(util.flatten(out_nodes))
   return op.results
 
 mlir.register_lowering(select_and_scatter_p, _select_and_scatter_lower)
@@ -654,7 +654,8 @@ def _select_and_gather_add_shape_rule(
     window_dilation)
 
 def _select_and_gather_add_lowering(
-    ctx, tangents, operand, *, select_prim,
+    ctx: mlir.LoweringRuleContext,
+    tangents, operand, *, select_prim,
     window_dimensions, window_strides, padding, base_dilation, window_dilation,
     max_bits=64):
   _, operand_aval, = ctx.avals_in
@@ -669,8 +670,10 @@ def _select_and_gather_add_lowering(
   const = lambda dtype, x: mlir.ir_constant(np.array(x, dtype=dtype),
                                             canonicalize_types=False)
 
-  def _broadcast(x, dims):
-    return mhlo.BroadcastOp(x, mlir.dense_int_elements(dims))
+  def _broadcast_scalar_const(x, aval_out):
+    return mlir.broadcast_in_dim(ctx, const(aval_out.dtype, x),
+                                 aval_out,
+                                 broadcast_dimensions=())
 
   if double_word_reduction:
     # TODO(b/73062247): XLA doesn't yet implement ReduceWindow on tuples, so
@@ -678,35 +681,33 @@ def _select_and_gather_add_lowering(
     # 2k-bit unsigned integer using bit tricks.
     word_dtype = lax._UINT_DTYPES[nbits]
     double_word_dtype = lax._UINT_DTYPES[nbits * 2]
-    word_type = mlir.dtype_to_ir_type(word_dtype)
-    double_word_type = mlir.dtype_to_ir_type(double_word_dtype)
+    word_type = mlir.dtype_to_ir_type(word_dtype)  # type: ignore
+    double_word_type = mlir.dtype_to_ir_type(double_word_dtype)  # type: ignore
+    # Packs two values into a double_word_type.
+    def pack(a, b, ab_aval):
+      word_type_ab_aval = ab_aval.update(dtype=word_dtype)
+      double_word_type_ab_aval = ab_aval.update(dtype=double_word_dtype)
+      a = hlo.BitcastConvertOp(mlir.aval_to_ir_type(word_type_ab_aval), a)
+      b = hlo.BitcastConvertOp(mlir.aval_to_ir_type(word_type_ab_aval), b)
+      a = hlo.ConvertOp(mlir.aval_to_ir_type(double_word_type_ab_aval), a)
+      b = hlo.ConvertOp(mlir.aval_to_ir_type(double_word_type_ab_aval), b)
+      a = hlo.ShiftLeftOp(a,
+                          _broadcast_scalar_const(nbits, double_word_type_ab_aval))
+      return hlo.OrOp(a, b)
 
-    # Packs two values into a tuple.
-    def pack(a, b):
-      a_dims = ir.RankedTensorType(a.type).shape
-      b_dims = ir.RankedTensorType(b.type).shape
-      a = mhlo.BitcastConvertOp(ir.RankedTensorType.get(a_dims, word_type), a)
-      b = mhlo.BitcastConvertOp(ir.RankedTensorType.get(b_dims, word_type), b)
-      a = mhlo.ConvertOp(ir.RankedTensorType.get(a_dims, double_word_type), a)
-      b = mhlo.ConvertOp(ir.RankedTensorType.get(b_dims, double_word_type), b)
-      a = mhlo.ShiftLeftOp(a,
-                           _broadcast(const(double_word_dtype, nbits), a_dims))
-      return mhlo.OrOp(a, b)
-
-    # Unpacks the first element of a tuple.
+    # Unpacks the first element of a double_word_type.
     def fst(t):
-      dims = ir.RankedTensorType(t.type).shape
-      st = mhlo.ShiftRightLogicalOp(t, const(double_word_dtype, nbits))
-      return mhlo.BitcastConvertOp(
-          ir.RankedTensorType.get(dims, etype),
-          mhlo.ConvertOp(ir.RankedTensorType.get(dims, word_type), st)).result
+      assert not ir.RankedTensorType(t.type).shape
+      st = hlo.ShiftRightLogicalOp(t, const(double_word_dtype, nbits))
+      return hlo.BitcastConvertOp(
+          ir.RankedTensorType.get([], etype),
+          hlo.ConvertOp(ir.RankedTensorType.get([], word_type), st)).result
 
-    # Unpacks the second element of a tuple.
-    def snd(t):
-      dims = ir.RankedTensorType(t.type).shape
-      return mhlo.BitcastConvertOp(
-          ir.RankedTensorType.get(dims, etype),
-          mhlo.ConvertOp(ir.RankedTensorType.get(dims, word_type), t)).result
+    # Unpacks the second element of a double_word_type.
+    def snd(t, t_aval):
+      return hlo.BitcastConvertOp(
+          mlir.aval_to_ir_type(t_aval.update(dtype=dtype)),
+          hlo.ConvertOp(mlir.aval_to_ir_type(t_aval.update(dtype=word_dtype)), t)).result
 
   else:
     # The double-word trick above only works if we have a sufficiently large
@@ -723,42 +724,42 @@ def _select_and_gather_add_lowering(
     nmant = r_nbits - nexp - 1
 
     double_word_dtype = word_dtype = lax._UINT_DTYPES[nbits]
-    double_word_type = word_type = mlir.dtype_to_ir_type(word_dtype)
+    double_word_type = word_type = mlir.dtype_to_ir_type(word_dtype)  # type: ignore
 
-    # Packs two values into a tuple.
-    def pack(a, b):
-      a_dims = ir.RankedTensorType(a.type).shape
-      b_dims = ir.RankedTensorType(b.type).shape
-      a = mhlo.ReducePrecisionOp(a, exponent_bits=mlir.i32_attr(nexp),
-                                  mantissa_bits=mlir.i32_attr(nmant))
-      b = mhlo.ReducePrecisionOp(b, exponent_bits=mlir.i32_attr(nexp),
-                                  mantissa_bits=mlir.i32_attr(nmant))
-      a = mhlo.BitcastConvertOp(ir.RankedTensorType.get(a_dims, word_type), a)
-      b = mhlo.BitcastConvertOp(ir.RankedTensorType.get(b_dims, word_type), b)
-      b = mhlo.ShiftRightLogicalOp(
-          b, _broadcast(const(word_dtype, r_nbits), b_dims))
-      return mhlo.OrOp(a, b)
+    # Packs two values into a double_word_type.
+    def pack(a, b, ab_aval):
+      word_type_ab_aval = ab_aval.update(dtype=word_dtype)
+      a = hlo.ReducePrecisionOp(a, exponent_bits=mlir.i32_attr(nexp),
+                                mantissa_bits=mlir.i32_attr(nmant))
+      b = hlo.ReducePrecisionOp(b, exponent_bits=mlir.i32_attr(nexp),
+                                mantissa_bits=mlir.i32_attr(nmant))
+      a = hlo.BitcastConvertOp(mlir.aval_to_ir_type(word_type_ab_aval), a)
+      b = hlo.BitcastConvertOp(mlir.aval_to_ir_type(word_type_ab_aval), b)
+      b = hlo.ShiftRightLogicalOp(
+          b, _broadcast_scalar_const(r_nbits, word_type_ab_aval))
+      return hlo.OrOp(a, b)
 
-    # Unpacks the first element of a tuple.
+    # Unpacks the first element of a double_word_type.
     def fst(t):
-      st = mhlo.AndOp(t, const(word_dtype, ((1 << r_nbits) - 1) << r_nbits))
-      return mhlo.BitcastConvertOp(ir.RankedTensorType.get([], etype),
-                                   st).result
+      assert not ir.RankedTensorType(t.type).shape
+      st = hlo.AndOp(t, const(word_dtype, ((1 << r_nbits) - 1) << r_nbits))
+      return hlo.BitcastConvertOp(ir.RankedTensorType.get([], etype),
+                                  st).result
 
-    # Unpacks the second element of a tuple.
-    def snd(t):
-      dims = ir.RankedTensorType(t.type).shape
-      return mhlo.BitcastConvertOp(
-          ir.RankedTensorType.get(dims, etype),
-          mhlo.ShiftLeftOp(t, _broadcast(const(word_dtype, r_nbits), dims))
+    # Unpacks the second element of a double_word_type.
+    def snd(t, t_aval):
+      return hlo.BitcastConvertOp(
+          mlir.aval_to_ir_type(t_aval.update(dtype=dtype)),
+          hlo.ShiftLeftOp(t, _broadcast_scalar_const(r_nbits, t_aval.update(dtype=word_dtype)))
           ).result
 
   assert select_prim is lax.ge_p or select_prim is lax.le_p, select_prim
   init = -np.inf if select_prim is lax.ge_p else np.inf
-  rw = mhlo.ReduceWindowOp(
-      [ir.RankedTensorType.get(out_aval.shape, double_word_type)],
-      pack(operand, tangents),
-      pack(const(dtype, init), const(dtype, 0)),
+  double_word_out_aval = out_aval.update(dtype=double_word_dtype)
+  rw = hlo.ReduceWindowOp(
+      [mlir.aval_to_ir_type(double_word_out_aval)],
+      pack(operand, tangents, operand_aval),
+      pack(const(dtype, init), const(dtype, 0), core.ShapedArray((), dtype)),
       mlir.dense_int_elements(window_dimensions),
       window_strides=mlir.dense_int_elements(window_strides),
       base_dilations=mlir.dense_int_elements(base_dilation),
@@ -770,10 +771,10 @@ def _select_and_gather_add_lowering(
   with ir.InsertionPoint(reducer):
     x, y = reducer.arguments
     assert select_prim is lax.ge_p or select_prim is lax.le_p
-    which = "GE" if select_prim is lax.ge_p else "LE"
-    out = mhlo.SelectOp(mlir.compare_mhlo(fst(x), fst(y), which), x, y)
-    mhlo.ReturnOp(out)
-  return [snd(rw.result)]
+    cmp_op = "GE" if select_prim is lax.ge_p else "LE"
+    out = hlo.SelectOp(mlir.compare_hlo(fst(x), fst(y), cmp_op), x, y)
+    hlo.ReturnOp(out)
+  return [snd(rw.result, double_word_out_aval)]
 
 # TODO(phawkins): use this translation rule on all platforms.
 def _select_and_gather_add_using_variadic_reducewindow(

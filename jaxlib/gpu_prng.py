@@ -17,12 +17,13 @@ import functools
 from functools import partial
 import itertools
 import operator
+from typing import Optional, Union
 
 import jaxlib.mlir.ir as ir
 
 from jaxlib import xla_client
 
-from .mhlo_helpers import custom_call
+from .hlo_helpers import custom_call
 
 try:
   from .cuda import _prng as _cuda_prng
@@ -41,27 +42,44 @@ except ImportError:
 _prod = lambda xs: functools.reduce(operator.mul, xs, 1)
 
 
-def _threefry2x32_lowering(prng, platform, keys, data):
+def _threefry2x32_lowering(prng, platform, keys, data,
+                           length: Optional[Union[int, ir.Value]] = None):
   """ThreeFry2x32 kernel for GPU."""
   assert len(keys) == 2, keys
   assert len(data) == 2, data
   assert (ir.RankedTensorType(keys[0].type).element_type ==
           ir.IntegerType.get_unsigned(32)), keys[0].type
+
   typ = keys[0].type
   dims = ir.RankedTensorType(typ).shape
 
   for x in itertools.chain(keys, data):
     assert x.type == typ, (x.type, typ)
   ndims = len(dims)
-
-  opaque = prng.threefry2x32_descriptor(_prod(dims))
   layout = tuple(range(ndims - 1, -1, -1))
+  operand_layouts = [layout] * 4
+  operands = [keys[0], keys[1], data[0], data[1]]
+
+  if length is None:
+    length = _prod(dims)
+
+  if isinstance(length, int):
+    opaque = prng.threefry2x32_descriptor(length)
+  else:
+    opaque = prng.threefry2x32_descriptor(-1)
+    assert (ir.RankedTensorType(length.type).element_type ==
+            ir.IntegerType.get_signless(64)), length
+    assert (ir.RankedTensorType(length.type).shape ==
+            [1]), (length, ir.RankedTensorType(length.type).shape)
+    operands.append(length)
+    operand_layouts.append((0,))
+
   return custom_call(
       f"{platform}_threefry2x32",
       [typ, typ],
-      [keys[0], keys[1], data[0], data[1]],
+      operands,
       backend_config=opaque,
-      operand_layouts=[layout] * 4,
+      operand_layouts=operand_layouts,
       result_layouts=[layout] * 2)
 
 

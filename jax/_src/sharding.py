@@ -33,7 +33,7 @@ Device = xc.Device
 Index = Tuple[slice, ...]
 XLADeviceAssignment = Sequence[Device]
 
-@use_cpp_class(xc.Sharding if xc._version >= 94 else None)
+@use_cpp_class(xc.Sharding)
 class Sharding(metaclass=abc.ABCMeta):
   """Abstract ``Sharding`` interface which describes how a ``jax.Array`` is laid out
   across devices.
@@ -69,6 +69,18 @@ class Sharding(metaclass=abc.ABCMeta):
     """
     raise NotImplementedError('Subclasses should implement this method.')
 
+  @abc.abstractmethod
+  def is_equivalent_to(self, other: Sharding, ndim: int) -> bool:
+    """Returns True if two shardings put the same logical array
+    (sharded/unsharded) on the same device(s).
+
+    For example, every XLACompatibleSharding lowers to OpShardingSharding which
+    is a general representation. So `jax.sharding.NamedSharding` is equivalent
+    to `jax.sharding.PositionalSharding` if both of them lower to the same
+    OpShardingSharding.
+    """
+    raise NotImplementedError('Subclasses should implement this method.')
+
   #############################################################################
   # Default implementations below that all subclasses will inherit.
 
@@ -99,7 +111,7 @@ class Sharding(metaclass=abc.ABCMeta):
 
 # Shardings that inherit from XLACompatibleSharding should implement the
 # `_device_assignment` property and `_to_xla_op_sharding` method.
-@use_cpp_class(xc.XLACompatibleSharding if xc._version >= 94 else None)
+@use_cpp_class(xc.XLACompatibleSharding)
 class XLACompatibleSharding(Sharding, metaclass=abc.ABCMeta):
   """A `Sharding` that describes shardings expressible to XLA.
 
@@ -152,6 +164,18 @@ class XLACompatibleSharding(Sharding, metaclass=abc.ABCMeta):
       out.append(quotient)
     return tuple(out)
 
+  def is_equivalent_to(self: XLACompatibleSharding,  # type: ignore
+                       other: XLACompatibleSharding, ndim: int) -> bool:
+    try:
+      return (pxla.are_op_shardings_equal(self._to_xla_op_sharding(ndim),
+                                          other._to_xla_op_sharding(ndim)) and
+              self._device_assignment == other._device_assignment)
+    # NotImplementedError is raised by PmapSharding because it can't lower
+    # to OpSharding. So if `other` is a PmapSharding, default to a strict
+    # equality check.
+    except NotImplementedError:
+      return self == other
+
 
 @functools.lru_cache()
 def _check_mesh_resource_axis(mesh, parsed_pspec):
@@ -190,15 +214,6 @@ def device_replica_id_map(sharding, global_shape: Shape) -> Mapping[Device, int]
   return out
 
 
-def _enable_cpp_named_sharding():
-  if xc._version >= 107:
-    return xc.NamedSharding
-  elif xc._version >= 95:
-    return xc.MeshPspecSharding  # type: ignore
-  else:
-    return None
-
-
 class _UnconstrainedPartitionSingleton:
 
   def __str__(self):
@@ -235,7 +250,7 @@ class PartitionSpec(tuple):
     return (PartitionSpec, tuple(self))
 
 
-@use_cpp_class(_enable_cpp_named_sharding())
+@use_cpp_class(xc.NamedSharding)
 class NamedSharding(XLACompatibleSharding):
   r"""NamedSharding is a way to express ``Sharding``\s using named axes.
 
@@ -252,7 +267,8 @@ class NamedSharding(XLACompatibleSharding):
   is sharded across ``x`` axis of the mesh, and the second dimension is sharded
   across ``y`` axis of the mesh.
 
-  The pjit tutorial (https://jax.readthedocs.io/en/latest/jax-101/08-pjit.html#more-information-on-partitionspec)
+  The Distributed arrays and automatic parallelization
+  (https://jax.readthedocs.io/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html#namedsharding-gives-a-way-to-express-shardings-with-names)
   goes into more details and has diagrams to help explain the concept about
   ``Mesh`` and ``PartitionSpec``.
 
@@ -291,7 +307,7 @@ class NamedSharding(XLACompatibleSharding):
     # representation of Parsed Pspec
     if self._parsed_pspec is None:
       from jax.experimental import pjit
-      self._parsed_pspec, _, _, _ = pjit._prepare_axis_resources(
+      self._parsed_pspec, _, _ = pjit._prepare_axis_resources(
           self.spec, "NamedSharding spec")
 
     _check_mesh_resource_axis(self.mesh, self._parsed_pspec)
@@ -367,7 +383,7 @@ def _get_replicated_op_sharding():
   return proto
 
 
-@use_cpp_class(xc.SingleDeviceSharding if xc._version >= 95 else None)
+@use_cpp_class(xc.SingleDeviceSharding)
 class SingleDeviceSharding(XLACompatibleSharding):
   """A subclass of ``XLACompatibleSharding`` that places its data on a single device.
 
@@ -415,7 +431,7 @@ class SingleDeviceSharding(XLACompatibleSharding):
     return _get_replicated_op_sharding()
 
 
-@use_cpp_class(xc.PmapSharding if xc._version >= 94 else None)
+@use_cpp_class(xc.PmapSharding)
 class PmapSharding(XLACompatibleSharding):
 
   @use_cpp_method
@@ -450,6 +466,10 @@ class PmapSharding(XLACompatibleSharding):
   def __repr__(self):
     return (f'PmapSharding(sharding_spec={self.sharding_spec}, '
             f'devices={self.devices})')
+
+  def is_equivalent_to(self: PmapSharding, other: PmapSharding,  # type: ignore
+                       ndim: int) -> bool:
+    return self == other
 
   # TODO(yashkatariya): Expose `sharded_dim_size` in the API if required.
   @classmethod
@@ -624,7 +644,7 @@ class DeviceIdSet:
             self._ids == other._ids)
 
 
-@use_cpp_class(xc.OpShardingSharding if xc._version >= 95 else None)
+@use_cpp_class(xc.OpShardingSharding)
 class OpShardingSharding(XLACompatibleSharding):
 
   @use_cpp_method

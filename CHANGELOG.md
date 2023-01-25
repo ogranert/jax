@@ -6,9 +6,32 @@ Best viewed [here](https://jax.readthedocs.io/en/latest/changelog.html).
 Remember to align the itemized text with the first line of an item within a list.
 -->
 
-## jax 0.4.2
+## jax 0.4.3
 
-## jaxlib 0.4.2
+## jaxlib 0.4.3
+
+## jax 0.4.2 (Jan 20, 2023)
+
+* Breaking changes
+  * Deleted `jax.experimental.callback`
+  * Operations with dimensions in presence of jax2tf shape polymorphism have
+    been generalized to work in more scenarios, by converting the symbolic
+    dimension to JAX arrays. Operations involving symbolic dimensions and
+    `np.ndarray` now can raise errors when the result is used as a shape value
+    ({jax-issue}`#14106`).
+  * jaxpr objects now raise an error on attribute setting in order to avoid
+    problematic mutations ({jax-issue}`14102`)
+
+* Changes
+  * {func}`jax2tf.call_tf` has a new parameter `has_side_effects` (default `True`)
+    that can be used to declare whether an instance can be removed or replicated
+    by JAX optimizations such as dead-code elimination ({jax-issue}`#13980`).
+
+## jaxlib 0.4.2 (Jan 20, 2023)
+
+* Changes
+  * Set JAX_USE_PJRT_C_API_ON_TPU=1 to enable new Cloud TPU runtime, featuring
+    automatic device memory defragmentation.
 
 ## jax 0.4.1 (Dec 13, 2022)
 

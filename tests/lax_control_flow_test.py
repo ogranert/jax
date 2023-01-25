@@ -1508,7 +1508,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     def f(c, a):
       assert a.shape == (3,)
       assert c.shape == (4,)
-      b = jnp.cos(jnp.sum(jnp.sin(a)) + jnp.sum(jnp.cos(c)) + jnp.sum(jnp.tan(d)))
+      b = jnp.cos(jnp.sum(jnp.sin(a)) + jnp.sum(jnp.cos(c)) + jnp.sum(d))
       c = jnp.sin(c * b)
       assert b.shape == ()
       return c, b
@@ -1548,7 +1548,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     def f(c, a):
       assert a.shape == (3,)
       assert c.shape == (4,)
-      b = jnp.cos(jnp.sum(jnp.sin(a)) + jnp.sum(jnp.cos(c)) + jnp.sum(jnp.tan(d)))
+      b = jnp.cos(jnp.sum(jnp.sin(a)) + jnp.sum(jnp.cos(c)) + jnp.sum(d))
       c = jnp.sin(c * b)
       assert b.shape == ()
       return c, b
@@ -1581,7 +1581,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     def f(c, a):
       assert a.shape == (3,)
       assert c.shape == (4,)
-      b = jnp.cos(jnp.sum(jnp.sin(a)) + jnp.sum(jnp.cos(c)) + jnp.sum(jnp.tan(d)))
+      b = jnp.cos(jnp.sum(jnp.sin(a)) + jnp.sum(jnp.cos(c)) + jnp.sum(d))
       c = jnp.sin(c * b)
       assert b.shape == ()
       return c, b
@@ -1821,7 +1821,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     def f(c, a):
       assert a.shape == (3,)
       assert c.shape == (4,)
-      b = jnp.cos(jnp.sum(jnp.sin(a)) + jnp.sum(jnp.cos(c)) + jnp.sum(jnp.tan(d)))
+      b = jnp.cos(jnp.sum(jnp.sin(a)) + jnp.sum(jnp.cos(c)) + jnp.sum(d))
       c = jnp.sin(c * b)
       assert b.shape == ()
       return c, b
@@ -1852,7 +1852,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     def f(c, a):
       a1, a2 = a
       c1, c2 = c
-      b = jnp.sum(jnp.cos(a1)) * jnp.sum(jnp.tan(c2 * a2))
+      b = jnp.sum(jnp.cos(a1)) * jnp.sum(c2 * a2)
       c = c1 * jnp.sin(jnp.sum(a1 * a2)), c2 * jnp.cos(jnp.sum(a1))
       return c, b
 
@@ -2221,7 +2221,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     def f(c, a):
       assert a.shape == (3,)
       assert c.shape == (4,)
-      b = jnp.cos(jnp.sum(jnp.sin(a)) + jnp.sum(jnp.cos(c)) + jnp.sum(jnp.tan(d)))
+      b = jnp.cos(jnp.sum(jnp.sin(a)) + jnp.sum(jnp.cos(c)) + jnp.sum(d))
       c = jnp.sin(c * b)
       assert b.shape == ()
       return c, b
@@ -2400,6 +2400,21 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     x = np.arange(3, dtype='float32')
     jax.jvp(g, (x,), (x,))  # doesn't crash
 
+  def test_cond_excessive_compilation(self):
+    # Regression test for https://github.com/google/jax/issues/14058
+    def f(x):
+      return x + 1
+
+    def g(x):
+      return x + 2
+
+    with jtu.count_jit_and_pmap_compiles() as count:
+      for x in range(10):
+        lax.cond(x, f, g, x)
+    # Should observe a maximum of 4 compiles: convert_element_type, f, g, cond
+    # In #14058, this was observed to be 31 compiles.
+    self.assertLess(count[0], 5)
+
   @parameterized.named_parameters(
       {"testcase_name": f"_dtype={dtype.__name__}", "dtype": dtype}
       for dtype in jtu.dtypes.all_integer)
@@ -2563,6 +2578,46 @@ class LaxControlFlowTest(jtu.JaxTestCase):
       return jnp.sum(c1) + jnp.sum(c2) + jnp.sum(c3)
 
     jax.grad(f)(1.)  # doesn't crash
+
+  def test_custom_jvp_tangent_cond_transpose(self):
+    # https://github.com/google/jax/issues/14026
+    def mask_fun(arr, choice):
+      out = (1 - choice) * arr.sum() +  choice * (1 - arr.sum())
+      return out
+
+    def switch_fun(arr, choice):
+      choice = jnp.floor(choice).astype(jnp.int32)
+      out = jax.lax.switch(choice, [lambda x: x.sum(), lambda x: 1 - x.sum()], arr)
+      return out
+
+    test_arr = jnp.arange(3.)
+    test_val = 0.
+
+    expected1 = jax.grad(mask_fun)(test_arr, test_val)
+    expected2 = jax.grad(switch_fun)(test_arr, test_val)
+
+    def good_switchfun_jvp(primals, tangents):
+      arr, choice = primals
+      arr_dot, choice_dot = tangents
+      return switch_fun(arr, choice), mask_fun(arr_dot, choice)
+
+    def bad_switchfun_jvp(primals, tangents):
+      arr, choice = primals
+      arr_dot, choice_dot = tangents
+      return switch_fun(arr, choice), switch_fun(arr_dot, choice)
+
+    good_custom_switchfun = jax.custom_jvp(switch_fun)
+    good_custom_switchfun.defjvp(good_switchfun_jvp)
+    expected3 = jax.grad(good_custom_switchfun)(test_arr, test_val)
+
+    bad_custom_switchfun = jax.custom_jvp(switch_fun)
+    bad_custom_switchfun.defjvp(bad_switchfun_jvp)
+    actual = jax.grad(bad_custom_switchfun)(test_arr, test_val)
+
+    self.assertAllClose(expected1, expected2)
+    self.assertAllClose(expected2, expected3)
+    self.assertAllClose(expected3, actual)
+
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

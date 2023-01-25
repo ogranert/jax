@@ -22,8 +22,8 @@ For examples and details, see
 https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#calling-tensorflow-functions-from-jax.
 
 """
+import enum
 import functools
-import re
 from typing import Any, Callable, Optional, Sequence, Tuple
 
 from absl import logging
@@ -35,11 +35,14 @@ from jax import dtypes
 from jax import tree_util
 from jax._src import util
 from jax._src import ad_util
+from jax._src.lax import control_flow as lax_control_flow
+from jax._src import ad_checkpoint
+from jax._src import custom_derivatives
 from jax.interpreters import mlir
 from jax.interpreters import xla
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import func as func_dialect
-from jax._src.lib.mlir.dialects import mhlo
+from jax._src.lib.mlir.dialects import hlo
 from jax._src.lib import xla_client
 from jax.experimental.jax2tf import jax2tf as jax2tf_internal
 
@@ -56,7 +59,7 @@ TfConcreteFunction = Any
 # DLPack, if we are careful.
 _DLPACK_PLATFORMS = ("gpu",)
 
-def call_tf(callable_tf: Callable) -> Callable:
+def call_tf(callable_tf: Callable, has_side_effects=True) -> Callable:
   """Calls a TensorFlow function from JAX, with support for reverse autodiff.
 
   The ``callable_tf`` will be called with TensorFlow-compatible arguments (
@@ -82,6 +85,9 @@ def call_tf(callable_tf: Callable) -> Callable:
   Args:
     callable_tf: a TensorFlow Callable that can take a pytree of TensorFlow
       arguments.
+    has_side_effects: if True then it ensures that instances of this primitive
+      are not removed or replicated by JAX optimizations such as dead-code
+      elimination.
 
   Returns: a JAX callable that can be invoked with JAX pytree arguments, in
     op-by-op mode or in a staged context. This callable can be used with
@@ -104,13 +110,10 @@ def call_tf(callable_tf: Callable) -> Callable:
     args_flat_jax = tuple(map(canonical_arg, args_flat_jax))
     def make_tensorspec(a_jax):
       a_tf_dtype = jax2tf_internal._to_tf_dtype(a_jax.dtype)
-      if any(not core.is_constant_dim(d) for d in a_jax.shape):
-        msg = ("call_tf cannot be applied to shape-polymorphic arguments. "
-               f"Found argument shape: {a_jax.shape}. "
-               "See https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#limitations-of-call_tf for a discussion.")
-        raise ValueError(msg)
-
-      return tf.TensorSpec(a_jax.shape, a_tf_dtype)
+      a_tf_shape = [
+          d if core.is_constant_dim(d) else None for d in a_jax.shape
+      ]
+      return tf.TensorSpec(a_tf_shape, a_tf_dtype)
     args_flat_sig_tf = tuple(map(make_tensorspec, args_flat_jax))
 
     res_treedef = None  # We'll store here the result treedef
@@ -129,12 +132,32 @@ def call_tf(callable_tf: Callable) -> Callable:
     # won't be used in op-by-op execution mode.
     function_flat_tf = tf.function(callable_flat_tf, autograph=False, jit_compile=True)
 
+    input_shapes_tf = [s.shape for s in args_flat_sig_tf]
+    output_shapes_tf = _get_concrete_function_tf(
+        function_flat_tf, args_flat_sig_tf
+    ).output_shapes
+
+    if not all(s.is_fully_defined() for s in input_shapes_tf) and not all(
+        s.is_fully_defined() for s in output_shapes_tf
+    ):
+      for a_jax, a_tf_shape in zip(args_flat_jax, input_shapes_tf):
+        if not a_tf_shape.is_fully_defined():
+          msg = (
+              "call_tf cannot be applied to shape-polymorphic arguments unless"
+              " all the output shapes are static. Found argument shape:"
+              f" {a_jax.shape}. See"
+              " https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#limitations-of-call_tf"
+              " for a discussion."
+          )
+          raise ValueError(msg)
+
     res_jax_flat = call_tf_p.bind(
         *args_flat_jax,
         # Carry the actual function such that op-by-op call can call in TF eager mode.
         callable_flat_tf=callable_flat_tf,
         function_flat_tf=function_flat_tf,
-        args_flat_sig_tf=args_flat_sig_tf)
+        args_flat_sig_tf=args_flat_sig_tf,
+        has_side_effects=has_side_effects)
     return res_treedef.unflatten(res_jax_flat)
 
   # Define the fwd and bwd custom_vjp functions
@@ -235,9 +258,19 @@ def _get_concrete_function_tf(function_flat_tf, args_flat_sig_tf):  # -> tf.Conc
     return function_flat_tf.get_concrete_function(*args_flat_sig_tf)
 
 
+# Mark the effectful instancess of call_tf
+CallTfEffect = enum.Enum('CallTfEffect', ['EFFECT'])
+
+mlir.lowerable_effects.add(CallTfEffect.EFFECT)
+lax_control_flow.allowed_effects.add(CallTfEffect.EFFECT)
+ad_checkpoint.remat_allowed_effects.add(CallTfEffect.EFFECT)
+custom_derivatives.allowed_effects.add(CallTfEffect.EFFECT)
+
+
 def _call_tf_abstract_eval(*_,
                            function_flat_tf,
-                           args_flat_sig_tf, **__):
+                           args_flat_sig_tf,
+                           has_side_effects, **__):
   # Called only when we form a Jaxpr, i.e., under jit, scan, etc.
 
   concrete_function_flat_tf = _get_concrete_function_tf(function_flat_tf,
@@ -245,13 +278,17 @@ def _call_tf_abstract_eval(*_,
 
   def is_fully_known_shape(s):
     return s.rank is not None and all([d is not None for d in s])
+  effects = {CallTfEffect.EFFECT} if has_side_effects else set()
   if all([is_fully_known_shape(s)
           for s in concrete_function_flat_tf.output_shapes]):
-    return tuple([
-        # We convert to JAX type, and canonicalize to 32-bit if necessary
-        core.ShapedArray(shape, jax2tf_internal._to_jax_dtype(dtype))
-        for dtype, shape in zip(concrete_function_flat_tf.output_dtypes,
-                                concrete_function_flat_tf.output_shapes)])
+    return (
+        tuple([
+            # We convert to JAX type, and canonicalize to 32-bit if necessary
+            core.ShapedArray(shape, jax2tf_internal._to_jax_dtype(dtype))
+            for dtype, shape in zip(concrete_function_flat_tf.output_dtypes,
+                                    concrete_function_flat_tf.output_shapes)
+        ]),
+        effects)
 
   # There are some cases when TF shape inference is not powerful enough to
   # figure out the output shapes (e.g., b/128924522), even in situations where
@@ -262,10 +299,9 @@ def _call_tf_abstract_eval(*_,
   # it should not matter which platform we use.
   _, result_avals = _code_generator_and_avals(function_flat_tf, args_flat_sig_tf,
                                               "CPU")
-  return tuple(result_avals)
+  return tuple(result_avals), effects
 
-
-call_tf_p.def_abstract_eval(_call_tf_abstract_eval)
+call_tf_p.def_effectful_abstract_eval(_call_tf_abstract_eval)
 
 
 def _call_tf_lowering(ctx, *args_op, platform,
@@ -316,14 +352,24 @@ def _code_generator_and_avals(
       else:
         captured_inputs.append(inp)
 
-  # TODO(necula): It seems that we need concrete tensors for get_compiler_ir?
-  # We know of one case when TF is sensitive to the values of the tensors that
-  # affect shapes in the computation. In those cases, however, those tensors
-  # are inlined in the computation, which we detect below.
-  args_tf_flat = [
-      tf.constant((0 if a.dtype != tf.bool else False),
-                  shape=a.shape,
-                  dtype=a.dtype) for a in args_flat_sig_tf]
+  # TODO(b/265073174): Currently TensorSpec get_compiler_ir does not support
+  # tf.function captured variables. We can elminate this after it is fixed.
+  if tf.executing_eagerly():
+    args_tf_flat = [
+        tf.constant(
+            (0 if a.dtype != tf.bool else False), shape=a.shape, dtype=a.dtype
+        )
+        for a in args_flat_sig_tf
+    ]
+  else:
+
+    def maybe_convert_to_spec(x):
+      if isinstance(x, tf.TensorSpec):
+        return x
+      else:
+        return tf.TensorSpec.from_tensor(x)
+
+    args_tf_flat = [maybe_convert_to_spec(a) for a in args_flat_sig_tf]
 
   with jax2tf_internal.inside_call_tf():
     # When the TF computation uses variables on a particular device, we must
@@ -392,16 +438,16 @@ def _code_generator_and_avals(
     captured_ops = tuple(mlir.ir_constant(np.asarray(inp),
                                           canonicalize_types=False)
                          for inp in captured_inputs)
-    submodule = mlir.xla_computation_to_mhlo_module(xla_comp)
+    submodule = mlir.xla_computation_to_mlir_module(xla_comp)
     symtab = ir.SymbolTable(submodule.operation)
     callee_result_types = symtab["main"].type.results
-    fn = mlir.merge_mhlo_modules(ctx.module, f"call_tf_{function_flat_tf.name}",
+    fn = mlir.merge_mlir_modules(ctx.module, f"call_tf_{function_flat_tf.name}",
                                  submodule)
     call = func_dialect.CallOp(callee_result_types,
                                ir.FlatSymbolRefAttr.get(fn),
                                tuple(args_op) + captured_ops)
     if result_shape.is_tuple():
-      flat_results = [mhlo.GetTupleElementOp(call, mlir.i32_attr(i)).result
+      flat_results = [hlo.GetTupleElementOp(call, mlir.i32_attr(i)).result
                       for i in range(len(result_shapes))]
     else:
       flat_results = call.results
@@ -410,7 +456,7 @@ def _code_generator_and_avals(
     for op, res_aval, res_shape in zip(flat_results, result_avals,
                                        result_shapes):
       if res_aval.dtype != res_shape.numpy_dtype():
-        op = mhlo.ConvertOp(mlir.aval_to_ir_type(res_aval), op).result
+        op = hlo.ConvertOp(mlir.aval_to_ir_type(res_aval), op).result
       outputs.append(op)
     return outputs
 

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import functools
 import itertools as it
 import os
@@ -46,7 +45,6 @@ from jax._src import config as jax_config
 from jax._src.nn import initializers as nn_initializers
 from jax._src.lib import xla_bridge
 from jax._src.lib import xla_client
-from jax._src.lib import mlir_api_version
 from jax._src.util import unzip2, prod, safe_zip
 from jax._src.lax import parallel as lax_parallel
 from jax._src.lax.parallel import pgather
@@ -55,10 +53,6 @@ from jax.ad_checkpoint import checkpoint
 
 from jax.config import config
 config.parse_flags_with_absl()
-
-with contextlib.suppress(ImportError):
-  import pytest
-  pytestmark = pytest.mark.multiaccelerator
 
 
 # TODO(mattjj): de-duplicate setUpModule and tearDownModule with pmap_test.py
@@ -241,6 +235,7 @@ def schedules(sizes: Dict[str, int]
           yield axis_resources, mesh_data
 
 
+@jtu.pytest_mark_if_available('multiaccelerator')
 class XMapTestCase(jtu.BufferDonationTestCase):
   pass
 
@@ -268,6 +263,7 @@ class ManualSPMDTestMixin:
     jtu.restore_spmd_lowering_flag()
 
 
+@jtu.pytest_mark_if_available('multiaccelerator')
 class XMapTest(XMapTestCase):
 
   def testBasic(self):
@@ -745,6 +741,7 @@ class XMapTest(XMapTestCase):
     self.assertIsInstance(f.as_text(), str)
     self.assertIsInstance(f.as_text(dialect='hlo'), str)
     self.assertIsInstance(f.as_text(dialect='mhlo'), str)
+    self.assertIsInstance(f.as_text(dialect='stablehlo'), str)
 
   def testLowerCompilerIR(self):
     f = xmap(lambda x: x + 4, in_axes=['i', ...], out_axes=['i', ...])
@@ -753,6 +750,7 @@ class XMapTest(XMapTestCase):
     self.assertIsNotNone(f.compiler_ir())
     self.assertIsNotNone(f.compiler_ir(dialect='hlo'))
     self.assertIsNotNone(f.compiler_ir(dialect='mhlo'))
+    self.assertIsNotNone(f.compiler_ir(dialect='stablehlo'))
 
   @jtu.ignore_warning(category=DeprecationWarning)
   def testLowerCompileCompilerIR(self):
@@ -800,6 +798,7 @@ class XMapTest(XMapTestCase):
     jax.grad(lambda x: f(x).sum())(jnp.arange(3.))  # TODO crashes!
 
 
+@jtu.pytest_mark_if_available('multiaccelerator')
 class XMapTestSPMD(SPMDTestMixin, XMapTest):
   """Re-executes all basic tests with the SPMD partitioner enabled"""
 
@@ -855,6 +854,7 @@ class XMapTestSPMD(SPMDTestMixin, XMapTest):
       jnp.concatenate([yp, yp]))
 
 
+@jtu.pytest_mark_if_available('multiaccelerator')
 class XMapTestManualSPMD(ManualSPMDTestMixin, XMapTestCase):
   @jtu.with_mesh([('x', 2)])
   def testBasic(self):
@@ -956,9 +956,6 @@ class XMapTestManualSPMD(ManualSPMDTestMixin, XMapTestCase):
 
   @jtu.with_mesh([('x', 2)])
   def testPPermute(self):
-    if mlir_api_version < 35:
-      self.skipTest('MLIR api version should be greater than 35 for manual '
-                    'lowering of ppermute.')
     n = 2
     x = jnp.arange(n * 5, dtype=jnp.float32).reshape(n, 5)
 
@@ -978,6 +975,7 @@ class XMapTestManualSPMD(ManualSPMDTestMixin, XMapTestCase):
       jnp.concatenate([yp, yp]))
 
 
+@jtu.pytest_mark_if_available('multiaccelerator')
 class NamedNumPyTest(XMapTestCase):
 
   @jtu.sample_product(
@@ -1002,6 +1000,7 @@ class NamedNumPyTest(XMapTestCase):
     self.assertAllClose(ref_red(x), xmap_red(x))
 
 
+@jtu.pytest_mark_if_available('multiaccelerator')
 class NamedRandomTest(XMapTestCase):
 
   SAMPLERS = [
@@ -1040,6 +1039,7 @@ class NamedRandomTest(XMapTestCase):
     self.assertAllClose(sample({}), sample(dict(axis_resources)))
 
 
+@jtu.pytest_mark_if_available('multiaccelerator')
 class NamedNNTest(XMapTestCase):
 
   def testOneHot(self):
@@ -1092,6 +1092,7 @@ class NamedNNTest(XMapTestCase):
                         atol=1e-4, rtol=2e-2)
 
 
+@jtu.pytest_mark_if_available('multiaccelerator')
 class XMapGDATest(XMapTestCase):
 
   def setUp(self):
@@ -1252,6 +1253,7 @@ class XMapGDATest(XMapTestCase):
 
 
 
+@jtu.pytest_mark_if_available('multiaccelerator')
 class XMapArrayTest(XMapTestCase):
 
   def test_basic(self):
@@ -1329,6 +1331,7 @@ class XMapArrayTest(XMapTestCase):
           f(input_array)
 
 
+@jtu.pytest_mark_if_available('multiaccelerator')
 class NewPrimitiveTest(XMapTestCase):
 
   def testGatherPositional(self):
@@ -1353,6 +1356,7 @@ class NewPrimitiveTest(XMapTestCase):
     self.assertAllClose(f(x, y), f_ref(x, y))
 
 
+@jtu.pytest_mark_if_available('multiaccelerator')
 class NewPrimitiveTestSPMD(SPMDTestMixin, NewPrimitiveTest):
   pass
 
@@ -1456,6 +1460,7 @@ def schedules_from_pdot_spec(
   yield from schedules(logical_sizes)
 
 
+@jtu.pytest_mark_if_available('multiaccelerator')
 class PDotTests(XMapTestCase):
 
   @jtu.with_mesh([('r1', 2)])
@@ -1766,6 +1771,7 @@ class PDotTests(XMapTestCase):
     check('jk{i,b}->k{b}')
 
 
+@jtu.pytest_mark_if_available('multiaccelerator')
 class XMapErrorTest(jtu.JaxTestCase):
 
   @jtu.with_mesh([('x', 2)])
@@ -2013,6 +2019,7 @@ class XMapErrorTest(jtu.JaxTestCase):
       xmap(lambda x: x, (p,), (p, ['x']))([x, x, x])  # Error, we raise a generic tree mismatch message
 
 
+@jtu.pytest_mark_if_available('multiaccelerator')
 class NamedAutodiffTests(jtu.JaxTestCase):
 
   def testVjpReduceAxes(self):

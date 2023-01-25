@@ -5,7 +5,7 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.14.1
+    jupytext_version: 1.14.4
 kernelspec:
   display_name: Python 3
   name: python3
@@ -13,7 +13,7 @@ kernelspec:
 
 +++ {"id": "xgSYgIQhLJgx"}
 
-# Named axes and easy-to-revise parallelism
+# Named axes and easy-to-revise parallelism with `xmap`
 
 This tutorial introduces `jax.xmap` and the named-axis programming model that comes with it. By reading this, you'll learn how to write error-avoiding, self-documenting functions using named axes, then control how they're executed on hardware at any scale, from your laptop CPU to the largest TPU supercomputer.
 

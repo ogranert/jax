@@ -22,7 +22,7 @@ import numpy as np
 import jax
 from jax import core
 from jax import lax
-from jax import linear_util as lu
+from jax._src import linear_util as lu
 from jax.config import config
 from jax.interpreters import partial_eval as pe
 from jax._src import test_util as jtu
@@ -647,6 +647,17 @@ class StateDischargeTest(jtu.JaxTestCase):
     self.assertIsInstance(discharged_jaxpr.invars[1].aval, core.ShapedArray)
     self.assertEqual(discharged_jaxpr.effects,
         {state.WriteEffect(discharged_jaxpr.invars[0].aval)})
+
+  def test_ellipsis_index(self):
+    def f(ref):
+      state.ref_set(ref, ..., jnp.array(0., dtype=jnp.float32))
+      state.ref_get(ref, ...)
+      ref[...] = jnp.array(0., dtype=jnp.float32)
+      ref[...]
+      return []
+
+    in_avals = [state.ShapedArrayRef((), jnp.float32)]
+    pe.trace_to_jaxpr_dynamic(lu.wrap_init(f), in_avals)
 
 
 if CAN_USE_HYPOTHESIS:

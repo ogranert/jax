@@ -20,12 +20,10 @@ import weakref
 
 from typing import Any, Dict, Callable, Optional, Sequence, Set, Tuple, Union
 
-from jax import core
 from jax import tree_util
 from jax import lax
-from jax import linear_util as lu
+from jax._src import linear_util as lu
 from jax.config import config
-from jax._src.sharding import Sharding, OpShardingSharding
 from jax.experimental import pjit
 from jax.interpreters import ad
 from jax.interpreters import batching
@@ -33,12 +31,14 @@ from jax.interpreters import mlir
 from jax.interpreters import partial_eval as pe
 from jax.interpreters import pxla
 from jax._src import ad_checkpoint
+from jax._src import core
 from jax._src import custom_derivatives
 from jax._src import util
 from jax._src.lax import control_flow as lcf
 from jax._src.lib import xla_client as xc
 from jax._src.lib.mlir import ir
-from jax._src.lib.mlir.dialects import mhlo
+from jax._src.lib.mlir.dialects import hlo
+from jax._src.sharding import Sharding, OpShardingSharding
 import jax.numpy as jnp
 
 import numpy as np
@@ -335,15 +335,15 @@ def _inspect_sharding_lowering_rule(ctx: mlir.LoweringRuleContext, value, *,
   # partitioner runs so we keep it alive by attaching it to the executable.
   ctx.module_context.add_keepalive(sharding_callback_info)
 
-  mhlo.CustomCallOp([value.type], [value],
-                    call_target_name=ir.StringAttr.get(
-                      _INSPECT_SHARDING_CALL_NAME),
-                    has_side_effect=ir.BoolAttr.get(True),
-                    api_version=mlir.i32_attr(1),
-                    called_computations=ir.ArrayAttr.get([]),
-                    backend_config=ir.StringAttr.get(key),
-                    operand_layouts=None,
-                    result_layouts=None)
+  hlo.CustomCallOp([value.type], [value],
+                   call_target_name=ir.StringAttr.get(
+                     _INSPECT_SHARDING_CALL_NAME),
+                   has_side_effect=ir.BoolAttr.get(True),
+                   api_version=mlir.i32_attr(1),
+                   called_computations=ir.ArrayAttr.get([]),
+                   backend_config=ir.StringAttr.get(key),
+                   operand_layouts=None,
+                   result_layouts=None)
   return []
 mlir.register_lowering(inspect_sharding_p, _inspect_sharding_lowering_rule)
 

@@ -15,7 +15,7 @@
 """Sparse utilities."""
 
 import functools
-from typing import Any, Iterable, Sequence, Tuple, Union
+from typing import Any, NamedTuple, Tuple, Union
 
 import numpy as np
 import jax
@@ -40,6 +40,13 @@ class SparseEfficiencyWarning(UserWarning):
 class CuSparseEfficiencyWarning(SparseEfficiencyWarning):
   pass
 
+Shape = Tuple[int, ...]
+
+class SparseInfo(NamedTuple):
+  shape: Shape
+  indices_sorted: bool = False
+  unique_indices: bool = False
+
 #--------------------------------------------------------------------
 # utilities
 # TODO: possibly make these primitives, targeting cusparse rountines
@@ -50,7 +57,14 @@ def _asarray_or_float0(arg) -> Union[np.ndarray, Array]:
     return arg
   return jnp.asarray(arg)
 
-def _broadcasting_vmap(fun, in_axes=0, out_axes=0):
+def nfold_vmap(fun, N, *, broadcasted=True, in_axes=0):
+  """Convenience function to apply (broadcasted) vmap N times."""
+  _vmap = broadcasting_vmap if broadcasted else vmap
+  for _ in range(N):
+    fun = _vmap(fun, in_axes=in_axes)
+  return fun
+
+def broadcasting_vmap(fun, in_axes=0, out_axes=0):
   @functools.wraps(fun)
   def batched_fun(*args):
     args_flat, in_tree  = tree_util.tree_flatten(args)
@@ -94,7 +108,7 @@ def _count_stored_elements_per_batch(mat: Array, n_batch: int = 0, n_dense: int 
 
 def _count_stored_elements(mat: Array, n_batch: int = 0, n_dense: int = 0) -> int:
   """Return the number of stored elements (nse) of the given dense matrix."""
-  return int(_count_stored_elements_per_batch(mat, n_batch, n_dense).max())
+  return int(_count_stored_elements_per_batch(mat, n_batch, n_dense).max(initial=0))
 
 def _is_pytree_placeholder(*args: Any) -> bool:
   # Returns True if the arguments are consistent with being a placeholder within

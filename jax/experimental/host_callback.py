@@ -524,7 +524,7 @@ from jax._src.lib import pytree
 from jax._src.lib import xla_bridge as xb
 from jax._src.lib import xla_client
 from jax._src.lib import xla_extension
-from jax._src.lib.mlir.dialects import mhlo
+from jax._src.lib.mlir.dialects import hlo
 
 import numpy as np
 
@@ -550,7 +550,14 @@ XlaDevice = xla_client.Device
 XlaLocalClient = xla_client.Client
 DType = Any
 
-def id_tap(tap_func, arg, *, result=None, tap_with_device=False, **kwargs):
+
+def id_tap(tap_func,
+           arg,
+           *,
+           result=None,
+           tap_with_device=False,
+           device_index=0,
+           **kwargs):
   """Host-callback tap primitive, like identity function with a call to ``tap_func``.
 
   **Experimental: please give feedback, and expect changes!**
@@ -574,6 +581,9 @@ def id_tap(tap_func, arg, *, result=None, tap_with_device=False, **kwargs):
       value of ``id_tap`` is ``arg``.
     tap_with_device: if True then the tap function is invoked with the
       device from which the tap originates as a keyword argument.
+    device_index: specifies from which device the tap function is invoked in a
+      SPMD program. Works only when using the outfeed implementation mechanism,
+      i.e., does not work on CPU unless --jax_host_callback_outfeed=True.
 
   Returns:
     ``arg``, or ``result`` if given.
@@ -586,9 +596,7 @@ def id_tap(tap_func, arg, *, result=None, tap_with_device=False, **kwargs):
   Tapping works even for code executed on accelerators and even for code under
   JAX transformations.
 
-  For more details see the
-  `module documentation
-  <jax.experimental.host_callback.html>`_.
+  For more details see the :mod:`jax.experimental.host_callback` module documentation.
   """
   if kwargs:
     msg = (
@@ -605,10 +613,15 @@ def id_tap(tap_func, arg, *, result=None, tap_with_device=False, **kwargs):
   if result is not None:
     flat_results, result_treedef = pytree.flatten(result)
     for r in flat_results:
-      api._check_arg(r)
+      dispatch.check_arg(r)
 
-  call_res = _call(tap_func, arg, call_with_device=tap_with_device,
-                   result_shape=None, identity=True)
+  call_res = _call(
+      tap_func,
+      arg,
+      call_with_device=tap_with_device,
+      result_shape=None,
+      identity=True,
+      device_index=device_index)
 
   if result is not None:
     # Return the results, but add a dependency on the call, to ensure it
@@ -627,8 +640,14 @@ def id_tap(tap_func, arg, *, result=None, tap_with_device=False, **kwargs):
     return call_res
 
 
-def id_print(arg, *, result=None, tap_with_device=False,
-             output_stream=None, threshold=None, **kwargs):
+def id_print(arg,
+             *,
+             result=None,
+             tap_with_device=False,
+             device_index=0,
+             output_stream=None,
+             threshold=None,
+             **kwargs):
   """Like :func:`id_tap` with a printing tap function.
 
    **Experimental: please give feedback, and expect changes!**
@@ -647,16 +666,24 @@ def id_print(arg, *, result=None, tap_with_device=False,
      built-in ``print``. The string will be passed as
      ``output_stream.write(s)``.
    * ``threshold`` is passed to ``numpy.array2string``.
+
+  For more details see the :mod:`jax.experimental.host_callback` module documentation.
   """
   printer = functools.partial(_print_tap_func,
                               output_stream=output_stream,
                               threshold=threshold, **kwargs)
-  return id_tap(printer, arg, result=result, tap_with_device=tap_with_device)
+  return id_tap(
+      printer,
+      arg,
+      result=result,
+      tap_with_device=tap_with_device,
+      device_index=device_index)
 
 
 def call(callback_func: Callable, arg, *,
          result_shape=None,
-         call_with_device=False):
+         call_with_device=False,
+         device_index=0):
   """Make a call to the host, and expect a result.
 
   **Experimental: please give feedback, and expect changes!**
@@ -684,15 +711,17 @@ def call(callback_func: Callable, arg, *,
     call_with_device: if True then the callback function is invoked with the
       device from which the call originates as a keyword argument.
 
+    device_index: specifies from which device the tap function is invoked in a
+      SPMD program. Works only when using the outfeed implementation mechanism,
+      i.e., does not work on CPU unless --jax_host_callback_outfeed=True.
   Returns:
     the result of the ``callback_func`` invocation.
 
-  For more details see the
-  `module documentation
-  <jax.experimental.host_callback.html>`_.
+  For more details see the :mod:`jax.experimental.host_callback` module documentation.
   """
   return _call(callback_func, arg, result_shape=result_shape,
-               call_with_device=call_with_device, identity=False)
+               call_with_device=call_with_device, identity=False,
+               device_index=device_index)
 
 
 # We need the wrapper function to have hash and equality defined since it is
@@ -728,17 +757,20 @@ class _CallbackWrapper:
 
 # Helper function to implement both `call` and `id_tap`. The two cases are
 # differentiated by the `identity` flag.
-def _call(callback_func: Callable, arg, *,
+def _call(callback_func: Callable,
+          arg,
+          *,
           result_shape=None,
           call_with_device=False,
+          device_index=0,
           identity=False):
   # Lazy initialization
   _initialize_outfeed_receiver(
       max_callback_queue_size_bytes=FLAGS.jax_host_callback_max_queue_byte_size)
-  api._check_callable(callback_func)
+  api.check_callable(callback_func)
   flat_args, arg_treedef = pytree.flatten(arg)
   for arg in flat_args:
-    api._check_arg(arg)
+    dispatch.check_arg(arg)
   # See definition of outside_call_p for what parameters it takes
   params: Dict[str, Any] = {}
   # TODO: wrap function
@@ -746,6 +778,7 @@ def _call(callback_func: Callable, arg, *,
                                         call_with_device)
   params["identity"] = identity
   params["arg_treedef"] = arg_treedef
+  params["device_index"] = device_index
 
   if not identity:
     # Turn abstract values into ShapesDtypeStruct
@@ -932,6 +965,9 @@ It takes the following parameters:
     going to be the non-token positional arguments, along with the updated
     token. The tokens and this parameter are added after all the JAX
     transformations, just before staging XLA.
+  * device_index: an integer, denotes from which device the invocation is from.
+    Works only when using the outfeed implementation mechanism, i.e., does
+    not work on CPU unless --jax_host_callback_outfeed=True.
 """
 outside_call_p = core.Primitive("outside_call")
 outside_call_p.multiple_results = True
@@ -945,7 +981,7 @@ def _outside_call_abstract_eval(*args_a: pe.AbstractValue,
     assert "result_treedef" not in params
     assert "flat_results_aval" not in params
     return args_a
-
+  assert params["device_index"] is not None
   assert params["result_treedef"] is not None
   assert params["flat_results_aval"] is not None
   flat_results_aval = params["flat_results_aval"]
@@ -960,9 +996,13 @@ outside_call_p.def_abstract_eval(_outside_call_abstract_eval)
 
 
 def _outside_call_impl(*args, **params):
-  assert not "has_token" in params
+  assert "has_token" not in params
   if _inline_host_callback():
-    device = api.devices()[0]
+    if jaxlib.xla_extension_version >= 112:
+      device_index = params["device_index"]
+      device = api.devices()[device_index]
+    else:
+      device = api.devices()[0]
     results = _outside_call_run_callback(args, device, send_infeed=False, **params)
     return results
   else:
@@ -979,10 +1019,13 @@ def _outside_call_impl(*args, **params):
 outside_call_p.def_impl(_outside_call_impl)
 
 
-def _outside_call_translation_rule(ctx, avals_in, avals_out,
+def _outside_call_translation_rule(ctx,
+                                   avals_in,
+                                   avals_out,
                                    *args_op: XlaOp,
                                    has_token,
                                    identity,
+                                   device_index,
                                    flat_results_aval=(),
                                    **params):
   # We expect the current tokens at the end, inserted by _rewrite_jaxpr.
@@ -1014,9 +1057,12 @@ def _outside_call_translation_rule(ctx, avals_in, avals_out,
             identity=identity,
             flat_results_aval=flat_results_aval,
             **params))
-    next_token = _callback_handler_data.receiver.add_outfeed(comp, current_token,
-                                                        callback_id,
-                                                        args_to_outfeed)
+    if jaxlib.xla_extension_version >= 112:
+      next_token = _callback_handler_data.receiver.add_outfeed(
+          comp, current_token, callback_id, args_to_outfeed, device_index)
+    else:
+      next_token = _callback_handler_data.receiver.add_outfeed(
+          comp, current_token, callback_id, args_to_outfeed)
     if identity:
       results = list(args_to_outfeed)
       next_itoken = current_itoken
@@ -1029,13 +1075,16 @@ def _outside_call_translation_rule(ctx, avals_in, avals_out,
       if non_empty_flat_results_aval:
         assert need_callback_results_on_device
         after_outfeed_itoken = xops.AfterAll(comp, [current_itoken, next_token])
-        # We shard the infeed as AssignedDevice(0). This must match the
+        # We shard the infeed as AssignedDevice(device_index). This must match the
         # outfeed (from outfeed_receiver.cc). Since `lax.infeed` does not support
         # this kind of sharding, we use a custom translation for infeed.
         array_sharding_proto = xla_client.OpSharding()
         array_sharding_proto.type = xla_client.OpSharding.Type.MAXIMAL
         array_sharding_proto.tile_assignment_dimensions = [1]
-        array_sharding_proto.tile_assignment_devices = [0]
+        if jaxlib.xla_extension_version >= 112:
+          array_sharding_proto.tile_assignment_devices = [device_index]
+        else:
+          array_sharding_proto.tile_assignment_devices = [0]
 
         token_sharding_proto = xla_client.OpSharding()
         token_sharding_proto.type = xla_client.OpSharding.Type.REPLICATED
@@ -1071,6 +1120,9 @@ def _outside_call_translation_rule(ctx, avals_in, avals_out,
         next_itoken = current_itoken
 
   else:  # !use_outfeed : CustomCall implementation
+    if device_index != 0:
+      raise ValueError("The device_index feature works only when using outfeed.")
+
     # TODO(necula): this is a weak attempt to get the device. This works
     # inside pmap, but does not work when we just execute on a single device,
     # because in such executions we always get replica_id == 0.
@@ -1126,9 +1178,14 @@ def _outside_call_translation_rule(ctx, avals_in, avals_out,
 
 xla.register_translation(outside_call_p, _outside_call_translation_rule)
 
-def _outside_call_lowering(
-    ctx: mlir.LoweringRuleContext, *args, has_token: bool, identity: bool,
-    flat_results_aval=(), **params):
+
+def _outside_call_lowering(ctx: mlir.LoweringRuleContext,
+                           *args,
+                           has_token: bool,
+                           identity: bool,
+                           device_index: int,
+                           flat_results_aval=(),
+                           **params):
   """MLIR Lowering for `CustomCall`-based HCB."""
   platform = ctx.module_context.platform
   use_outfeed = _use_outfeed(platform)
@@ -1136,21 +1193,29 @@ def _outside_call_lowering(
     # Fall back to XLA path if we are using the outfeed
     # TODO(sharadmv): update to use MLIR for this path as well and delete
     #                 XLA lowering
-    return mlir.xla_fallback_lowering(outside_call_p)(ctx, *args,
-        has_token=has_token, identity=identity,
-        flat_results_aval=flat_results_aval, **params)
+    return mlir.xla_fallback_lowering(outside_call_p)(
+        ctx,
+        *args,
+        has_token=has_token,
+        identity=identity,
+        flat_results_aval=flat_results_aval,
+        device_index=device_index,
+        **params)
+  else:
+    if device_index != 0:
+      raise ValueError("The device_index feature works only when using outfeed.")
   # We expect the current tokens at the end, inserted by _rewrite_jaxpr.
   assert has_token
   current_token = args[-2]
   current_itoken = args[-1]
-  assert current_token.type == mhlo.TokenType.get(), "The last two arguments must be tokens"
-  assert current_itoken.type == mhlo.TokenType.get(), "The last two arguments must be tokens"
+  assert current_token.type == hlo.TokenType.get(), "The last two arguments must be tokens"
+  assert current_itoken.type == hlo.TokenType.get(), "The last two arguments must be tokens"
 
   args_to_outfeed = args[:-2]
   # TODO(necula): this is a weak attempt to get the device. This works
   # inside pmap, but does not work when we just execute on a single device,
   # because in such executions we always get replica_id == 0.
-  replica_id = mhlo.ReplicaIdOp()
+  replica_id = hlo.ReplicaIdOp()
   callback_operands = [replica_id, *args_to_outfeed]
   callback_operand_avals = [
       core.ShapedArray((), np.uint32), *ctx.avals_in[:-2]]
@@ -1176,11 +1241,14 @@ def _outside_call_lowering(
 
   if isinstance(ctx.module_context.axis_context,
                 (mlir.SPMDAxisContext, mlir.ShardingContext)):
-    # Apply maximal sharding so pjit only executes the callback on device 0.
+    # Apply maximal sharding so pjit only executes the callback on device device_index.
     sharding = xla_client.OpSharding()
     sharding.type = xla_client.OpSharding.Type.MAXIMAL
     sharding.tile_assignment_dimensions = [1]
-    sharding.tile_assignment_devices = [0]
+    if jaxlib.xla_extension_version >= 112:
+      sharding.tile_assignment_devices = [device_index]
+    else:
+      sharding.tile_assignment_devices = [0]
   else:
     sharding = None
   results, next_token, keep_alive = mlir.emit_python_callback(ctx,
@@ -1573,13 +1641,13 @@ def _rewrite_eqn(eqn: core.JaxprEqn, eqns: List[core.JaxprEqn],
     new_jaxpr_invars = (
         new_jaxpr_invars[0:nr_const_and_carry] + new_jaxpr_invars[-2:] +
         new_jaxpr_invars[nr_const_and_carry:-2])
-    new_jaxpr.jaxpr.invars = new_jaxpr_invars
+    new_jaxpr = new_jaxpr.replace(jaxpr=new_jaxpr.jaxpr.replace(invars=new_jaxpr_invars))
 
     new_jaxpr_outvars = new_jaxpr.jaxpr.outvars
     new_jaxpr_outvars = (
         new_jaxpr_outvars[0:num_carry] + new_jaxpr_outvars[-2:] +
         new_jaxpr_outvars[num_carry:-2])
-    new_jaxpr.jaxpr.outvars = new_jaxpr_outvars
+    new_jaxpr = new_jaxpr.replace(jaxpr=new_jaxpr.jaxpr.replace(outvars=new_jaxpr_outvars))
     eqns.append(
         eqn.replace(
             invars=new_invars,
@@ -1661,10 +1729,10 @@ def _rewrite_eqn(eqn: core.JaxprEqn, eqns: List[core.JaxprEqn],
                 eqn.params,
                 jaxpr=_rewrite_closed_jaxpr(jaxpr, True, True),
                 donated_invars=eqn.params["donated_invars"] + (False, False),
-                in_axis_resources=(eqn.params["in_axis_resources"] +
-                                   (pjit.REPLICATED, pjit.REPLICATED)),
-                out_axis_resources=(eqn.params["out_axis_resources"] +
-                                    (pjit.REPLICATED, pjit.REPLICATED)),
+                in_shardings=(eqn.params["in_shardings"] +
+                              (pjit._UNSPECIFIED, pjit._UNSPECIFIED)),
+                out_shardings=(eqn.params["out_shardings"] +
+                               (pjit._UNSPECIFIED, pjit._UNSPECIFIED)),
             )))
   elif eqn.primitive is ad_checkpoint.remat_p:
     jaxpr_ = cast(core.Jaxpr, eqn.params["jaxpr"])
@@ -1800,8 +1868,8 @@ dispatch.outfeed_rewriter = lambda j: _rewrite_jaxpr(j, False, False)
 class CallbackException(Exception):
   """Signals that some callback function had exceptions.
 
-  Raised by :func:`barrier_wait`.
-  See module documentation for details.
+  Raised by :func:`barrier_wait`. See the :mod:`jax.experimental.host_callback`
+  module documentation for details.
   """
   pass
 
@@ -1946,6 +2014,8 @@ def barrier_wait(logging_name: Optional[str] = None):
   Args:
     logging_name: an optional string that will be used in the logging statements
       for this invocation. See `Debugging` in the module documentation.
+
+  For more details see the :mod:`jax.experimental.host_callback` module documentation.
   """
   logging_name = logging_name or ""
   logger.debug("barrier_wait[%s]: start", logging_name)

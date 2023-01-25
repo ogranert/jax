@@ -1,5 +1,5 @@
-jax.scipy package
-=================
+``jax.scipy`` module
+====================
 
 jax.scipy.fft
 -------------
@@ -159,6 +159,8 @@ jax.scipy.stats.bernoulli
 
    logpmf
    pmf
+   cdf
+   ppf
 
 jax.scipy.stats.beta
 ~~~~~~~~~~~~~~~~~~~~
@@ -357,3 +359,12 @@ jax.scipy.stats.gaussian_kde
    gaussian_kde.resample
    gaussian_kde.pdf
    gaussian_kde.logpdf
+
+jax.scipy.stats.vonmises
+~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: jax.scipy.stats.vonmises
+.. autosummary::
+  :toctree: _autosummary
+
+   logpdf
+   pdf

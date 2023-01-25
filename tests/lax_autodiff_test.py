@@ -170,7 +170,7 @@ LAX_GRAD_SPECIAL_VALUE_TESTS = [
     grad_special_values_test_spec(
       lax.cosh, [0.],
       tol={np.float32: 1e-2} if jtu.device_under_test() == "tpu" else None),
-    grad_special_values_test_spec(lax.tanh, [0., 1000.]),
+    grad_special_values_test_spec(lax.tanh, [0., 1000.], tol=5e-3),
     grad_special_values_test_spec(lax.sin, [0., np.pi, np.pi/2., np.pi/4.]),
     grad_special_values_test_spec(lax.cos, [0., np.pi, np.pi/2., np.pi/4.]),
     grad_special_values_test_spec(lax.tan, [0.]),
@@ -415,7 +415,9 @@ class LaxAutodiffTest(jtu.JaxTestCase):
     rhs = rng(rhs_shape, dtype)
     dot_general = partial(lax.dot_general, dimension_numbers=dimension_numbers,
                           precision=lax.Precision.HIGHEST)
-    check_grads_bilinear(dot_general, (lhs, rhs), order=2, modes=["fwd", "rev"])
+    atol = {np.float16: 5E-2} if jtu.device_under_test() == 'tpu' else None
+    check_grads_bilinear(dot_general, (lhs, rhs), order=2,
+                         modes=["fwd", "rev"], atol=atol)
     # check that precision config is preserved
     result, pullback = jax.vjp(dot_general, lhs, rhs)
     gresult = lax.zeros_like_array(result)

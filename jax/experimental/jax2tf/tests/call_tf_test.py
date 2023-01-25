@@ -542,23 +542,13 @@ class CallTfTest(tf_test_util.JaxToTfTestCase):
 
     def fun_tf(x):
       begin = 0
-      return x[begin:5]  # x must be a compile-time constant
+      return x[begin:5]
 
-    hlo = tf.function(fun_tf, jit_compile=True).experimental_get_compiler_ir(x)()
+    hlo = tf.function(fun_tf, jit_compile=True, autograph=False).experimental_get_compiler_ir(x)()
     self.assertIn("(arg0.1: s32[10]) -> s32[5]", hlo)
 
     # Non-constant slice, but compile-time constant depending only on values.
     x = np.zeros((10,), dtype=np.int32)
-
-    def fun_tf(x):
-      begin = x[0]
-      return x[begin:5]  # x must be a compile-time constant
-
-    hlo = tf.function(fun_tf, jit_compile=True).experimental_get_compiler_ir(x)()
-    self.assertIn("() -> s32[5]", hlo)
-    x = np.ones((10,), dtype=np.int32)
-    hlo = tf.function(fun_tf, jit_compile=True).experimental_get_compiler_ir(x)()
-    self.assertIn("() -> s32[4]", hlo)
 
     # Non-constant slice, but compile-time constant depending only on shapes.
     x = np.zeros((10,), dtype=np.int32)
@@ -567,7 +557,7 @@ class CallTfTest(tf_test_util.JaxToTfTestCase):
       begin = tf.shape(x)[0] - 2  # begin is a compile-time constant, even if x is not
       return x[begin:]
 
-    hlo = tf.function(fun_tf, jit_compile=True).experimental_get_compiler_ir(x)()
+    hlo = tf.function(fun_tf, jit_compile=True, autograph=False).experimental_get_compiler_ir(x)()
     self.assertIn("(arg0.1: s32[10]) -> s32[2]", hlo)
 
     # Capture a variable
@@ -577,7 +567,7 @@ class CallTfTest(tf_test_util.JaxToTfTestCase):
     def fun_tf(x):
       return x * tf.broadcast_to(outer_var, x.shape) + 1.
 
-    hlo = tf.function(fun_tf, jit_compile=True).experimental_get_compiler_ir(x)()
+    hlo = tf.function(fun_tf, jit_compile=True, autograph=False).experimental_get_compiler_ir(x)()
     self.assertIn("(arg0.1: f32[3], arg1.2: f32[1]) -> f32[3]", hlo)
 
     # Capture a constant
@@ -587,7 +577,7 @@ class CallTfTest(tf_test_util.JaxToTfTestCase):
     def fun_tf(x):
       return x * tf.broadcast_to(outer_ct, x.shape) + 1.
 
-    hlo = tf.function(fun_tf, jit_compile=True).experimental_get_compiler_ir(x)()
+    hlo = tf.function(fun_tf, jit_compile=True, autograph=False).experimental_get_compiler_ir(x)()
     self.assertIn("(arg0.1: f32[3]) -> f32[3]", hlo)
 
     # Call get_compiler_ir in a function context
@@ -596,7 +586,7 @@ class CallTfTest(tf_test_util.JaxToTfTestCase):
 
     def fun_tf_outer(x):
       x_const = tf.constant(0, shape=x.shape, dtype=x.dtype)
-      _ = tf.function(tf.math.sin, jit_compile=True).experimental_get_compiler_ir(x_const)()
+      _ = tf.function(tf.math.sin, jit_compile=True, autograph=False).experimental_get_compiler_ir(x_const)()
 
     # TODO(b/193754660)
     # with self.assertRaisesRegex(
@@ -634,6 +624,16 @@ class CallTfTest(tf_test_util.JaxToTfTestCase):
     res = tf.function(f_tf2, autograph=False)(x)
     self.assertAllClose(res.numpy(), f_jax(x))
 
+  def test_effectful(self):
+    if not config.jax_array:
+      raise unittest.SkipTest("Test not intended to work without jax.Array")
+
+    x = np.ones((3,), dtype=np.float32)
+    lower_effect = jax.jit(jax2tf.call_tf(tf.math.sin, has_side_effects=True)).lower(x)
+    self.assertNotEmpty(lower_effect._lowering.compile_args["unordered_effects"])
+
+    lower_no_effect = jax.jit(jax2tf.call_tf(tf.math.sin, has_side_effects=False)).lower(x)
+    self.assertEmpty(lower_no_effect._lowering.compile_args["unordered_effects"])
 
   def test_module_documentation(self):
     def cos_tf(x):
@@ -817,6 +817,21 @@ class RoundTripToJaxTest(tf_test_util.JaxToTfTestCase):
     with self.assertRaises(TypeError):
       _ = jax.grad(f_rt)(x)
 
+  def test_call_tf_under_function_context(self):
+    def fun_jax(x, y):
+      z = jax2tf.call_tf(tf.math.sin)(x) + jnp.cos(y)
+      return z
+
+    x = np.array([-1.0, 0.0, 1.0], dtype=np.float32)
+    y = np.array([-0.5, 0.0, 0.5], dtype=np.float32)
+
+    converted_fun = tf.function(
+        jax2tf.convert(fun_jax, experimental_native_lowering=True)
+    )
+    expected = np.sin(x) + np.cos(y)
+    res = tf.function(converted_fun, jit_compile=True, autograph=False)(x, y)
+    self.assertAllClose(expected, res.numpy(), atol=1e-5, rtol=1e-5)
+
 
 class RoundTripToTfTest(tf_test_util.JaxToTfTestCase):
   "Reloading output of call_tf into TF with jax2tf."
@@ -894,6 +909,29 @@ class RoundTripToTfTest(tf_test_util.JaxToTfTestCase):
     res = reloaded_f(x)
     self.assertAllClose(np.sin(x), res.numpy())
 
+  def test_saved_model_polymorphic_input_static_output(self):
+    x = np.array([.7, .8], dtype=np.float32)
+    def fun_tf(x):
+      return tf.math.reduce_sum(tf.math.sin(x))
+    def fun_jax(x):
+      return jax2tf.call_tf(fun_tf)(x)
+
+    # Now convert and save to SavedModel
+    fun_tf_rt = jax2tf.convert(fun_jax)
+    res = fun_tf_rt(x)
+    self.assertAllClose(fun_tf(x), res.numpy())
+
+    res = tf.function(fun_tf_rt, autograph=False)(x)
+    self.assertAllClose(fun_tf(x), res.numpy())
+
+    res = tf.function(fun_tf_rt, jit_compile=True, autograph=False)(x)
+    self.assertAllClose(fun_tf(x), res.numpy())
+
+    reloaded_f, _ = tf_test_util.SaveAndLoadFunction(
+        fun_tf_rt, input_args=[x])
+    res = reloaded_f(x)
+    self.assertAllClose(fun_tf(x), res.numpy())
+
   def test_function_dynamic_shape(self):
     # Call a function for which shape inference does not give an output
     # shape.
@@ -927,13 +965,24 @@ class RoundTripToTfTest(tf_test_util.JaxToTfTestCase):
 
     fun_jax = jax2tf.call_tf(fun_tf)
 
-    fun_tf_rt = jax2tf.convert(fun_jax,
-                               polymorphic_shapes=["b, ..."])
+    fun_tf_rt = jax2tf.convert(fun_jax, polymorphic_shapes=["b, ..."])
     with self.assertRaisesRegex(
-        ValueError,
-        "call_tf cannot be applied to shape-polymorphic arguments"):
+        ValueError, "call_tf cannot be applied to shape-polymorphic arguments"
+    ):
       fun_tf_rt(x)
 
+  @_parameterized_jit
+  def test_shape_polymorphism_static_output_shape(self, with_jit=True):
+    x = np.array([0.7, 0.8], dtype=np.float32)
+
+    def fun_tf(x):
+      return tf.math.reduce_sum(tf.math.sin(x))
+
+    fun_jax = jax2tf.call_tf(fun_tf)
+    fun_tf_rt = jax2tf.convert(fun_jax, polymorphic_shapes=["b, ..."])
+    if with_jit:
+      fun_tf_rt = tf.function(jit_compile=True, autograph=False)(fun_tf_rt)
+    self.assertAllClose(fun_tf(x), fun_tf_rt(x))
 
   @parameterized.named_parameters(
       _named_test(f2_function=f2_function, f2_saved_model=f2_saved_model,

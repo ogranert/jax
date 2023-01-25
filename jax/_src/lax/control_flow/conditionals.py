@@ -22,7 +22,7 @@ import operator
 from typing import Callable, Sequence, List, Tuple
 
 from jax import core
-from jax import linear_util as lu
+from jax._src import linear_util as lu
 from jax.config import config
 from jax.core import ConcreteArray, raise_to_shaped
 from jax.interpreters import ad
@@ -32,6 +32,7 @@ from jax.interpreters import partial_eval as pe
 from jax.interpreters import xla
 from jax.tree_util import tree_flatten, tree_unflatten
 from jax._src import ad_util
+from jax._src.core import replace_jaxpr_effects
 from jax._src import dtypes
 from jax._src import source_info_util
 from jax._src import util
@@ -41,7 +42,7 @@ from jax._src.traceback_util import api_boundary
 from jax._src.util import (safe_map, extend_name_stack, split_list,
                            partition_list)
 from jax._src.lib.mlir import ir
-from jax._src.lib.mlir.dialects import mhlo
+from jax._src.lib.mlir.dialects import hlo
 import numpy as np
 
 from jax._src.lax.control_flow.common import (
@@ -155,8 +156,13 @@ def _cond(pred, true_fun: Callable, false_fun: Callable, *operands,
           operand=_no_operand_sentinel, linear=None):
   """Conditionally apply ``true_fun`` or ``false_fun``.
 
+  Wraps XLA's `Conditional
+  <https://www.tensorflow.org/xla/operation_semantics#conditional>`_
+  operator.
+
   Provided arguments are correctly typed, ``cond()`` has equivalent
-  semantics to this Python implementation::
+  semantics to this Python implementation, where ``pred`` must be a
+  scalar type::
 
     def cond(pred, true_fun, false_fun, *operands):
       if pred:
@@ -164,7 +170,11 @@ def _cond(pred, true_fun: Callable, false_fun: Callable, *operands,
       else:
         return false_fun(*operands)
 
-  ``pred`` must be a scalar type.
+
+  In contrast with :func:`jax.lax.select`, using ``cond`` indicates that only one of
+  the two branches is executed (up to compiler rewrites and optimizations).
+  However, when transformed with :func:`~jax.vmap` to operate over a batch of
+  predicates, ``cond`` is converted to :func:`~jax.lax.select`.
 
   Args:
     pred: Boolean scalar type, indicating which branch function to apply.
@@ -246,10 +256,8 @@ def _cond(pred, true_fun: Callable, false_fun: Callable, *operands,
     # Raise index in case of effects to allow data-dependence-based discharging
     # of those effects (even if they don't have an explicit data dependence).
     index = core.raise_as_much_as_possible(index)
-  false_jaxpr = false_jaxpr.replace(
-      jaxpr=false_jaxpr.jaxpr.replace(effects=joined_effects))
-  true_jaxpr = true_jaxpr.replace(
-      jaxpr=true_jaxpr.jaxpr.replace(effects=joined_effects))
+  false_jaxpr = replace_jaxpr_effects(false_jaxpr, joined_effects)
+  true_jaxpr = replace_jaxpr_effects(true_jaxpr, joined_effects)
 
   linear = [False] * len(consts) + linear_ops
   out = cond_p.bind(
@@ -328,10 +336,17 @@ def _bcast_select_n(pred, *cases):
 def _cond_batching_rule(axis_size, axis_name, main_type, args, dims, branches, linear):
   index, *ops = args
   index_dim, *op_dims = dims
+  # TODO(sharadmv): clean this up by adding a specific blocklist
   if any(isinstance(eff, state.RefEffect) for branch in branches for eff in
       branch.jaxpr.effects):
     raise NotImplementedError(
-        "State effect not supported in cond vmap.")
+        "State effect not supported in vmap-of-cond.")
+  from jax._src.callback import _IOEffect, _OrderedIOEffect
+  if any(eff in branch.effects for eff in [_IOEffect, _OrderedIOEffect]
+      for branch in branches):
+    raise NotImplementedError(
+        "IO effect not supported in vmap-of-cond.")
+
 
   if index_dim is not batching.not_mapped:
     # Convert to a lax.select. While we could get away with not broadcasting
@@ -678,7 +693,9 @@ def _transpose_cond_jaxpr(jaxpr, num_res, reduce_axes):
   return _make_closed_jaxpr(transposed, res_avals + jaxpr.out_avals)
 
 def _cond_transpose(reduce_axes, cts, *args, branches, linear):
+  del linear  # could use for error checking, but see #14026
   index, *ops = args
+  linear = [type(x) is ad.UndefinedPrimal for x in ops]
   in_avals = map(raise_to_shaped, branches[0].in_avals)
   num_res = len(ops) - sum(linear)
   if any(isinstance(eff, state.RefEffect) for branch in branches for eff in
@@ -806,11 +823,11 @@ def _cond_lowering(ctx, index, *args, branches, linear):
       *output_token_types, *map(mlir.aval_to_ir_types, ctx.avals_out)]
   flat_output_types = util.flatten(output_types)
 
-  # mhlo.CaseOp takes a single argument 'index' and the corresponding blocks
+  # CaseOp takes a single argument 'index' and the corresponding blocks
   # have no arguments; the computation within the block uses implicit
   # captures.
-  case_op = mhlo.CaseOp(flat_output_types, index=index,
-                        num_branches=len(branches))
+  case_op = hlo.CaseOp(flat_output_types, index=index,
+                       num_branches=len(branches))
   name_stack = extend_name_stack(ctx.module_context.name_stack, 'cond')
   for i, jaxpr in enumerate(branches):
     branch = case_op.regions[i].blocks.append()
@@ -824,7 +841,7 @@ def _cond_lowering(ctx, index, *args, branches, linear):
           dim_var_values=ctx.dim_var_values)
       out_tokens = [tokens_out.get(eff) for eff in ordered_effects]
       out_vals = [*out_tokens, *out_vals]
-      mhlo.ReturnOp(util.flatten(out_vals))
+      hlo.ReturnOp(util.flatten(out_vals))
 
   tokens_and_outputs = util.unflatten(case_op.results, map(len, output_types))
   tokens, outputs = util.split_list(tokens_and_outputs, [num_tokens])

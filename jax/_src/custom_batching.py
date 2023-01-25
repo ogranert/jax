@@ -17,8 +17,7 @@ import operator
 from typing import Callable, Optional
 
 import jax
-from jax import core
-from jax import linear_util as lu
+from jax._src import linear_util as lu
 from jax import tree_util
 from jax.interpreters import ad
 from jax.interpreters import batching
@@ -28,6 +27,7 @@ from jax.interpreters import partial_eval as pe
 from jax.interpreters import xla
 from jax.tree_util import (tree_flatten, tree_map, tree_structure,
                            tree_unflatten, treedef_tuple)
+from jax._src import core
 from jax._src import custom_api_util
 from jax._src import source_info_util
 from jax._src import traceback_util

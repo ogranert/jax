@@ -35,6 +35,9 @@ del _cloud_tpu_init
 from jax import config as _config_module
 del _config_module
 
+# Note: import <name> as <name> is required for names to be exported.
+# See PEP 484 & https://github.com/google/jax/issues/7570
+
 from jax._src.basearray import Array as Array
 
 from jax._src.config import (
@@ -59,7 +62,7 @@ from jax._src.config import (
   transfer_guard_device_to_host as transfer_guard_device_to_host,
   spmd_mode as spmd_mode,
 )
-from .core import eval_context as ensure_compile_time_eval
+from jax._src.core import ensure_compile_time_eval as ensure_compile_time_eval
 from jax._src.environment_info import print_environment_info as print_environment_info
 from jax._src.api import (
   ad,  # TODO(phawkins): update users to avoid this.
@@ -146,6 +149,7 @@ from jax import dtypes as dtypes
 from jax import errors as errors
 from jax import image as image
 from jax import lax as lax
+from jax import linear_util as linear_util
 from jax import nn as nn
 from jax import numpy as numpy
 from jax import ops as ops
@@ -159,4 +163,11 @@ from jax import util as util
 
 import jax.lib  # TODO(phawkins): remove this export.
 
-del jax._src
+if hasattr(jax, '_src'):
+  del jax._src
+else:
+  from warnings import warn as _warn
+  _warn("The jax module appears to have been reloaded within the python process. "
+        "This is not well-supported and can cause unpredictable side-effects. "
+        "For information see https://github.com/google/jax/issues/13857.")
+  del _warn

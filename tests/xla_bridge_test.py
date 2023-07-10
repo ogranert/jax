@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import platform
 import time
 import warnings
 
 from absl import logging
 from absl.testing import absltest
 from jax._src import test_util as jtu
-from jax._src.lib import xla_bridge as xb
+from jax._src import xla_bridge as xb
 from jax._src.lib import xla_client as xc
+from jax._src.lib import xla_extension_version
 from jax.interpreters import xla
 
 from jax._src.config import config
@@ -89,10 +92,81 @@ class XlaBridgeTest(jtu.JaxTestCase):
                              side_effect=_mock_tpu_client):
         xb.tpu_client_timer_callback(0.01)
 
+  def test_register_plugin(self):
+    with self.assertLogs(level="WARNING") as log_output:
+      if platform.system() == "Windows":
+        os.environ['PJRT_NAMES_AND_LIBRARY_PATHS'] = "name1;path1,name2;path2,name3"
+      else:
+        os.environ['PJRT_NAMES_AND_LIBRARY_PATHS'] = "name1:path1,name2:path2,name3"
+      xb.register_pjrt_plugin_factories_from_env()
+    registration = xb._backend_factories["name1"]
+    with mock.patch.object(xc, "make_c_api_client", autospec=True) as mock_make:
+      with mock.patch.object(xc, "load_pjrt_plugin_dynamically", autospec=True):
+        with mock.patch.object(
+            xc, "pjrt_plugin_loaded", autospec=True) as mock_plugin_loaded:
+          registration.factory()
+
+    self.assertRegex(
+        log_output[1][0],
+        r"invalid value name3 in env var PJRT_NAMES_AND_LIBRARY_PATHS"
+        r" name1.path1,name2.path2,name3",
+    )
+    self.assertIn("name1", xb._backend_factories)
+    self.assertIn("name2", xb._backend_factories)
+    self.assertEqual(registration.priority, 400)
+    self.assertTrue(registration.experimental)
+    mock_plugin_loaded.assert_called_once_with("name1")
+    if xla_extension_version < 165:
+      mock_make.assert_called_once_with("name1", None)
+    else:
+      mock_make.assert_called_once_with("name1", None, None)
+
+  def test_register_plugin_with_config(self):
+    test_json_file_path = os.path.join(
+        os.path.dirname(__file__), "testdata/example_pjrt_plugin_config.json"
+    )
+    os.environ['PJRT_NAMES_AND_LIBRARY_PATHS'] = (
+      f"name1;{test_json_file_path}" if platform.system() == "Windows"
+      else f"name1:{test_json_file_path}")
+    xb.register_pjrt_plugin_factories_from_env()
+    registration = xb._backend_factories["name1"]
+    with mock.patch.object(xc, "make_c_api_client", autospec=True) as mock_make:
+      with mock.patch.object(xc, "load_pjrt_plugin_dynamically", autospec=True):
+        with mock.patch.object(
+            xc, "pjrt_plugin_loaded", autospec=True) as mock_plugin_loaded:
+          registration.factory()
+
+    self.assertIn("name1", xb._backend_factories)
+    self.assertEqual(registration.priority, 400)
+    self.assertTrue(registration.experimental)
+    mock_plugin_loaded.assert_called_once_with("name1")
+    if xla_extension_version < 165:
+      mock_make.assert_called_once_with(
+          "name1",
+          {
+              "int_option": 64,
+              "int_list_option": [32, 64],
+              "string_option": "string",
+              "float_option": 1.0,
+          },
+      )
+    else:
+      mock_make.assert_called_once_with(
+          "name1",
+          {
+              "int_option": 64,
+              "int_list_option": [32, 64],
+              "string_option": "string",
+              "float_option": 1.0,
+          },
+          None,
+      )
+
 
 class GetBackendTest(jtu.JaxTestCase):
 
   class _DummyBackend:
+
     def __init__(self, platform, device_count):
       self.platform = platform
       self._device_count = device_count
@@ -107,7 +181,7 @@ class GetBackendTest(jtu.JaxTestCase):
       return []
 
   def _register_factory(self, platform: str, priority, device_count=1,
-                        assert_used_at_most_once=False):
+                        assert_used_at_most_once=False, experimental=False):
     if assert_used_at_most_once:
       used = []
     def factory():
@@ -121,9 +195,8 @@ class GetBackendTest(jtu.JaxTestCase):
           used.append(True)
       return self._DummyBackend(platform, device_count)
 
-    xb.register_backend_factory(
-        platform, factory,
-        priority=priority)
+    xb.register_backend_factory(platform, factory, priority=priority,
+                                fail_quietly=False, experimental=experimental)
 
   def setUp(self):
     self._orig_factories = xb._backend_factories
@@ -184,42 +257,30 @@ class GetBackendTest(jtu.JaxTestCase):
     def factory():
       raise RuntimeError("I'm not a real backend")
 
-    xb.register_backend_factory("error", factory, priority=10)
-    # No error raised if there's a fallback backend.
-    default_backend = xb.get_backend()
-    self.assertEqual(default_backend.platform, "cpu")
+    xb.register_backend_factory("error", factory, priority=10,
+                                fail_quietly=False)
 
-    with self.assertRaisesRegex(RuntimeError, "I'm not a real backend"):
+    with self.assertRaisesRegex(
+      RuntimeError,
+      "Unable to initialize backend 'error': I'm not a real backend"
+    ):
       xb.get_backend("error")
+
 
   def test_no_devices(self):
     self._register_factory("no_devices", -10, device_count=0)
-    default_backend = xb.get_backend()
-    self.assertEqual(default_backend.platform, "cpu")
     with self.assertRaisesRegex(
         RuntimeError,
-        "Backend 'no_devices' failed to initialize: "
+        "Unable to initialize backend 'no_devices': "
         "Backend 'no_devices' provides no devices."):
       xb.get_backend("no_devices")
 
-    self._reset_backend_state()
-
-    self._register_factory("no_devices2", 10, device_count=0)
-    default_backend = xb.get_backend()
-    self.assertEqual(default_backend.platform, "cpu")
-    with self.assertRaisesRegex(
-        RuntimeError,
-        "Backend 'no_devices2' failed to initialize: "
-        "Backend 'no_devices2' provides no devices."):
-      xb.get_backend("no_devices2")
-
   def test_factory_returns_none(self):
-    xb.register_backend_factory("none", lambda: None, priority=10)
-    default_backend = xb.get_backend()
-    self.assertEqual(default_backend.platform, "cpu")
+    xb.register_backend_factory("none", lambda: None, priority=10,
+                                fail_quietly=False)
     with self.assertRaisesRegex(
         RuntimeError,
-        "Backend 'none' failed to initialize: "
+        "Unable to initialize backend 'none': "
         "Could not initialize backend 'none'"):
       xb.get_backend("none")
 
@@ -252,6 +313,17 @@ class GetBackendTest(jtu.JaxTestCase):
 
     finally:
       config.FLAGS.jax_platforms = orig_jax_platforms
+
+
+  def test_experimental_warning(self):
+    self._register_factory("platform_A", 20, experimental=True)
+
+    with self.assertLogs("jax._src.xla_bridge", level="WARNING") as logs:
+      _ = xb.get_backend()
+    self.assertEqual(logs.output, [
+      "WARNING:jax._src.xla_bridge:Platform 'platform_A' is experimental and "
+      "not all JAX functionality may be correctly supported!"
+    ])
 
 
 if __name__ == "__main__":

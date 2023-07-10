@@ -20,14 +20,21 @@ file.
 Run this as follows:
 
 ```
-# Run all converters on all suites and regenerate the table.
+# Test all converters on all suites and regenerate the table.
 python3 models_test_main.py
 
-# Run only CNN and Resnet50 with the TFjs converter and don't write Markdown.
+# Test only CNN and Resnet50 with the TFjs converter and don't write Markdown.
 python3 models_test_main.py \
     --examples=flax/cnn,flax/resnet50 \
     --converters=jax2tf_noxla_tfjs \
     --write_markdown=False
+
+# Execute all CNN tests (including the tests for shape polymorphism):
+python3 models_test_main.py --example_prefix=flax/cnn
+
+# Execute only a specific CNN test for shape polymorphism (NOTE: quotes and
+# commas are stripped from the example names).
+python3 models_test_main.py --examples="flax/cnn_[(b ...)]"
 ```
 """
 from absl import app
@@ -43,7 +50,7 @@ from jax._src import dtypes
 import jax.numpy as jnp
 
 import datetime
-from typing import Dict, List, Sequence, Tuple
+from typing import Sequence
 
 import tensorflow as tf
 
@@ -75,7 +82,7 @@ flags.DEFINE_bool(
 FLAGS = flags.FLAGS
 
 
-def _write_markdown(results: Dict[str, List[Tuple[str, str,]]]) -> None:
+def _write_markdown(results: dict[str, list[tuple[str, str,]]]) -> None:
   """Writes all results to Markdown file."""
   table_lines = []
   converters = FLAGS.converters
@@ -146,7 +153,7 @@ def _crop_convert_error(msg: str) -> str:
   return msg
 
 
-def _get_random_data(x: jnp.ndarray) -> np.ndarray:
+def _get_random_data(x: jax.Array) -> np.ndarray:
   dtype = dtypes.canonicalize_dtype(x.dtype)
   if np.issubdtype(dtype, np.integer):
     return np.random.randint(0, 100, size=x.shape, dtype=dtype)

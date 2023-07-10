@@ -13,10 +13,30 @@
 # limitations under the License.
 
 import os
+import warnings
 
-running_in_cloud_tpu_vm = False
+running_in_cloud_tpu_vm: bool = False
 
-def cloud_tpu_init():
+
+def maybe_import_libtpu():
+  try:
+    # pylint: disable=import-outside-toplevel
+    # pytype: disable=import-error
+    import libtpu
+
+    # pytype: enable=import-error
+    # pylint: enable=import-outside-toplevel
+  except ImportError:
+    return None
+  else:
+    return libtpu
+
+
+def jax_force_tpu_init() -> bool:
+  return 'JAX_FORCE_TPU_INIT' in os.environ
+
+
+def cloud_tpu_init() -> None:
   """Automatically sets Cloud TPU topology and other env vars.
 
   **This must be called before the TPU runtime is loaded, which happens as soon
@@ -33,20 +53,28 @@ def cloud_tpu_init():
   set.
   """
   global running_in_cloud_tpu_vm
-  try:
-    # pylint: disable=import-outside-toplevel
-    # pytype: disable=import-error
-    import libtpu
-    # pytype: enable=import-error
-    # pylint: enable=import-outside-toplevel
-  except ImportError:
-    # We assume libtpu is installed iff we're in a correctly-configured Cloud
-    # TPU environment. Exit early if we're not running on Cloud TPU.
+
+  # We assume we are in a correctly-configured Cloud TPU environment
+  # if the following hold: a) libtpu is installed b) JAX_FORCE_TPU_INIT is set
+  # Exit early if we're not running on Cloud TPU.
+  libtpu_module = maybe_import_libtpu()
+  if libtpu_module is not None:
+    libtpu_module.configure_library_path()
+  elif not jax_force_tpu_init():
     return
 
   running_in_cloud_tpu_vm = True
 
-  libtpu.configure_library_path()
   os.environ.setdefault('GRPC_VERBOSITY', 'ERROR')
   os.environ.setdefault('JAX_PLATFORMS', 'tpu,cpu')
   os.environ['TPU_ML_PLATFORM'] = 'JAX'
+
+  if 'JAX_USE_PJRT_C_API_ON_TPU' not in os.environ:
+    os.environ['JAX_USE_PJRT_C_API_ON_TPU'] = 'true'
+
+  use_pjrt_c_api = os.environ['JAX_USE_PJRT_C_API_ON_TPU']
+  if use_pjrt_c_api in ("false", "0"):
+    warnings.warn(
+        f"JAX_USE_PJRT_C_API_ON_TPU={use_pjrt_c_api} will no longer be "
+        "supported in an upcoming future release. Please file an issue at "
+        "https://github.com/google/jax/issues if you need this setting.")

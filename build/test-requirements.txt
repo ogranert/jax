@@ -1,8 +1,9 @@
 absl-py
 cloudpickle
 colorama>=0.4.4
-matplotlib
+numpy>=1.22
 pillow>=9.1.0
+portpicker
 pytest-xdist
 wheel
 rich

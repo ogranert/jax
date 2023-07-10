@@ -19,30 +19,29 @@ from typing import Any, Callable, Sequence
 
 from absl.testing import absltest
 import jax
-from jax import core
 from jax import lax
 from jax import tree_util
+from jax._src import core
 from jax._src import debugging
 from jax._src import dispatch
-from jax._src import sharding
+from jax._src import effects
 from jax._src import test_util as jtu
 from jax._src import util
-from jax._src.lib import xla_bridge
+from jax._src import xla_bridge
 from jax._src.lib import xla_client
-from jax.config import config
+from jax import config
 from jax.experimental import maps
 from jax.experimental import pjit
 from jax.interpreters import mlir
-from jax.experimental.maps import Mesh
 from jax.experimental.maps import xmap
+from jax.experimental.shard_map import shard_map
 from jax.experimental import io_callback
 import jax.numpy as jnp
+from jax.sharding import Mesh
 import numpy as np
 
 
 config.parse_flags_with_absl()
-
-debug_print = debugging.debug_print
 
 
 def _format_multiline(text):
@@ -91,8 +90,7 @@ def callback(f, result_shape, *args, ordered: bool = False, **kwargs):
       core.ShapedArray(s.shape, s.dtype) for s in flat_result_shapes
   ]
   effect = (
-      debugging.DebugEffect.ORDERED_PRINT
-      if ordered else debugging.DebugEffect.PRINT)
+      debugging.ordered_debug_effect if ordered else debugging.debug_effect)
   flat_args, in_tree = tree_util.tree_flatten((args, kwargs))
   def _flat_callback(*flat_args):
     args, kwargs = tree_util.tree_unflatten(in_tree, flat_args)
@@ -111,7 +109,7 @@ def callback_lowering(ctx, *args, effect, callback, **params):
     return tuple(
         callback_p.impl(*flat_args, effect=effect, callback=callback, **params))
 
-  if effect in core.ordered_effects:
+  if effects.ordered_effects.contains(effect):
     token = ctx.tokens_in.get(effect)[0]
     result, token, keepalive = mlir.emit_python_callback(
         ctx, _callback, token, list(args), ctx.avals_in, ctx.avals_out, True)
@@ -128,7 +126,6 @@ mlir.register_lowering(callback_p, callback_lowering, platform="gpu")
 mlir.register_lowering(callback_p, callback_lowering, platform="tpu")
 
 
-@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # host callback
 class PythonCallbackTest(jtu.JaxTestCase):
 
   def tearDown(self):
@@ -458,7 +455,6 @@ class PythonCallbackTest(jtu.JaxTestCase):
         out,
         np.arange(2 * jax.local_device_count()).reshape([-1, 2]) + 1.)
 
-@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # host callback
 class PurePythonCallbackTest(jtu.JaxTestCase):
 
   def tearDown(self):
@@ -683,7 +679,7 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
     try:
       mesh = Mesh(np.array(jax.devices()), axis_names=('x',))
 
-      spec = pjit.PartitionSpec('x')
+      spec = jax.sharding.PartitionSpec('x')
 
       def f(x):
         axis_resources = {v: v for v in mesh.axis_names}
@@ -700,19 +696,10 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
 
       with mesh:
         inp = jnp.arange(float(jax.local_device_count()))
-        out = pjit.pjit(f, in_axis_resources=spec, out_axis_resources=spec)(inp)
+        out = pjit.pjit(f, in_shardings=spec, out_shardings=spec)(inp)
         np.testing.assert_allclose(
             out, np.sin(np.arange(jax.local_device_count()))
         )
-
-        if jax.local_device_count() > 1:
-          with self.assertRaisesRegex(
-              NotImplementedError, 'when all mesh axes are partitioned manually'
-          ):
-            pjit.pjit(
-                without_xmap_f, in_axis_resources=spec, out_axis_resources=spec
-            )(inp)
-
     finally:
       jtu.restore_spmd_manual_lowering_flag()
       jtu.restore_spmd_lowering_flag()
@@ -850,7 +837,7 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
 
     f = maps.xmap(f, in_axes=['a'], out_axes=['a'],
                   axis_resources={'a': 'dev'})
-    with maps.Mesh(np.array(jax.devices()), ['dev']):
+    with jax.sharding.Mesh(np.array(jax.devices()), ['dev']):
       out = f(np.arange(40.))
     np.testing.assert_allclose(out, jnp.arange(1., 41.))
 
@@ -866,7 +853,7 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
 
     f = maps.xmap(f, in_axes=['a'], out_axes=['a'],
                   axis_resources={'a': 'dev'})
-    with maps.Mesh(np.array(jax.devices()), ['dev']):
+    with jax.sharding.Mesh(np.array(jax.devices()), ['dev']):
       out = f(np.arange(40.))
     np.testing.assert_allclose(out, jnp.arange(1., 41.))
 
@@ -879,6 +866,57 @@ class PurePythonCallbackTest(jtu.JaxTestCase):
 
     x = np.arange(6, dtype=np.int32).reshape((3, 2))
     np.testing.assert_allclose(g(x), x)
+
+  def test_can_shard_pure_callback_maximally(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest(
+          'Host callback not supported for runtime type: stream_executor.'
+      )
+
+    mesh = Mesh(np.array(jax.devices()), axis_names=('x',))
+
+    spec = jax.sharding.PartitionSpec('x')
+    sharding = jax.sharding.NamedSharding(mesh, spec)
+
+    def func(x):
+      return x + np.arange(x.shape[0], dtype=x.dtype)
+
+    def f(x):
+      return jax.pure_callback(func, x, x)
+
+    inp = jnp.arange(float(jax.local_device_count()))
+    out = jax.jit(f, in_shardings=sharding, out_shardings=sharding)(inp)
+    jax.block_until_ready(out)
+    np.testing.assert_allclose(
+        out, np.arange(jax.local_device_count()) * 2
+    )
+
+  def test_can_shard_pure_callback_manually(self):
+    if xla_bridge.get_backend().runtime_type == 'stream_executor':
+      raise unittest.SkipTest(
+          'Host callback not supported for runtime type: stream_executor.'
+      )
+
+    mesh = Mesh(np.array(jax.devices()), axis_names=('x',))
+
+    spec = jax.sharding.PartitionSpec('x')
+    sharding = jax.sharding.NamedSharding(mesh, spec)
+
+    def func(x):
+      return x + np.arange(x.shape[0], dtype=x.dtype)
+
+    def f(x):
+      return jax.pure_callback(func, x, x)
+    f = shard_map(f, mesh=mesh, in_specs=(spec,), out_specs=spec)
+
+    inp = jnp.arange(float(jax.local_device_count() * 2))
+    out = jax.jit(f, in_shardings=sharding, out_shardings=sharding)(inp)
+    y = np.tile(np.arange(2, dtype=inp.dtype), jax.local_device_count())
+    jax.block_until_ready(out)
+    np.testing.assert_allclose(
+        out, inp + y
+    )
+
 
 class IOPythonCallbackTest(jtu.JaxTestCase):
 
@@ -1019,14 +1057,10 @@ class IOPythonCallbackTest(jtu.JaxTestCase):
       io_callback(_cb, None, x)
       return x
 
-    mesh = maps.Mesh(np.array(jax.devices()), ['dev'])
-    if config.jax_array:
-      spec = sharding.NamedSharding(mesh, pjit.PartitionSpec('dev'))
-      out_spec = sharding.NamedSharding(mesh, pjit.PartitionSpec())
-    else:
-      spec = pjit.PartitionSpec('dev')
-      out_spec = pjit.PartitionSpec()
-    f = pjit.pjit(f, in_axis_resources=spec, out_axis_resources=out_spec)
+    mesh = jax.sharding.Mesh(np.array(jax.devices()), ['dev'])
+    spec = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('dev'))
+    out_spec = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    f = pjit.pjit(f, in_shardings=spec, out_shardings=out_spec)
     with mesh:
       f(jnp.arange(mesh.size))
       jax.effects_barrier()

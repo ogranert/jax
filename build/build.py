@@ -74,8 +74,8 @@ def get_python_version(python_bin_path):
   return major, minor
 
 def check_python_version(python_version):
-  if python_version < (3, 8):
-    print("ERROR: JAX requires Python 3.8 or newer, found ", python_version)
+  if python_version < (3, 9):
+    print("ERROR: JAX requires Python 3.9 or newer, found ", python_version)
     sys.exit(-1)
 
 
@@ -83,47 +83,47 @@ def check_numpy_version(python_bin_path):
   version = shell(
       [python_bin_path, "-c", "import numpy as np; print(np.__version__)"])
   numpy_version = tuple(map(int, version.split(".")[:2]))
-  if numpy_version < (1, 20):
-    print("ERROR: JAX requires NumPy 1.20 or newer, found " + version + ".")
+  if numpy_version < (1, 22):
+    print("ERROR: JAX requires NumPy 1.22 or newer, found " + version + ".")
     sys.exit(-1)
   return version
 
 # Bazel
 
-BAZEL_BASE_URI = "https://github.com/bazelbuild/bazel/releases/download/5.1.1/"
+BAZEL_BASE_URI = "https://github.com/bazelbuild/bazel/releases/download/6.1.2/"
 BazelPackage = collections.namedtuple("BazelPackage",
                                       ["base_uri", "file", "sha256"])
 bazel_packages = {
     ("Linux", "x86_64"):
         BazelPackage(
             base_uri=None,
-            file="bazel-5.1.1-linux-x86_64",
+            file="bazel-6.1.2-linux-x86_64",
             sha256=
-            "5e126060d9169b462a18e97435356c3b3712d20fdbef9ac7609016838a90e7d3"),
+            "e89747d63443e225b140d7d37ded952dacea73aaed896bca01ccd745827c6289"),
     ("Linux", "aarch64"):
         BazelPackage(
             base_uri=None,
-            file="bazel-5.1.1-linux-arm64",
+            file="bazel-6.1.2-linux-arm64",
             sha256=
-            "a590a28608772e779efc0c29bb678cd2a150deb27a9f8c557cc1d2b131a779ef"),
+            "1c9b249e315601c3703c41668a1204a8fdf0eba7f0f2b7fc38253bad1d1969c7"),
     ("Darwin", "x86_64"):
         BazelPackage(
             base_uri=None,
-            file="bazel-5.1.1-darwin-x86_64",
+            file="bazel-6.1.2-darwin-x86_64",
             sha256=
-            "91d8958fffd3077c32466a03300b7eba3b680588688f11d378ccbf2ae9000753"),
+            "22d4b605ce6a7aad92d4f387458cc68de9907a2efa08f9b8bda244c2b6010561"),
     ("Darwin", "arm64"):
         BazelPackage(
             base_uri=None,
-            file="bazel-5.1.1-darwin-arm64",
+            file="bazel-6.1.2-darwin-arm64",
             sha256=
-            "4fad9d066436ccca022578192be9fcc330d833799833c549683949939b3ce717"),
+            "30cdf85af055ca8fdab7de592b1bd64f940955e3f63ed5c503c4e93d0112bd9d"),
     ("Windows", "AMD64"):
         BazelPackage(
             base_uri=None,
-            file="bazel-5.1.1-windows-x86_64.exe",
+            file="bazel-6.1.2-windows-x86_64.exe",
             sha256=
-            "03061f1e9aac1966155ca402dcd1075c6493dfe85df72aa2cf3e12fcaa258d90"),
+            "47e7f65a3bfa882910f76e2107b4298b28ace33681bd0279e25a8f91551913c0"),
 }
 
 
@@ -219,8 +219,7 @@ def write_bazelrc(*, python_bin_path, remote_build,
                   cpu, cuda_compute_capabilities,
                   rocm_amdgpu_targets, bazel_options, target_cpu_features,
                   wheel_cpu, enable_mkl_dnn, enable_cuda, enable_nccl,
-                  enable_tpu, enable_remote_tpu, enable_rocm,
-                  enable_plugin_device):
+                  enable_tpu, enable_rocm):
   tf_cuda_paths = []
 
   with open("../.jax_configure.bazelrc", "w") as f:
@@ -286,14 +285,10 @@ def write_bazelrc(*, python_bin_path, remote_build,
         f.write("build --config=nonccl\n")
     if enable_tpu:
       f.write("build --config=tpu\n")
-    if enable_remote_tpu:
-      f.write("build --//build:enable_remote_tpu=true\n")
     if enable_rocm:
       f.write("build --config=rocm\n")
       if not enable_nccl:
         f.write("build --config=nonccl\n")
-    if enable_plugin_device:
-      f.write("build --config=plugin_device\n")
 
 BANNER = r"""
      _   _  __  __
@@ -377,10 +372,6 @@ def main():
       help_str="Should we build with Cloud TPU VM support enabled?")
   add_boolean_argument(
       parser,
-      "enable_remote_tpu",
-      help_str="Should we build with remote Cloud TPU support enabled?")
-  add_boolean_argument(
-      parser,
       "enable_rocm",
       help_str="Should we build with ROCm enabled?")
   add_boolean_argument(
@@ -389,11 +380,6 @@ def main():
       default=True,
       help_str="Should we build with NCCL enabled? Has no effect for non-CUDA "
                "builds.")
-  add_boolean_argument(
-      parser,
-      "enable_plugin_device",
-      default=False,
-      help_str="Should we build with a plugin device enable?")
   add_boolean_argument(
       parser,
       "remote_build",
@@ -446,6 +432,10 @@ def main():
       default=None,
       help="CPU platform to target. Default is the same as the host machine. "
            "Currently supported values are 'darwin_arm64' and 'darwin_x86_64'.")
+  parser.add_argument(
+      "--editable",
+      action="store_true",
+      help="Create an 'editable' jaxlib build instead of a wheel.")
   add_boolean_argument(
       parser,
       "configure_only",
@@ -514,15 +504,12 @@ def main():
     print("NCCL enabled: {}".format("yes" if args.enable_nccl else "no"))
 
   print("TPU enabled: {}".format("yes" if args.enable_tpu else "no"))
-  print("Remote TPU enabled: {}".format("yes" if args.enable_remote_tpu else "no"))
 
   print("ROCm enabled: {}".format("yes" if args.enable_rocm else "no"))
   if args.enable_rocm:
     if rocm_toolkit_path:
       print(f"ROCm toolkit path: {rocm_toolkit_path}")
     print(f"ROCm amdgpu targets: {args.rocm_amdgpu_targets}")
-
-  print("Plugin device enabled: {}".format("yes" if args.enable_plugin_device else "no"))
 
   write_bazelrc(
       python_bin_path=python_bin_path,
@@ -542,9 +529,7 @@ def main():
       enable_cuda=args.enable_cuda,
       enable_nccl=args.enable_nccl,
       enable_tpu=args.enable_tpu,
-      enable_remote_tpu=args.enable_remote_tpu,
       enable_rocm=args.enable_rocm,
-      enable_plugin_device=args.enable_plugin_device,
   )
 
   if args.configure_only:
@@ -558,6 +543,8 @@ def main():
     [":build_wheel", "--",
     f"--output_path={output_path}",
     f"--cpu={wheel_cpu}"])
+  if args.editable:
+    command += ["--editable"]
   print(" ".join(command))
   shell(command)
   shell([bazel_path] + args.bazel_startup_options + ["shutdown"])

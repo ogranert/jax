@@ -27,20 +27,18 @@ from absl.testing import absltest
 
 import jax
 from jax import ad_checkpoint
-from jax import core
-from jax.config import config
+from jax._src import core
+from jax import config
 from jax import dtypes
 from jax.experimental import host_callback as hcb
-from jax.experimental import PartitionSpec as P
-from jax.experimental import maps
+from jax.sharding import PartitionSpec as P
 from jax.experimental import pjit
 from jax import lax
 from jax import numpy as jnp
-from jax._src import lib as jaxlib
 from jax._src import test_util as jtu
 from jax import tree_util
+from jax._src import xla_bridge
 from jax._src.lib import xla_client
-from jax._src.lib import xla_bridge
 
 xops = xla_client.ops
 
@@ -234,13 +232,14 @@ def assertMultiDeviceOutputEqual(tst: jtu.JaxTestCase,
   return assertMultiLineStrippedEqual(tst, expected, what)
 
 
-@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # crashes runtime
 class HostCallbackTapTest(jtu.JaxTestCase):
 
   def setUp(self):
     super().setUp()
     if jtu.device_under_test() == "gpu" and jax.device_count() > 1:
       raise SkipTest("host_callback broken on multi-GPU platforms (#6447)")
+    if xla_bridge.using_pjrt_c_api():
+      raise SkipTest("host_callback not implemented in PJRT C API")
 
     testing_stream.reset()
     testing_stream._test_method_name = self._testMethodName
@@ -1715,12 +1714,9 @@ class HostCallbackTapTest(jtu.JaxTestCase):
                           output_stream=testing_stream,
                           tap_with_device=True, device_index=device_index)
 
-    pjit_fun1 = pjit.pjit(
-        fun1,
-        in_axis_resources=(P("d"),),
-        out_axis_resources=P("d"))
+    pjit_fun1 = pjit.pjit(fun1, in_shardings=(P("d"),), out_shardings=P("d"))
 
-    with maps.Mesh(devices, ["d"]):
+    with jax.sharding.Mesh(devices, ["d"]):
       # Print the internal IR
       helper_log_ir(
           f"{self._testMethodName}.pjit",
@@ -1878,15 +1874,11 @@ class HostCallbackTapTest(jtu.JaxTestCase):
     comp = xla_client.XlaBuilder(self._testMethodName)
     token = hcb.xops.CreateToken(comp)
     hcb._initialize_outfeed_receiver()  # Needed if this is the sole test
-    if jaxlib.xla_extension_version >= 112:
-      args = [0]
-    else:
-      args = []
     with self.assertRaisesRegex(RuntimeError,
                                 "Consumer ID cannot be a reserved value: 0"):
       hcb._callback_handler_data.receiver.add_outfeed(
           comp, token, 0,
-          [xops.Constant(comp, np.zeros((2, 3), dtype=np.float32))], *args)
+          [xops.Constant(comp, np.zeros((2, 3), dtype=np.float32))], 0)
 
   def test_tap_error_different_shapes(self):
     """Try to register different shapes for the same consumer ID."""
@@ -1895,23 +1887,19 @@ class HostCallbackTapTest(jtu.JaxTestCase):
     comp = xla_client.XlaBuilder(self._testMethodName)
     token = hcb.xops.CreateToken(comp)
     hcb._initialize_outfeed_receiver()  # Needed if this is the sole test
-    if jaxlib.xla_extension_version >= 112:
-      args = [0]
-    else:
-      args = []
     hcb._callback_handler_data.receiver.add_outfeed(
         comp, token, 123,
-        [xops.Constant(comp, np.zeros((2, 3), dtype=np.float32))], *args)
+        [xops.Constant(comp, np.zeros((2, 3), dtype=np.float32))], 0)
     with self.assertRaisesRegex(
         RuntimeError, ".*does not match previous shape element_type.*"):
       hcb._callback_handler_data.receiver.add_outfeed(
           comp, token, 123,
-          [xops.Constant(comp, np.zeros((2, 3), dtype=np.int32))], *args)
+          [xops.Constant(comp, np.zeros((2, 3), dtype=np.int32))], 0)
     with self.assertRaisesRegex(
         RuntimeError, ".*does not match previous shape element_type.*"):
       hcb._callback_handler_data.receiver.add_outfeed(
           comp, token, 123,
-          [xops.Constant(comp, np.zeros((2,), dtype=np.float32))], *args)
+          [xops.Constant(comp, np.zeros((2,), dtype=np.float32))], 0)
 
   def test_tap_id_tap_removed_kwargs(self):
     def func(x, transforms, y):
@@ -1919,6 +1907,15 @@ class HostCallbackTapTest(jtu.JaxTestCase):
 
     with self.assertRaisesRegex(TypeError, r"Support for \*\*kwargs in ``id_tap``"):
       hcb.id_tap(func, 1, y=2)
+
+  def test_tap_id_tap_random_key(self):
+    # See https://github.com/google/jax/issues/13949
+    with jax.enable_custom_prng():
+      @jax.jit
+      def f(x):
+        def tap(tap_x, _): pass
+        return hcb.id_tap(tap, x, result=x)
+      f(jax.random.PRNGKey(123))
 
   def test_tap_odeint(self):
     # TODO: find a smaller repro for bug #4015
@@ -2033,7 +2030,6 @@ class HostCallbackTapTest(jtu.JaxTestCase):
     self.assertMultiLineStrippedEqual(expected, testing_stream.output)
 
 
-@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # crashes runtime
 class HostCallbackCallTest(jtu.JaxTestCase):
   """Tests for hcb.call"""
 
@@ -2041,6 +2037,8 @@ class HostCallbackCallTest(jtu.JaxTestCase):
     super().setUp()
     if jtu.device_under_test() == "gpu" and jax.device_count() > 1:
       raise SkipTest("host_callback broken on multi-GPU platforms (#6447)")
+    if xla_bridge.using_pjrt_c_api():
+      raise SkipTest("host_callback not implemented in PJRT C API")
 
     testing_stream.reset()
     testing_stream._test_method_name = self._testMethodName
@@ -2336,9 +2334,8 @@ class HostCallbackCallTest(jtu.JaxTestCase):
           callback_x5_func, xy, result_shape=xy, call_with_device=True,
           device_index=device_index)
 
-    pjit_fun = pjit.pjit(
-        fun, in_axis_resources=(P("d"),), out_axis_resources=P("d"))
-    with maps.Mesh(devices, ["d"]):
+    pjit_fun = pjit.pjit(fun, in_shardings=(P("d"),), out_shardings=P("d"))
+    with jax.sharding.Mesh(devices, ["d"]):
       # Print the internal IR
       helper_log_ir(
           f"{self._testMethodName}.pjit",
@@ -2463,13 +2460,14 @@ def call_jax_other_device(jax_outside_fun, arg, *, device):
   return make_call(arg)
 
 
-@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # crashes runtime
 class CallJaxTest(jtu.JaxTestCase):
   """Tests using `call_jax_other_device`."""
 
   def setUp(self):
     if jtu.device_under_test() == "gpu" and jax.device_count() > 1:
       raise SkipTest("host_callback broken on multi-GPU platforms (#6447)")
+    if xla_bridge.using_pjrt_c_api():
+      raise SkipTest("host_callback not implemented in PJRT C API")
 
     if jtu.device_under_test() != "cpu":
       assert jax.devices("cpu")
@@ -2538,12 +2536,13 @@ class CallJaxTest(jtu.JaxTestCase):
     self.assertAllClose(res_jax, res_outside)
 
 
-@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # crashes runtime
 class OutfeedRewriterTest(jtu.JaxTestCase):
 
   def setUp(self):
     if jtu.device_under_test() == "gpu" and jax.device_count() > 1:
       raise SkipTest("host_callback broken on multi-GPU platforms (#6447)")
+    if xla_bridge.using_pjrt_c_api():
+      raise SkipTest("host_callback not implemented in PJRT C API")
     super().setUp()
 
   def assertRewrite(self, expected: str, func: Callable, args: Sequence,
@@ -3009,7 +3008,6 @@ class OutfeedRewriterTest(jtu.JaxTestCase):
                                              in (c, f, g) }
                                 devices=None
                                 donated_invars=(False, False, False)
-                                global_arg_shapes=(None,)
                                 global_axis_size=None
                                 in_axes=(0, 0, 0)
                                 name=<lambda>

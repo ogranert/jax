@@ -15,9 +15,6 @@
 # Note: import <name> as <name> is required for names to be exported.
 # See PEP 484 & https://github.com/google/jax/issues/7570
 
-# TODO(https://github.com/google/jax/issues/13487): Remove PartitionSpec in
-# 3 months from `jax.experimental.PartitionSpec`.
-from jax.interpreters.pxla import PartitionSpec as PartitionSpec
 from jax.experimental.x64_context import (
   enable_x64 as enable_x64,
   disable_x64 as disable_x64,

@@ -6,11 +6,346 @@ Best viewed [here](https://jax.readthedocs.io/en/latest/changelog.html).
 Remember to align the itemized text with the first line of an item within a list.
 -->
 
-## jax 0.4.3
+## jax 0.4.14
 
-## jaxlib 0.4.3
+* Deprecations
+  * Python 3.8 support has been dropped as per
+    https://jax.readthedocs.io/en/latest/deprecation.html
+  * JAX now requires NumPy 1.22 or newer as per
+    https://jax.readthedocs.io/en/latest/deprecation.html
+  * `jax.interpreters.pxla.device_put` has been removed. This was deprecated in
+    JAX version 0.4.6: use `jax.device_put` instead.
+  * `jax.interpreters.pxla.make_sharded_device_array` has been removed. This was
+    deprecated in JAX version 0.4.6: use `jax.make_array_from_single_device_arrays`
+    instead.
+  * Passing optional arguments to {func}`jax.numpy.ndarray.at` by position is
+    no longer supported, after being deprecated in JAX version 0.4.7.
+    For example, instead of `x.at[i].get(True)`, use `x.at[i].get(indices_are_sorted=True)`
 
-## jax 0.4.2 (Jan 20, 2023)
+* Breaking changes
+  * JAX now requires ml_dtypes version 0.2.0 or newer.
+  * To fix a corner case, calls to {func}`jax.lax.cond` with five
+    arguments will always resolve to the "common operands" `cond`
+    behavior (as documented) if the second and third arguments are
+    callable, even if other operands are callable as well. See
+    [#16413](https://github.com/google/jax/issues/16413).
+
+## jaxlib 0.4.14
+
+* Deprecations
+  * Python 3.8 support has been dropped as per
+      https://jax.readthedocs.io/en/latest/deprecation.html
+
+## jax 0.4.13 (June 22, 2023)
+
+* Changes
+  * `jax.jit` now allows `None` to be passed to `in_shardings` and
+    `out_shardings`. The semantics are as follows:
+      * For in_shardings, JAX will mark is as replicated but this behavior
+        can change in the future.
+      * For out_shardings, we will rely on the XLA GSPMD partitioner to
+        determine the output shardings.
+  * `jax.experimental.pjit.pjit` also allows `None` to be passed to
+    `in_shardings` and `out_shardings`. The semantics are as follows:
+    * If the mesh context manager is *not* provided, JAX has the freedom to
+      choose whatever sharding it wants.
+      * For in_shardings, JAX will mark is as replicated but this behavior
+        can change in the future.
+      * For out_shardings, we will rely on the XLA GSPMD partitioner to
+        determine the output shardings.
+    * If the mesh context manager is provided, None will imply that the value
+      will be replicated on all devices of the mesh.
+  * Executable.cost_analysis() works on Cloud TPU
+  * Added a warning if a non-allowlisted `jaxlib` plugin is in use.
+  * Added `jax.tree_util.tree_leaves_with_path`.
+  * `None` is not a valid input to
+    `jax.experimental.multihost_utils.host_local_array_to_global_array` or
+    `jax.experimental.multihost_utils.global_array_to_host_local_array`.
+    Please use `jax.sharding.PartitionSpec()` if you wanted to replicate your
+    input.
+
+* Bug fixes
+  * Fixed incorrect wheel name in CUDA 12 releases (#16362); the correct wheel
+    is named `cudnn89` instead of `cudnn88`.
+
+* Deprecations
+  * The `native_serialization_strict_checks` parameter to
+    {func}`jax.experimental.jax2tf.convert` is deprecated in favor of the
+    new `native_serializaation_disabled_checks` ({jax-issue}`#16347`).
+
+## jaxlib 0.4.13 (June 22, 2023)
+
+* Changes
+  * Added Windows CPU-only wheels to the `jaxlib` Pypi release.
+
+* Bug fixes
+  * `__cuda_array_interface__` was broken in previous jaxlib versions and is now
+    fixed ({jax-issue}`16440`).
+  * Concurrent CUDA kernel tracing is now enabled by default on NVIDIA GPUs.
+
+## jax 0.4.12 (June 8, 2023)
+
+* Changes
+  * Added {class}`scipy.spatial.transform.Rotation` and {class}`scipy.spatial.transform.Slerp`
+
+* Deprecations
+  * `jax.abstract_arrays` and its contents are now deprecated. See related
+    functionality in :mod:`jax.core`.
+  * `jax.numpy.alltrue`: use `jax.numpy.all`. This follows the deprecation
+    of `numpy.alltrue` in NumPy version 1.25.0.
+  * `jax.numpy.sometrue`: use `jax.numpy.any`. This follows the deprecation
+    of `numpy.sometrue` in NumPy version 1.25.0.
+  * `jax.numpy.product`: use `jax.numpy.prod`. This follows the deprecation
+    of `numpy.product` in NumPy version 1.25.0.
+  * `jax.numpy.cumproduct`: use `jax.numpy.cumprod`. This follows the deprecation
+    of `numpy.cumproduct` in NumPy version 1.25.0.
+  * `jax.sharding.OpShardingSharding` has been removed since it has been 3
+    months since it was deprecated.
+
+## jaxlib 0.4.12 (June 8, 2023)
+
+* Changes
+  * Includes PTX/SASS for Hopper (SM version 9.0+) GPUs. Previous
+    versions of jaxlib should work on Hopper but would have a long
+    JIT-compilation delay the first time a JAX operation was executed.
+
+* Bug fixes
+  * Fixes incorrect source line information in JAX-generated Python tracebacks
+    under Python 3.11.
+  * Fixes crash when printing local variables of frames in JAX-generated Python
+    tracebacks (#16027).
+
+## jax 0.4.11 (May 31, 2023)
+
+* Deprecations
+  * The following APIs have been removed after a 3 month deprecation period, in
+    accordance with the {ref}`api-compatibility` policy:
+    * `jax.experimental.PartitionSpec`: use `jax.sharding.PartitionSpec`.
+    * `jax.experimental.maps.Mesh`: use `jax.sharding.Mesh`
+    * `jax.experimental.pjit.NamedSharding`: use `jax.sharding.NamedSharding`.
+    * `jax.experimental.pjit.PartitionSpec`: use `jax.sharding.PartitionSpec`.
+    * `jax.experimental.pjit.FROM_GDA`. Instead pass sharded `jax.Array` objects
+      as input and remove the optional `in_shardings` argument to `pjit`.
+    * `jax.interpreters.pxla.PartitionSpec`: use `jax.sharding.PartitionSpec`.
+    * `jax.interpreters.pxla.Mesh`: use `jax.sharding.Mesh`
+    * `jax.interpreters.xla.Buffer`: use `jax.Array`.
+    * `jax.interpreters.xla.Device`: use `jax.Device`.
+    * `jax.interpreters.xla.DeviceArray`: use `jax.Array`.
+    * `jax.interpreters.xla.device_put`: use `jax.device_put`.
+    * `jax.interpreters.xla.xla_call_p`: use `jax.experimental.pjit.pjit_p`.
+    * `axis_resources` argument of `with_sharding_constraint` is removed. Please
+      use `shardings` instead.
+
+
+## jaxlib 0.4.11 (May 31, 2023)
+
+* Changes
+  * Added `memory_stats()` method to `Device`s. If supported, this returns a
+    dict of string stat names with int values, e.g. `"bytes_in_use"`, or None if
+    the platform doesn't support memory statistics. The exact stats returned may
+    vary across platforms. Currently only implemented on Cloud TPU.
+  * Readded support for the Python buffer protocol (`memoryview`) on CPU
+    devices.
+
+## jax 0.4.10 (May 11, 2023)
+
+## jaxlib 0.4.10 (May 11, 2023)
+
+* Changes
+  * Fixed `'apple-m1' is not a recognized processor for this target (ignoring
+    processor)` issue that prevented previous release from running on Mac M1.
+
+## jax 0.4.9 (May 9, 2023)
+
+* Changes
+  * The flags experimental_cpp_jit, experimental_cpp_pjit and
+    experimental_cpp_pmap have been removed.
+    They are now always on.
+  * Accuracy of singular value decomposition (SVD) on TPU has been improved
+    (requires jaxlib 0.4.9).
+
+* Deprecations
+  * `jax.experimental.gda_serialization` is deprecated and has been renamed to
+    `jax.experimental.array_serialization`.
+    Please change your imports to use `jax.experimental.array_serialization`.
+  * The `in_axis_resources` and `out_axis_resources` arguments of pjit have been
+    deprecated. Please use `in_shardings` and `out_shardings` respectively.
+  * The function `jax.numpy.msort` has been removed. It has been deprecated since
+    JAX v0.4.1. Use `jnp.sort(a, axis=0)` instead.
+  * `in_parts` and `out_parts` arguments have been removed from `jax.xla_computation`
+    since they were only used with sharded_jit and sharded_jit is long gone.
+  * `instantiate_const_outputs` argument has been removed from `jax.xla_computation`
+    since it has been unused for a very long time.
+
+## jaxlib 0.4.9 (May 9, 2023)
+
+## jax 0.4.8 (March 29, 2023)
+
+* Breaking changes
+  * A major component of the Cloud TPU runtime has been upgraded. This enables
+    the following new features on Cloud TPU:
+    * {func}`jax.debug.print`, {func}`jax.debug.callback`, and
+      {func}`jax.debug.breakpoint()` now work on Cloud TPU
+    * Automatic TPU memory defragmentation
+
+    {func}`jax.experimental.host_callback` is no longer supported on Cloud TPU
+    with the new runtime component. Please file an issue on the [JAX issue
+    tracker](https://github.com/google/jax/issues) if the new `jax.debug` APIs
+    are insufficient for your use case.
+
+    The old runtime component will be available for at least the next three
+    months by setting the environment variable
+    `JAX_USE_PJRT_C_API_ON_TPU=false`. If you find you need to disable the new
+    runtime for any reason, please let us know on the [JAX issue
+    tracker](https://github.com/google/jax/issues).
+
+* Changes
+  * The minimum jaxlib version has been bumped from 0.4.6 to 0.4.7.
+
+* Deprecations
+  * CUDA 11.4 support has been dropped. JAX GPU wheels only support
+    CUDA 11.8 and CUDA 12. Older CUDA versions may work if jaxlib is built
+    from source.
+  * `global_arg_shapes` argument of pmap only worked with sharded_jit and has
+    been removed from pmap. Please migrate to pjit and remove global_arg_shapes
+    from pmap.
+
+## jax 0.4.7 (March 27, 2023)
+
+* Changes
+  * As per https://jax.readthedocs.io/en/latest/jax_array_migration.html#jax-array-migration
+    `jax.config.jax_array` cannot be disabled anymore.
+  * `jax.config.jax_jit_pjit_api_merge` cannot be disabled anymore.
+  * {func}`jax.experimental.jax2tf.convert` now supports the `native_serialization`
+    parameter to use JAX's native lowering to StableHLO to obtain a
+    StableHLO module for the entire JAX function instead of lowering each JAX
+    primitive to a TensorFlow op. This simplifies the internals and increases
+    the confidence that what you serialize matches the JAX native semantics.
+    See [documentation](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md).
+    As part of this change the config flag `--jax2tf_default_experimental_native_lowering`
+    has been renamed to `--jax2tf_native_serialization`.
+  * JAX now depends on `ml_dtypes`, which contains definitions of NumPy types
+    like bfloat16. These definitions were previously internal to JAX, but have
+    been split into a separate package to facilitate sharing them with other
+    projects.
+  * JAX now requires NumPy 1.21 or newer and SciPy 1.7 or newer.
+
+* Deprecations
+  * The type `jax.numpy.DeviceArray` is deprecated. Use `jax.Array` instead,
+    for which it is an alias.
+  * The type `jax.interpreters.pxla.ShardedDeviceArray` is deprecated. Use
+    `jax.Array` instead.
+  * Passing additional arguments to {func}`jax.numpy.ndarray.at` by position is deprecated.
+    For example, instead of `x.at[i].get(True)`, use `x.at[i].get(indices_are_sorted=True)`
+  * `jax.interpreters.xla.device_put` is deprecated. Please use `jax.device_put`.
+  * `jax.interpreters.pxla.device_put` is deprecated. Please use `jax.device_put`.
+  * `jax.experimental.pjit.FROM_GDA` is deprecated. Please pass in sharded
+    jax.Arrays as input and remove the `in_shardings` argument to pjit since
+    it is optional.
+
+## jaxlib 0.4.7 (March 27, 2023)
+
+Changes:
+  * jaxlib now depends on `ml_dtypes`, which contains definitions of NumPy types
+    like bfloat16. These definitions were previously internal to JAX, but have
+    been split into a separate package to facilitate sharing them with other
+    projects.
+
+## jax 0.4.6 (Mar 9, 2023)
+
+* Changes
+  * `jax.tree_util` now contain a set of APIs that allow user to define keys for their
+    custom pytree node. This includes:
+    * `tree_flatten_with_path` that flattens a tree and return not only each leaf but
+      also their key paths.
+    * `tree_map_with_paths` that can map a function that takes the key path as argument.
+    * `register_pytree_with_keys`` to register how the key path and leaves should looks
+      like in a custom pytree node.
+    * `keystr` that pretty-prints a key path.
+
+  * {func}`jax2tf.call_tf` has a new parameter `output_shape_dtype` (default `None`)
+    that can be used to declare the output shape and type of the result. This enables
+    {func}`jax2tf.call_tf` to work in the presence of shape polymorphism. ({jax-issue}`#14734`).
+
+* Deprecations
+  * The old key-path APIs in `jax.tree_util` are deprecated and will be removed 3 months
+    from Mar 10 2023:
+    * `register_keypaths`: use {func}`jax.tree_util.register_pytree_with_keys` instead.
+    * `AttributeKeyPathEntry` : use `GetAttrKey` instead.
+    * `GetitemKeyPathEntry` : use `SequenceKey` or `DictKey` instead.
+
+## jaxlib 0.4.6 (Mar 9, 2023)
+
+## jax 0.4.5 (Mar 2, 2023)
+
+* Deprecations
+  * `jax.sharding.OpShardingSharding` has been renamed to `jax.sharding.GSPMDSharding`.
+    `jax.sharding.OpShardingSharding` will be removed in 3 months from Feb 17, 2023.
+  * The following `jax.Array` methods are deprecated and will be removed 3 months from
+    Feb 23 2023:
+    * `jax.Array.broadcast`: use {func}`jax.lax.broadcast` instead.
+    * `jax.Array.broadcast_in_dim`: use {func}`jax.lax.broadcast_in_dim` instead.
+    * `jax.Array.split`: use {func}`jax.numpy.split` instead.
+
+## jax 0.4.4 (Feb 16, 2023)
+
+* Changes
+  * The implementation of `jit` and `pjit` has been merged. Merging jit and pjit
+    changes the internals of JAX without affecting the public API of JAX.
+    Before, `jit` was a final style primitive. Final style means that the creation
+    of jaxpr was delayed as much as possible and transformations were stacked
+    on top of each other. With the `jit`-`pjit` implementation merge, `jit`
+    becomes an initial style primitive which means that we trace to jaxpr
+    as early as possible. For more information see
+    [this section in autodidax](https://jax.readthedocs.io/en/latest/autodidax.html#on-the-fly-final-style-and-staged-initial-style-processing).
+    Moving to initial style should simplify JAX's internals and make
+    development of features like dynamic shapes, etc easier.
+    You can disable it only via the environment variable i.e.
+    `os.environ['JAX_JIT_PJIT_API_MERGE'] = '0'`.
+    The merge must be disabled via an environment variable since it affects JAX
+    at import time so it needs to be disabled before jax is imported.
+  * `axis_resources` argument of `with_sharding_constraint` is deprecated.
+    Please use `shardings` instead. There is no change needed if you were using
+    `axis_resources` as an arg. If you were using it as a kwarg, then please
+    use `shardings` instead. `axis_resources` will be removed after 3 months
+    from Feb 13, 2023.
+  * added the {mod}`jax.typing` module, with tools for type annotations of JAX
+    functions.
+  * The following names have been deprecated:
+    * `jax.xla.Device` and `jax.interpreters.xla.Device`: use `jax.Device`.
+    * `jax.experimental.maps.Mesh`. Use `jax.sharding.Mesh`
+    instead.
+    * `jax.experimental.pjit.NamedSharding`: use `jax.sharding.NamedSharding`.
+    * `jax.experimental.pjit.PartitionSpec`: use `jax.sharding.PartitionSpec`.
+    * `jax.interpreters.pxla.Mesh`: use `jax.sharding.Mesh`.
+    * `jax.interpreters.pxla.PartitionSpec`: use `jax.sharding.PartitionSpec`.
+* Breaking Changes
+  * the `initial` argument to reduction functions like :func:`jax.numpy.sum`
+    is now required to be a scalar, consistent with the corresponding NumPy API.
+    The previous behavior of broadcating the output against non-scalar `initial`
+    values was an unintentional implementation detail ({jax-issue}`#14446`).
+
+## jaxlib 0.4.4 (Feb 16, 2023)
+  * Breaking changes
+    * Support for NVIDIA Kepler series GPUs has been removed from the default
+      `jaxlib` builds. If Kepler support is needed, it is still possible to
+      build `jaxlib` from source with Kepler support (via the
+      `--cuda_compute_capabilities=sm_35` option to `build.py`), however note
+      that CUDA 12 has completely dropped support for Kepler GPUs.
+
+## jax 0.4.3 (Feb 8, 2023)
+  * Breaking changes
+    * Deleted {func}`jax.scipy.linalg.polar_unitary`, which was a deprecated JAX
+      extension to the scipy API. Use {func}`jax.scipy.linalg.polar` instead.
+
+  * Changes
+    * Added {func}`jax.scipy.stats.rankdata`.
+
+## jaxlib 0.4.3 (Feb 8, 2023)
+  * `jax.Array` now has the non-blocking `is_ready()` method, which returns `True`
+    if the array is ready (see also {func}`jax.block_until_ready`).
+
+## jax 0.4.2 (Jan 24, 2023)
 
 * Breaking changes
   * Deleted `jax.experimental.callback`
@@ -26,8 +361,11 @@ Remember to align the itemized text with the first line of an item within a list
   * {func}`jax2tf.call_tf` has a new parameter `has_side_effects` (default `True`)
     that can be used to declare whether an instance can be removed or replicated
     by JAX optimizations such as dead-code elimination ({jax-issue}`#13980`).
+  * Added more support for floordiv and mod for jax2tf shape polymorphism. Previously,
+    certain division operations resulted in errors in presence of symbolic dimensions
+    ({jax-issue}`#14108`).
 
-## jaxlib 0.4.2 (Jan 20, 2023)
+## jaxlib 0.4.2 (Jan 24, 2023)
 
 * Changes
   * Set JAX_USE_PJRT_C_API_ON_TPU=1 to enable new Cloud TPU runtime, featuring

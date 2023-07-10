@@ -22,9 +22,9 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax._src import test_util as jtu
-from jax._src.lib import xla_bridge
+from jax._src import xla_bridge
 
-from jax.config import config
+from jax import config
 config.parse_flags_with_absl()
 
 prev_xla_flags = None
@@ -60,21 +60,13 @@ class MultiDeviceTest(jtu.JaxTestCase):
 
   def assert_committed_to_device(self, data, device):
     """Asserts that the data is committed to the device."""
-    if config.jax_array:
-      self.assertTrue(data._committed)
-      self.assertEqual(data.device(), device)
-    else:
-      self.assertIsNotNone(data._device)
-      self.assertEqual(data.device_buffer.device(), device)
+    self.assertTrue(data._committed)
+    self.assertEqual(data.device(), device)
 
   def assert_uncommitted_to_device(self, data, device):
     """Asserts that the data is on the device but not committed to it."""
-    if config.jax_array:
-      self.assertFalse(data._committed)
-      self.assertEqual(data.device(), device)
-    else:
-      self.assertIsNone(data._device)
-      self.assertEqual(data.device_buffer.device(), device)
+    self.assertFalse(data._committed)
+    self.assertEqual(data.device(), device)
 
   def test_computation_follows_data(self):
     if jax.device_count() < 5:
@@ -103,11 +95,7 @@ class MultiDeviceTest(jtu.JaxTestCase):
     # A computation with inputs committed to multiple devices will result
     # in an error
 
-    if jax.config.jax_jit_pjit_api_merge:
-      err_msg = "Devices of all `Array` inputs and outputs should be the same"
-    else:
-      err_msg = "primitive arguments must be colocated on the same device"
-
+    err_msg = "Received incompatible devices for jitted computation"
     with self.assertRaisesRegex(ValueError, err_msg):
       jax.device_put(x, devices[2]) + jax.device_put(x, devices[3])
 

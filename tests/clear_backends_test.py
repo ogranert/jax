@@ -13,20 +13,25 @@
 # limitations under the License.
 """Tests for release_backend_clients."""
 
+import unittest
+
 from absl.testing import absltest
 
 import jax
-from jax.config import config
+from jax import config
 from jax._src import test_util as jtu
-from jax._src.lib import xla_bridge as xb
+from jax._src import xla_bridge as xb
+from jax._src.lib import xla_extension_version
 
 config.parse_flags_with_absl()
 
 
-@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # crashes runtime
 class ClearBackendsTest(jtu.JaxTestCase):
 
   def test_clear_backends(self):
+    if xla_extension_version < 164 and xb.using_pjrt_c_api():
+      raise unittest.SkipTest('test crashes runtime with PJRT C API')
+
     g = jax.jit(lambda x, y: x * y)
     self.assertEqual(g(1, 2), 2)
     self.assertNotEmpty(xb.get_backend().live_executables())

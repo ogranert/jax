@@ -26,7 +26,7 @@ from jax import lax
 import jax.numpy as jnp
 import jax._src.test_util as jtu
 
-from jax.config import config
+from jax import config
 config.parse_flags_with_absl()
 
 
@@ -291,6 +291,7 @@ class EinsumTest(jtu.JaxTestCase):
     C = self.rng().rand(10, 10)
     np.einsum_path('ea,fb,abcd,gc,hd->efgh', C, C, I, C, C, optimize='greedy')
 
+  @jax.default_matmul_precision("float32")
   def test_einsum_kpmurphy_example(self):
     # code from an email with @murphyk
     N, C, D, K, T = 2, 3, 4, 5, 6
@@ -309,9 +310,8 @@ class EinsumTest(jtu.JaxTestCase):
         L[n,c] = s
 
     path = jnp.einsum_path('ntk,kd,dc->nc', S, W, V, optimize='optimal')[0]
-    rtol = 1e-2 if jtu.device_under_test() == "tpu" else None
     self.assertAllClose(L, jnp.einsum('ntk,kd,dc->nc', S, W, V, optimize=path),
-                        check_dtypes=False, rtol=rtol)
+                        check_dtypes=False)
 
   def test_contraction_broadcasting(self):
     r = self.rng()
@@ -347,6 +347,21 @@ class EinsumTest(jtu.JaxTestCase):
     y = r.randn(2, 2)
     jaxpr = jax.make_jaxpr(partial(jnp.einsum, "ijk,kl->ijl"))(x, y)
     self.assertNotIn('transpose', str(jaxpr))
+
+  def test_preferred_element_type(self):
+    r = self.rng()
+    x = r.randn(2, 2).astype('bfloat16')
+    y = r.randn(2).astype('bfloat16')
+    pattern = "ij,j->i"
+    f1 = partial(jnp.einsum, pattern)
+    jaxpr = jax.make_jaxpr(f1)(x, y)
+    self.assertLen(jaxpr.eqns, 1)
+    self.assertIsNone(jaxpr.eqns[0].params['preferred_element_type'])
+
+    f2 = partial(jnp.einsum, pattern, preferred_element_type='float32')
+    jaxpr = jax.make_jaxpr(f2)(x, y)
+    self.assertLen(jaxpr.eqns, 1)
+    self.assertEqual(jaxpr.eqns[0].params['preferred_element_type'], 'float32')
 
 
 if __name__ == '__main__':

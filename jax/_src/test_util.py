@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import inspect
 import io
 import functools
 from functools import partial
+import math
 import re
 import os
+import tempfile
 import textwrap
-from typing import Callable, List, Generator, Sequence, Tuple, Union
+from typing import Any, Callable, Generator, Optional, Sequence, Union
 import unittest
 import warnings
 import zlib
@@ -33,19 +35,24 @@ import numpy.random as npr
 
 import jax
 from jax import lax
-from jax.interpreters import mlir
+from jax.experimental.compilation_cache import compilation_cache
+from jax._src.interpreters import mlir
 from jax.tree_util import tree_map, tree_all, tree_flatten, tree_unflatten
 from jax._src import api
+from jax._src import pjit as pjit_lib
 from jax._src import core
 from jax._src import dispatch
 from jax._src import dtypes as _dtypes
-from jax._src.config import flags, bool_env, config
-from jax._src.numpy.lax_numpy import _promote_dtypes, _promote_dtypes_inexact
-from jax._src.util import prod, unzip2
-from jax._src.lib import xla_bridge
+from jax._src.interpreters import pxla
+from jax._src.config import (flags, bool_env, config,
+                             raise_persistent_cache_errors,
+                             persistent_cache_min_compile_time_secs)
+from jax._src.numpy.util import promote_dtypes, promote_dtypes_inexact
+from jax._src.util import unzip2
 from jax._src.public_test_util import (  # noqa: F401
     _assert_numpy_allclose, _check_dtypes_match, _default_tolerance, _dtype, check_close, check_grads,
     check_jvp, check_vjp, default_gradient_tolerance, default_tolerance, device_under_test, tolerance)
+from jax._src import xla_bridge
 
 
 # This submodule includes private test utilities that are not exported to
@@ -88,6 +95,12 @@ flags.DEFINE_string(
   'Regular expression specifying which tests NOT to run, called via re.search '
   'on the test name. If empty or unspecified, run all tests.'
 )
+
+flags.DEFINE_bool(
+    'jax_test_with_persistent_compilation_cache',
+    bool_env('JAX_TEST_WITH_PERSISTENT_COMPILATION_CACHE', False),
+    help='If enabled, the persistent compilation cache will be enabled for all '
+    'test cases. This can be used to increase compilation cache coverage.')
 
 def num_float_bits(dtype):
   return _dtypes.finfo(_dtypes.canonicalize_dtype(dtype)).bits
@@ -165,26 +178,30 @@ def capture_stdout() -> Generator[Callable[[], str], None, None]:
 
 @contextmanager
 def count_device_put():
-  device_put = dispatch.device_put
+  batched_device_put = pxla.batched_device_put
   count = [0]
 
-  def device_put_and_count(*args, **kwargs):
-    count[0] += 1
-    # device_put handlers might call `dispatch.device_put` (e.g. on an
-    # underlying payload or several). We only want to count these
-    # recursive puts once, so we skip counting more than the outermost
-    # one in such a call stack.
-    dispatch.device_put = device_put
-    try:
-      return device_put(*args, **kwargs)
-    finally:
-      dispatch.device_put = device_put_and_count
+  def make_fn_and_count(fn):
+    def fn_and_count(*args, **kwargs):
+      count[0] += 1
+      # device_put handlers might call `dispatch.device_put` (e.g. on an
+      # underlying payload or several). We only want to count these
+      # recursive puts once, so we skip counting more than the outermost
+      # one in such a call stack.
+      pxla.batched_device_put = batched_device_put
+      try:
+        return fn(*args, **kwargs)
+      finally:
+        pxla.batched_device_put = batched_device_put_and_count
+    return fn_and_count
 
-  dispatch.device_put = device_put_and_count
+  batched_device_put_and_count = make_fn_and_count(batched_device_put)
+
+  pxla.batched_device_put = batched_device_put_and_count
   try:
     yield count
   finally:
-    dispatch.device_put = device_put
+    pxla.batched_device_put = batched_device_put
 
 
 @contextmanager
@@ -199,22 +216,38 @@ def count_primitive_compiles():
 
 
 @contextmanager
+def count_pjit_cpp_cache_miss():
+  original_pjit_lower = pjit_lib._pjit_lower
+  count = [0]
+
+  def pjit_lower_and_count(*args, **kwargs):
+    count[0] += 1
+    return original_pjit_lower(*args, **kwargs)
+
+  pjit_lib._pjit_lower = pjit_lower_and_count
+  try:
+    yield count
+  finally:
+    pjit_lib._pjit_lower = original_pjit_lower
+
+
+@contextmanager
 def count_jit_and_pmap_compiles():
   # No need to clear any caches since we generally jit and pmap fresh callables
   # in tests.
 
-  mlir_jaxpr_subcomp = mlir.jaxpr_subcomp
+  mlir_lower = mlir.lower_jaxpr_to_module
   count = [0]
 
-  def mlir_jaxpr_subcomp_and_count(*args, **kwargs):
+  def mlir_lower_and_count(*args, **kwargs):
     count[0] += 1
-    return mlir_jaxpr_subcomp(*args, **kwargs)
+    return mlir_lower(*args, **kwargs)
 
-  mlir.jaxpr_subcomp = mlir_jaxpr_subcomp_and_count
+  mlir.lower_jaxpr_to_module = mlir_lower_and_count
   try:
     yield count
   finally:
-    mlir.jaxpr_subcomp = mlir_jaxpr_subcomp
+    mlir.lower_jaxpr_to_module = mlir_lower
 
 @contextmanager
 def assert_num_jit_and_pmap_compilations(times):
@@ -257,6 +290,15 @@ def is_device_cuda():
 
 def is_cloud_tpu():
   return 'libtpu' in xla_bridge.get_backend().platform_version
+
+
+def is_se_tpu():
+  return (
+      is_cloud_tpu() and not xla_bridge.using_pjrt_c_api()
+  ) or xla_bridge.get_backend().platform_version.startswith(
+      'StreamExecutor TPU'
+  )
+
 
 def is_device_tpu_v4():
   return jax.devices()[0].device_kind == "TPU v4"
@@ -454,7 +496,7 @@ def rand_fullrange(rng, standardize_nans=False):
   """Random numbers that span the full range of available bits."""
   def gen(shape, dtype, post=lambda x: x):
     dtype = np.dtype(dtype)
-    size = dtype.itemsize * np.prod(_dims_of_shape(shape), dtype=int)
+    size = dtype.itemsize * math.prod(_dims_of_shape(shape))
     vals = rng.randint(0, np.iinfo(np.uint8).max, size=size, dtype=np.uint8)
     vals = post(vals).view(dtype)
     if shape is PYTHON_SCALAR_SHAPE:
@@ -641,7 +683,7 @@ def rand_int(rng, low=0, high=None):
 
 def rand_unique_int(rng, high=None):
   def fn(shape, dtype):
-    return rng.choice(np.arange(high or prod(shape), dtype=dtype),
+    return rng.choice(np.arange(high or math.prod(shape), dtype=dtype),
                       size=shape, replace=False)
   return fn
 
@@ -728,7 +770,7 @@ def sample_product_testcases(*args, **kw):
   """Non-decorator form of sample_product."""
   args = [list(arg) for arg in args]
   kw = [(k, list(v)) for k, v in kw.items()]
-  n = prod(len(a) for a in args) * prod(len(v) for _, v in kw)
+  n = math.prod(len(a) for a in args) * math.prod(len(v) for _, v in kw)
   testcases = []
   for i in _choice(n, min(n, FLAGS.jax_num_generated_cases)):
     testcase = {}
@@ -788,7 +830,7 @@ def promote_like_jnp(fun, inexact=False):
   tests make an np reference implementation act more like an jnp
   implementation.
   """
-  _promote = _promote_dtypes_inexact if inexact else _promote_dtypes
+  _promote = promote_dtypes_inexact if inexact else promote_dtypes
   def wrapper(*args, **kw):
     flat_args, tree = tree_flatten(args)
     args = tree_unflatten(tree, _promote(*flat_args))
@@ -804,6 +846,8 @@ class JaxTestCase(parameterized.TestCase):
     'jax_numpy_rank_promotion': 'raise',
     'jax_traceback_filtering': 'off',
   }
+
+  _compilation_cache_exit_stack: Optional[ExitStack] = None
 
   # TODO(mattjj): this obscures the error messages from failures, figure out how
   # to re-enable it
@@ -826,6 +870,24 @@ class JaxTestCase(parameterized.TestCase):
     for key, value in self._original_config.items():
       config.update(key, value)
     super().tearDown()
+
+  @classmethod
+  def setUpClass(cls):
+    if FLAGS.jax_test_with_persistent_compilation_cache:
+      cls._compilation_cache_exit_stack = ExitStack()
+      stack = cls._compilation_cache_exit_stack
+      stack.enter_context(raise_persistent_cache_errors(True))
+      stack.enter_context(persistent_cache_min_compile_time_secs(0))
+
+      tmp_dir = stack.enter_context(tempfile.TemporaryDirectory())
+      compilation_cache.initialize_cache(tmp_dir)
+      stack.callback(lambda: compilation_cache.reset_cache()
+                     if compilation_cache.is_initialized() else None)
+
+  @classmethod
+  def tearDownClass(cls):
+    if FLAGS.jax_test_with_persistent_compilation_cache:
+      cls._compilation_cache_exit_stack.close()
 
   def rng(self):
     return self._rng
@@ -852,8 +914,8 @@ class JaxTestCase(parameterized.TestCase):
 
   def assertDtypesMatch(self, x, y, *, canonicalize_dtypes=True):
     if not config.x64_enabled and canonicalize_dtypes:
-      self.assertEqual(_dtypes.canonicalize_dtype(_dtype(x)),
-                       _dtypes.canonicalize_dtype(_dtype(y)))
+      self.assertEqual(_dtypes.canonicalize_dtype(_dtype(x), allow_opaque_dtype=True),
+                       _dtypes.canonicalize_dtype(_dtype(y), allow_opaque_dtype=True))
     else:
       self.assertEqual(_dtype(x), _dtype(y))
 
@@ -906,7 +968,7 @@ class JaxTestCase(parameterized.TestCase):
       yield
     self.assertEmpty(caught_warnings)
 
-  def _CompileAndCheck(self, fun, args_maker, *, check_dtypes=True,
+  def _CompileAndCheck(self, fun, args_maker, *, check_dtypes=True, tol=None,
                        rtol=None, atol=None, check_cache_misses=True):
     """Helper method for running JAX compilation and allclose assertions."""
     args = args_maker()
@@ -938,9 +1000,9 @@ class JaxTestCase(parameterized.TestCase):
     compiled_ans = cfun(*args)
 
     self.assertAllClose(python_ans, monitored_ans, check_dtypes=check_dtypes,
-                        atol=atol, rtol=rtol)
+                        atol=atol or tol, rtol=rtol or tol)
     self.assertAllClose(python_ans, compiled_ans, check_dtypes=check_dtypes,
-                        atol=atol, rtol=rtol)
+                        atol=atol or tol, rtol=rtol or tol)
 
     args = args_maker()
 
@@ -951,7 +1013,7 @@ class JaxTestCase(parameterized.TestCase):
     compiled_ans = cfun(*args)
 
     self.assertAllClose(python_ans, compiled_ans, check_dtypes=check_dtypes,
-                        atol=atol, rtol=rtol)
+                        atol=atol or tol, rtol=rtol or tol)
 
   def _CheckAgainstNumpy(self, numpy_reference_op, lax_op, args_maker,
                          check_dtypes=True, tol=None, atol=None, rtol=None,
@@ -963,16 +1025,13 @@ class JaxTestCase(parameterized.TestCase):
                         atol=atol or tol, rtol=rtol or tol,
                         canonicalize_dtypes=canonicalize_dtypes)
 
-_CPP_JIT_IMPLEMENTATION = functools.partial(api._jit, True)
-_CPP_JIT_IMPLEMENTATION._name = "cpp"
-_PYTHON_JIT_IMPLEMENTATION = functools.partial(api._jit, False)
-_PYTHON_JIT_IMPLEMENTATION._name = "python"
+_PJIT_IMPLEMENTATION = jax.jit
+_PJIT_IMPLEMENTATION._name = "jit"
 _NOOP_JIT_IMPLEMENTATION = lambda x, *args, **kwargs: x
 _NOOP_JIT_IMPLEMENTATION._name = "noop"
 
 JIT_IMPLEMENTATION = (
-  _CPP_JIT_IMPLEMENTATION,
-  _PYTHON_JIT_IMPLEMENTATION,
+  _PJIT_IMPLEMENTATION,
   _NOOP_JIT_IMPLEMENTATION,
 )
 
@@ -982,8 +1041,7 @@ class BufferDonationTestCase(JaxTestCase):
 
   def _assertDeleted(self, x, deleted):
     if hasattr(x, "_arrays"):
-      for buffer in x._arrays:
-        self.assertEqual(buffer.is_deleted(), deleted)
+      self.assertEqual(x.is_deleted(), deleted)
     elif hasattr(x, "device_buffer"):
       self.assertEqual(x.device_buffer.is_deleted(), deleted)
     else:
@@ -999,15 +1057,15 @@ def ignore_warning(**kw):
 
 # -------------------- Mesh parametrization helpers --------------------
 
-MeshSpec = List[Tuple[str, int]]
+MeshSpec = list[tuple[str, int]]
 
 @contextmanager
 def with_mesh(named_shape: MeshSpec) -> Generator[None, None, None]:
   """Test utility for setting up meshes given mesh data from `schedules`."""
   # This is similar to the `with_mesh` function above, but isn't a decorator.
   axis_names, shape = unzip2(named_shape)
-  size = prod(shape)
-  local_devices = list(api.local_devices())
+  size = math.prod(shape)
+  local_devices = list(jax.local_devices())
   if len(local_devices) < size:
     raise unittest.SkipTest(f"Test requires {size} local devices")
   mesh_devices = np.array(local_devices[:size]).reshape(shape)  # type: ignore
@@ -1046,10 +1104,10 @@ def restore_spmd_manual_lowering_flag():
   config.update('experimental_xmap_spmd_lowering_manual', old_spmd_manual_lowering_flag)
 
 def create_global_mesh(mesh_shape, axis_names):
-  size = prod(mesh_shape)
-  if len(api.devices()) < size:
+  size = math.prod(mesh_shape)
+  if len(jax.devices()) < size:
     raise unittest.SkipTest(f"Test requires {size} global devices.")
-  devices = sorted(api.devices(), key=lambda d: d.id)
+  devices = sorted(jax.devices(), key=lambda d: d.id)
   mesh_devices = np.array(devices[:size]).reshape(mesh_shape)
   global_mesh = jax.sharding.Mesh(mesh_devices, axis_names)
   return global_mesh
@@ -1141,7 +1199,7 @@ def strict_promotion_if_dtypes_match(dtypes):
   return jax.numpy_dtype_promotion('standard')
 
 _version_regex = re.compile(r"([0-9]+(?:\.[0-9]+)*)(?:(rc|dev).*)?")
-def _parse_version(v: str) -> Tuple[int, ...]:
+def _parse_version(v: str) -> tuple[int, ...]:
   m = _version_regex.match(v)
   if m is None:
     raise ValueError(f"Unable to parse version '{v}'")
@@ -1149,3 +1207,42 @@ def _parse_version(v: str) -> Tuple[int, ...]:
 
 def numpy_version():
   return _parse_version(np.__version__)
+
+def parameterized_filterable(*,
+    kwargs: Sequence[dict[str, Any]],
+    testcase_name: Optional[Callable[[dict[str, Any]], str]] = None,
+    one_containing: Optional[str] = None,
+):
+  """
+  Decorator for named parameterized tests, with filtering.
+
+  Works like parameterized.named_parameters, except that it supports the
+  `one_containing` option. This is useful to select only one of the tests,
+  and to leave the test name unchanged (helps with specifying the desired test
+  when debugging).
+
+  Args:
+    kwargs: Each entry is a set of kwargs to be passed to the test function.
+    testcase_name: Optionally, a function to construct the testcase_name from
+      one kwargs dict. If not given then the kwarg must contain `testcase_name`.
+    one_containing: If given, then leave the test name unchanged, and use
+      only one `kwargs` whose `testcase_name` includes `one_containing`.
+  """
+  # Ensure that all kwargs contain a testcase_name
+  kwargs_with_testcase_name: Sequence[dict[str, Any]]
+  if testcase_name is not None:
+    kwargs_with_testcase_name = [dict(testcase_name=testcase_name(kw), **kw)
+                                 for kw in kwargs]
+  else:
+    for kw in kwargs:
+      assert "testcase_name" in kw
+    kwargs_with_testcase_name = kwargs
+  if one_containing is not None:
+    filtered = tuple(kw for kw in kwargs_with_testcase_name
+                     if one_containing in kw["testcase_name"])
+    assert filtered, f"No testcase_name contains '{one_containing}'"
+    kw = filtered[0]
+    kw["testcase_name"] = ""
+    return parameterized.named_parameters([kw])
+  else:
+    return parameterized.named_parameters(*kwargs_with_testcase_name)

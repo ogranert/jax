@@ -14,19 +14,22 @@
 
 from functools import partial
 import operator
-from typing import cast, Any, List, Optional, Tuple
+from typing import cast, Any, Optional
 
 import numpy as np
 import scipy.special as osp_special
 
-from jax._src import api
-from jax._src import dtypes
-from jax import jit, vmap
-from jax import lax, core
-from jax.interpreters import ad
 import jax.numpy as jnp
+from jax import jit
+from jax import vmap
+from jax import lax
+
+from jax._src import core
+from jax._src import custom_derivatives
+from jax._src import dtypes
+from jax._src.interpreters import ad
 from jax._src.lax.lax import _const as _lax_const
-from jax._src.numpy.lax_numpy import moveaxis, _promote_args_inexact, _promote_dtypes_inexact
+from jax._src.numpy.util import promote_args_inexact, promote_dtypes_inexact
 from jax._src.numpy.util import _wraps
 from jax._src.ops import special as ops_special
 from jax._src.third_party.scipy.betaln import betaln as _betaln_impl
@@ -35,8 +38,15 @@ from jax._src.typing import Array, ArrayLike
 
 @_wraps(osp_special.gammaln, module='scipy.special')
 def gammaln(x: ArrayLike) -> Array:
-  x, = _promote_args_inexact("gammaln", x)
+  x, = promote_args_inexact("gammaln", x)
   return lax.lgamma(x)
+
+
+@_wraps(osp_special.gamma, module='scipy.special', lax_description="""\
+The JAX version only accepts real-valued inputs.""")
+def gamma(x: ArrayLike) -> Array:
+  x, = promote_args_inexact("gamma", x)
+  return lax.exp(lax.lgamma(x))
 
 
 betaln = _wraps(
@@ -48,14 +58,14 @@ betaln = _wraps(
 
 @_wraps(osp_special.betainc, module='scipy.special')
 def betainc(a: ArrayLike, b: ArrayLike, x: ArrayLike) -> Array:
-  a, b, x = _promote_args_inexact("betainc", a, b, x)
+  a, b, x = promote_args_inexact("betainc", a, b, x)
   return lax.betainc(a, b, x)
 
 
 @_wraps(osp_special.digamma, module='scipy.special', lax_description="""\
 The JAX version only accepts real-valued inputs.""")
 def digamma(x: ArrayLike) -> Array:
-  x, = _promote_args_inexact("digamma", x)
+  x, = promote_args_inexact("digamma", x)
   return lax.digamma(x)
 ad.defjvp(
     lax.digamma_p,
@@ -64,39 +74,39 @@ ad.defjvp(
 
 @_wraps(osp_special.gammainc, module='scipy.special', update_doc=False)
 def gammainc(a: ArrayLike, x: ArrayLike) -> Array:
-  a, x = _promote_args_inexact("gammainc", a, x)
+  a, x = promote_args_inexact("gammainc", a, x)
   return lax.igamma(a, x)
 
 
 @_wraps(osp_special.gammaincc, module='scipy.special', update_doc=False)
 def gammaincc(a: ArrayLike, x: ArrayLike) -> Array:
-  a, x = _promote_args_inexact("gammaincc", a, x)
+  a, x = promote_args_inexact("gammaincc", a, x)
   return lax.igammac(a, x)
 
 
 @_wraps(osp_special.erf, module='scipy.special', skip_params=["out"],
         lax_description="Note that the JAX version does not support complex inputs.")
 def erf(x: ArrayLike) -> Array:
-  x, = _promote_args_inexact("erf", x)
+  x, = promote_args_inexact("erf", x)
   return lax.erf(x)
 
 
 @_wraps(osp_special.erfc, module='scipy.special', update_doc=False)
 def erfc(x: ArrayLike) -> Array:
-  x, = _promote_args_inexact("erfc", x)
+  x, = promote_args_inexact("erfc", x)
   return lax.erfc(x)
 
 
 @_wraps(osp_special.erfinv, module='scipy.special')
 def erfinv(x: ArrayLike) -> Array:
-  x, = _promote_args_inexact("erfinv", x)
+  x, = promote_args_inexact("erfinv", x)
   return lax.erf_inv(x)
 
 
-@api.custom_jvp
+@custom_derivatives.custom_jvp
 @_wraps(osp_special.logit, module='scipy.special', update_doc=False)
 def logit(x: ArrayLike) -> Array:
-  x, = _promote_args_inexact("logit", x)
+  x, = promote_args_inexact("logit", x)
   return lax.log(lax.div(x, lax.sub(_lax_const(x, 1), x)))
 logit.defjvps(
     lambda g, ans, x: lax.div(g, lax.mul(x, lax.sub(_lax_const(x, 1), x))))
@@ -104,43 +114,72 @@ logit.defjvps(
 
 @_wraps(osp_special.expit, module='scipy.special', update_doc=False)
 def expit(x: ArrayLike) -> Array:
-  x, = _promote_args_inexact("expit", x)
+  x, = promote_args_inexact("expit", x)
   return lax.logistic(x)
 
 
 logsumexp = _wraps(osp_special.logsumexp, module='scipy.special')(ops_special.logsumexp)
 
 
+@custom_derivatives.custom_jvp
 @_wraps(osp_special.xlogy, module='scipy.special')
 def xlogy(x: ArrayLike, y: ArrayLike) -> Array:
-  x, y = _promote_args_inexact("xlogy", x, y)
+  # Note: xlogy(0, 0) should return 0 according to the function documentation.
+  x, y = promote_args_inexact("xlogy", x, y)
   x_ok = x != 0.
   safe_x = jnp.where(x_ok, x, 1.)
   safe_y = jnp.where(x_ok, y, 1.)
   return jnp.where(x_ok, lax.mul(safe_x, lax.log(safe_y)), jnp.zeros_like(x))
 
+def _xlogy_jvp(primals, tangents):
+  (x, y) = primals
+  (x_dot, y_dot) = tangents
+  result = xlogy(x, y)
+  return result, (x_dot * lax.log(y) + y_dot * x / y).astype(result.dtype)
+xlogy.defjvp(_xlogy_jvp)
 
+
+@custom_derivatives.custom_jvp
 @_wraps(osp_special.xlog1py, module='scipy.special', update_doc=False)
 def xlog1py(x: ArrayLike, y: ArrayLike) -> Array:
-  x, y = _promote_args_inexact("xlog1py", x, y)
+  # Note: xlog1py(0, -1) should return 0 according to the function documentation.
+  x, y = promote_args_inexact("xlog1py", x, y)
   x_ok = x != 0.
   safe_x = jnp.where(x_ok, x, 1.)
   safe_y = jnp.where(x_ok, y, 1.)
   return jnp.where(x_ok, lax.mul(safe_x, lax.log1p(safe_y)), jnp.zeros_like(x))
 
+def _xlog1py_jvp(primals, tangents):
+  (x, y) = primals
+  (x_dot, y_dot) = tangents
+  result = xlog1py(x, y)
+  return result, (x_dot * lax.log1p(y) + y_dot * x / (1 + y)).astype(result.dtype)
+xlog1py.defjvp(_xlog1py_jvp)
+
+@custom_derivatives.custom_jvp
+def _xlogx(x):
+  """Compute x log(x) with well-defined derivatives."""
+  return xlogy(x, x)
+
+def _xlogx_jvp(primals, tangents):
+  x, = primals
+  x_dot, = tangents
+  return  _xlogx(x), x_dot * (lax.log(x) + 1)
+_xlogx.defjvp(_xlogx_jvp)
+
 
 @_wraps(osp_special.entr, module='scipy.special')
 def entr(x: ArrayLike) -> Array:
-  x, = _promote_args_inexact("entr", x)
+  x, = promote_args_inexact("entr", x)
   return lax.select(lax.lt(x, _lax_const(x, 0)),
                     lax.full_like(x, -np.inf),
-                    lax.neg(xlogy(x, x)))
+                    lax.neg(_xlogx(x)))
 
 
 @_wraps(osp_special.multigammaln, update_doc=False)
 def multigammaln(a: ArrayLike, d: ArrayLike) -> Array:
   d = core.concrete_or_error(int, d, "d argument of multigammaln")
-  a, d_ = _promote_args_inexact("multigammaln", a, d)
+  a, d_ = promote_args_inexact("multigammaln", a, d)
 
   constant = lax.mul(lax.mul(lax.mul(_lax_const(a, 0.25), d_),
                              lax.sub(d_, _lax_const(a, 1))),
@@ -182,7 +221,7 @@ def zeta(x: ArrayLike, q: Optional[ArrayLike] = None) -> Array:
   # Numerical Algorithms 69.2 (2015): 253-270.
   # https://arxiv.org/abs/1309.2877 - formula (5)
   # here we keep the same notation as in reference
-  s, a = _promote_args_inexact("zeta", x, q)
+  s, a = promote_args_inexact("zeta", x, q)
   dtype = lax.dtype(a).type
   s_, a_ = jnp.expand_dims(s, -1), jnp.expand_dims(a, -1)
   # precision ~ N, M
@@ -206,12 +245,12 @@ def zeta(x: ArrayLike, q: Optional[ArrayLike] = None) -> Array:
 @_wraps(osp_special.polygamma, module='scipy.special', update_doc=False)
 def polygamma(n: ArrayLike, x: ArrayLike) -> Array:
   assert jnp.issubdtype(lax.dtype(n), jnp.integer)
-  n_arr, x_arr = _promote_args_inexact("polygamma", n, x)
+  n_arr, x_arr = promote_args_inexact("polygamma", n, x)
   shape = lax.broadcast_shapes(n_arr.shape, x_arr.shape)
   return _polygamma(jnp.broadcast_to(n_arr, shape), jnp.broadcast_to(x_arr, shape))
 
 
-@api.custom_jvp
+@custom_derivatives.custom_jvp
 def _polygamma(n: ArrayLike, x: ArrayLike) -> Array:
   dtype = lax.dtype(n).type
   n_plus = n + dtype(1)
@@ -224,6 +263,9 @@ _polygamma.defjvps(None, lambda g, ans, n, x: lax.mul(g, _polygamma(n + 1, x)))
 
 # Functions "ndtr" and "ndtri" are derived from calculations made in:
 # https://root.cern.ch/doc/v608/SpecFuncCephesInv_8cxx_source.html
+# The "spence" function is also based on the Cephes library with
+# the corresponding spence.c file located in the tarball:
+# https://netlib.org/cephes/misc.tgz
 # In the following email exchange, the author gives his consent to redistribute
 # derived works under an Apache 2.0 license.
 #
@@ -475,7 +517,7 @@ def _ndtri(p: ArrayLike) -> Array:
   return x_nan_replaced
 
 
-@partial(api.custom_jvp, nondiff_argnums=(1,))
+@partial(custom_derivatives.custom_jvp, nondiff_argnums=(1,))
 def log_ndtr(x: ArrayLike, series_order: int = 3) -> Array:
   r"""Log Normal distribution function.
 
@@ -625,22 +667,22 @@ def _norm_logpdf(x):
 
 @_wraps(osp_special.i0e, module='scipy.special')
 def i0e(x: ArrayLike) -> Array:
-  x, = _promote_args_inexact("i0e", x)
+  x, = promote_args_inexact("i0e", x)
   return lax.bessel_i0e(x)
 
 @_wraps(osp_special.i0, module='scipy.special')
 def i0(x: ArrayLike) -> Array:
-  x, = _promote_args_inexact("i0", x)
+  x, = promote_args_inexact("i0", x)
   return lax.mul(lax.exp(lax.abs(x)), lax.bessel_i0e(x))
 
 @_wraps(osp_special.i1e, module='scipy.special')
 def i1e(x: ArrayLike) -> Array:
-  x, = _promote_args_inexact("i1e", x)
+  x, = promote_args_inexact("i1e", x)
   return lax.bessel_i1e(x)
 
 @_wraps(osp_special.i1, module='scipy.special')
 def i1(x: ArrayLike) -> Array:
-  x, = _promote_args_inexact("i1", x)
+  x, = promote_args_inexact("i1", x)
   return lax.mul(lax.exp(lax.abs(x)), lax.bessel_i1e(x))
 
 def _bessel_jn_scan_body_fun(carry, k):
@@ -707,7 +749,7 @@ def bessel_jn(z: ArrayLike, *, v: int, n_iter: int=50) -> Array:
     ValueError if elements of array `z` are not float.
   """
   z = jnp.asarray(z)
-  z, = _promote_dtypes_inexact(z)
+  z, = promote_dtypes_inexact(z)
   z_dtype = lax.dtype(z)
   if dtypes.issubdtype(z_dtype, complex):
     raise ValueError("complex input not supported.")
@@ -718,12 +760,12 @@ def bessel_jn(z: ArrayLike, *, v: int, n_iter: int=50) -> Array:
   bessel_jn_fun = partial(_bessel_jn, v=v, n_iter=n_iter)
   for _ in range(z.ndim):
     bessel_jn_fun = vmap(bessel_jn_fun)
-  return moveaxis(bessel_jn_fun(z), -1, 0)
+  return jnp.moveaxis(bessel_jn_fun(z), -1, 0)
 
 
 def _gen_recurrence_mask(
     l_max: int, is_normalized: bool, dtype: Any
-) -> Tuple[Array, Array]:
+) -> tuple[Array, Array]:
   """Generates mask for recurrence relation on the remaining entries.
 
   The remaining entries are with respect to the diagonal and offdiagonal
@@ -970,7 +1012,7 @@ def _gen_associated_legendre(l_max: int,
   return p
 
 
-def lpmn(m: int, n: int, z: Array) -> Tuple[Array, Array]:
+def lpmn(m: int, n: int, z: Array) -> tuple[Array, Array]:
   """The associated Legendre functions (ALFs) of the first kind.
 
   Args:
@@ -1108,7 +1150,7 @@ def sph_harm(m: Array,
   :math:`Y_n^m(\theta, \phi) = N_n^m * P_n^m(\cos \phi) * \exp(i m \theta)`,
   where :math:`N_n^m = \sqrt{\frac{\left(2n+1\right) \left(n-m\right)!}
   {4 \pi \left(n+m\right)!}}` is the normalization factor and :math:`\phi` and
-  :math:\theta` are the colatitude and longitude, repectively. :math:`N_n^m` is
+  :math:`\theta` are the colatitude and longitude, repectively. :math:`N_n^m` is
   chosen in the way that the spherical harmonics form a set of orthonormal basis
   functions of :math:`L^2(S^2)`.
 
@@ -1173,7 +1215,7 @@ def _expint1(x: Array) -> Array:
   return x * f + jnp.euler_gamma + jnp.log(x)
 
 
-def _eval_expint_k(A: List[float], B: List[float], x: Array) -> Array:
+def _eval_expint_k(A: list[float], B: list[float], x: Array) -> Array:
   # helper function for all subsequent intervals
   A_arr = jnp.array(A, dtype=x.dtype)
   B_arr = jnp.array(B, dtype=x.dtype)
@@ -1355,11 +1397,11 @@ def _expi_neg(x: Array) -> Array:
   # x < 0
   return -exp1(-x)
 
-@api.custom_jvp
+@custom_derivatives.custom_jvp
 @jit
 @_wraps(osp_special.expi, module='scipy.special')
 def expi(x: ArrayLike) -> Array:
-  x_arr, = _promote_args_inexact("expi", x)
+  x_arr, = promote_args_inexact("expi", x)
   return jnp.piecewise(x_arr, [x_arr < 0], [_expi_neg, _expi_pos])
 
 
@@ -1473,12 +1515,12 @@ def _expn3(n: int, x: Array) -> Array:
   return (ans + one) * jnp.exp(-x) / xk
 
 
-@partial(api.custom_jvp, nondiff_argnums=(0,))
+@partial(custom_derivatives.custom_jvp, nondiff_argnums=(0,))
 @jnp.vectorize
 @_wraps(osp_special.expn, module='scipy.special')
 @jit
 def expn(n: ArrayLike, x: ArrayLike) -> Array:
-  n, x = _promote_args_inexact("expn", n, x)
+  n, x = promote_args_inexact("expn", n, x)
   _c = _lax_const
   zero = _c(x, 0)
   one = _c(x, 1)
@@ -1515,6 +1557,100 @@ def expn_jvp(n, primals, tangents):
 
 @_wraps(osp_special.exp1, module="scipy.special")
 def exp1(x: ArrayLike, module='scipy.special') -> Array:
-  x, = _promote_args_inexact("exp1", x)
+  x, = promote_args_inexact("exp1", x)
   # Casting becuase custom_jvp generic does not work correctly with mypy.
   return cast(Array, expn(1, x))
+
+
+def _spence_poly(w: Array) -> Array:
+  A = jnp.array([4.65128586073990045278E-5,
+                  7.31589045238094711071E-3,
+                  1.33847639578309018650E-1,
+                  8.79691311754530315341E-1,
+                  2.71149851196553469920E0,
+                  4.25697156008121755724E0,
+                  3.29771340985225106936E0,
+                  1.00000000000000000126E0,
+                  ], dtype=w.dtype)
+
+  B = jnp.array([6.90990488912553276999E-4,
+                  2.54043763932544379113E-2,
+                  2.82974860602568089943E-1,
+                  1.41172597751831069617E0,
+                  3.63800533345137075418E0,
+                  5.03278880143316990390E0,
+                  3.54771340985225096217E0,
+                  9.99999999999999998740E-1,
+                  ],dtype=w.dtype)
+
+  return -w * jnp.polyval(A, w) / jnp.polyval(B, w)
+
+
+def _spence_calc(x: Array) -> Array:
+  x2_bool = x > 2.0
+  x = jnp.piecewise(x, [x2_bool],
+                    [lambda x: 1.0 / x, lambda x: x])
+
+  x1_5_bool = x > 1.5
+  x_5_bool = x < 0.5
+  x2_bool = x2_bool | x1_5_bool
+
+  w = jnp.piecewise(x,
+                    [x1_5_bool, x_5_bool],
+                    [lambda x: 1.0 / x - 1.0,
+                      lambda x: -x,
+                      lambda x: x - 1.0])
+
+  y = _spence_poly(w)
+  y_flag_one = jnp.pi ** 2 / 6.0 - jnp.log(x) * jnp.log(1.0 - x) - y
+  y = jnp.where(x_5_bool, y_flag_one, y)
+  y_flag_two = -0.5 * jnp.log(x) ** 2 - y
+  return jnp.where(x2_bool, y_flag_two, y)
+
+
+def _spence(x: Array) -> Array:
+  return jnp.piecewise(x,
+                       [x < 0.0, x == 1.0, x == 0.0],
+                       [jnp.nan, 0, jnp.pi ** 2 / 6, _spence_calc])
+
+
+def spence(x: Array) -> Array:
+  r"""
+  Spence's function, also known as the dilogarithm for real values.
+  It is defined to be:
+
+  .. math::
+    \begin{equation}
+    \int_1^z \frac{\log(t)}{1 - t}dt
+    \end{equation}
+
+  Unlike the SciPy implementation, this is only defined for positive
+  real values of `z`. For negative values, `NaN` is returned.
+
+  Args:
+    z: An array of type `float32`, `float64`.
+
+  Returns:
+    An array with `dtype=z.dtype`.
+    computed values of Spence's function.
+
+  Raises:
+    TypeError: if elements of array `z` are not in (float32, float64).
+
+  Notes:
+  There is a different convention which defines Spence's function by the
+  integral:
+
+  .. math::
+    \begin{equation}
+    -\int_0^z \frac{\log(1 - t)}{t}dt
+    \end{equation}
+
+  this is our spence(1 - z).
+  """
+  x = jnp.asarray(x)
+  dtype = lax.dtype(x)
+  if dtype not in (jnp.float32, jnp.float64):
+    raise TypeError(
+      f"x.dtype={dtype} is not supported, see docstring for supported types.")
+  return _spence(x)

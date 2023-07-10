@@ -52,27 +52,26 @@ r"""Jet is an experimental module for higher-order automatic differentiation
     `outstanding primitive rules <https://github.com/google/jax/issues/2431>`__.
 """
 
-from typing import Callable, Any, Tuple
+from typing import Any, Callable
 
 from functools import partial
 
 import numpy as np
 
-import jax
-from jax import core
 from jax import lax
-from jax.interpreters import xla
 import jax.numpy as jnp
 from jax.experimental import pjit
-from jax.interpreters import partial_eval as pe, pxla
-from jax._src.api_util import shaped_abstractify
 from jax.tree_util import (register_pytree_node, tree_structure,
                            treedef_is_leaf, tree_flatten, tree_unflatten,)
 
 from jax._src import ad_util
+from jax._src import core
 from jax._src import dispatch
-from jax._src.lax import lax as lax_internal
 from jax._src import linear_util as lu
+from jax._src import sharding_impls
+from jax._src.api_util import shaped_abstractify
+from jax._src.interpreters import partial_eval as pe
+from jax._src.lax import lax as lax_internal
 from jax._src.util import unzip2, weakref_lru_cache
 
 
@@ -245,7 +244,8 @@ class JetTrace(core.Trace):
       return map(partial(JetTracer, trace), primals, series)
     return out, todo
 
-  def process_custom_jvp_call(self, primitive, fun, jvp, tracers):
+  def process_custom_jvp_call(self, primitive, fun, jvp, tracers, *,
+                              symbolic_zeros):
     # TODO(mattjj): don't just ignore custom jvp rules?
     del primitive, jvp  # Unused.
     return fun.call_wrapped(*tracers)
@@ -264,14 +264,7 @@ zero_series = ZeroSeries()
 register_pytree_node(ZeroSeries, lambda z: ((), None), lambda _, xs: zero_series)
 
 
-call_param_updaters = {}
-
-def _xla_call_param_updater(params, num_inputs):
-  donated_invars = params['donated_invars']
-  if any(donated_invars):
-    raise NotImplementedError("donated_invars not supported with jet")
-  return dict(params, donated_invars=(False,) * num_inputs)
-call_param_updaters[xla.xla_call_p] = _xla_call_param_updater
+call_param_updaters: dict[core.Primitive, Callable[..., Any]] = {}
 
 
 ### rule definitions
@@ -722,7 +715,7 @@ jet_rules[lax.scatter_add_p] = _scatter_add_rule
 @weakref_lru_cache
 def _jet_jaxpr(
     jaxpr: core.ClosedJaxpr, order: int, primals_and_series_avals, in_tree_def
-) -> Tuple[core.ClosedJaxpr, Any]:
+) -> tuple[core.ClosedJaxpr, Any]:
   f = lu.wrap_init(core.jaxpr_as_fun(jaxpr))
   f_jet, out_tree_def = traceable(jet_fun(jet_subtrace(f), order), in_tree_def)
   jaxpr_jet, _, consts = pe.trace_to_jaxpr_dynamic(
@@ -731,9 +724,6 @@ def _jet_jaxpr(
 
 
 def _pjit_jet_rule(primals_in, series_in, **params):
-  if not jax.config.jax_array:
-    raise NotImplementedError('jet is not implemented for pjit when jax.Array '
-                              'is disabled. Please enable jax.Array')
   primals_and_series, in_tree_def = tree_flatten((primals_in, series_in))
   order = len(series_in[0])
   primals_and_series_avals = tuple(shaped_abstractify(x) for x in primals_and_series)
@@ -745,11 +735,12 @@ def _pjit_jet_rule(primals_in, series_in, **params):
       **params,
       'jaxpr': jaxpr_jet,
       'in_shardings': (
-          params['in_shardings'] + (pjit._UNSPECIFIED,) * num_series_in),
-      'out_shardings': params['out_shardings'] + (pjit._UNSPECIFIED,) * num_series_out,
-      'in_positional_semantics': (
-          params['in_positional_semantics']
-          + (pxla._PositionalSemantics.GLOBAL,) * num_series_in),
+          params['in_shardings'] + (sharding_impls.UNSPECIFIED,) * num_series_in
+      ),
+      'out_shardings': (
+          params['out_shardings']
+          + (sharding_impls.UNSPECIFIED,) * num_series_out
+      ),
       'donated_invars': params['donated_invars'] + (False,) * num_series_in,
   }
   result = pjit.pjit_p.bind(*primals_and_series, **new_params)

@@ -25,9 +25,9 @@ from jax import lax
 from jax import numpy as jnp
 from jax._src import dtypes
 from jax._src import test_util as jtu
-from jax._src.numpy.util import _promote_dtypes_complex
+from jax._src.numpy.util import promote_dtypes_complex
 
-from jax.config import config
+from jax import config
 config.parse_flags_with_absl()
 
 FFT_NORMS = [None, "ortho", "forward", "backward"]
@@ -92,12 +92,6 @@ def _zero_for_irfft(z, axes):
 
 
 class FftTest(jtu.JaxTestCase):
-
-  def testNotImplemented(self):
-    for name in jnp.fft._NOT_IMPLEMENTED:
-      func = getattr(jnp.fft, name)
-      with self.assertRaises(NotImplementedError):
-        func()
 
   def testLaxFftAcceptsStringTypes(self):
     rng = jtu.rand_default(self.rng())
@@ -181,7 +175,7 @@ class FftTest(jtu.JaxTestCase):
       return jax.vmap(linear_func)(jnp.eye(size, size))
 
     def func(x):
-      x, = _promote_dtypes_complex(x)
+      x, = promote_dtypes_complex(x)
       return jnp.fft.irfft(jnp.concatenate([jnp.zeros_like(x, shape=1),
                                             x[:2] + 1j*x[2:]]))
 

@@ -95,7 +95,7 @@ def jax_to_ir(fn, input_shapes, *, constants=None, format):
 
   Args:
     fn: Function to convert.
-    input_shapes: List of tuples (arg name, jax.ShapedArray),
+    input_shapes: List of tuples (arg name, jax.core.ShapedArray),
       indicating the shapes of the arguments to fn.  The order of parameters in
       the resulting XLA program will match the order in this list.
     constants: Dict mapping function argument name to a Python value.  Specified
@@ -137,7 +137,7 @@ def jax_to_ir(fn, input_shapes, *, constants=None, format):
       raise ValueError(
           'Conversion to TF graph requires TensorFlow to be installed.')
 
-    f = jax2tf.convert(ordered_wrapper)
+    f = jax2tf.convert(ordered_wrapper, native_serialization=False)
     f = tf_wrap_with_input_names(f, input_shapes)
     f = tf.function(f, autograph=False)
     g = f.get_concrete_function(*args).graph.as_graph_def()
@@ -213,7 +213,7 @@ def parse_shape_str(s):
     shape = tuple(int(d.strip()) for d in match.group(2).split(","))
   else:
     shape = ()
-  return jax.ShapedArray(shape, dtype)
+  return jax.core.ShapedArray(shape, dtype)
 
 _DT = {'pred': jnp.bool_,
        'u8': jnp.uint8, 'u16': jnp.uint16, 'u32': jnp.uint32, 'u64': jnp.uint64,

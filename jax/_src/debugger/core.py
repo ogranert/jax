@@ -16,16 +16,16 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import threading
+from typing import Any, Hashable, Optional, Protocol
 
-from typing import Any, Dict, Hashable, List, Optional, Protocol, Tuple
+import numpy as np
 
-import jax.numpy as jnp
-from jax import core
+import jax
 from jax import tree_util
+from jax._src import core
 from jax._src import debugging
 from jax._src import traceback_util
 from jax._src import util
-import numpy as np
 
 
 @tree_util.register_pytree_node_class
@@ -72,10 +72,10 @@ def _safe_flatten_dict(dct: dict[Any, Any]
 class DebuggerFrame:
   """Encapsulates Python frame information."""
   filename: str
-  locals: Dict[str, Any]
-  globals: Dict[str, Any]
+  locals: dict[str, Any]
+  globals: dict[str, Any]
   code_context: str
-  source: List[str]
+  source: list[str]
   lineno: int
   offset: Optional[int]
 
@@ -84,7 +84,7 @@ class DebuggerFrame:
     flat_globals, globals_tree = _safe_flatten_dict(self.globals)
     flat_vars = flat_locals + flat_globals
     is_valid = [
-        isinstance(l, (core.Tracer, jnp.ndarray, np.ndarray))
+        isinstance(l, (core.Tracer, jax.Array, np.ndarray))
         for l in flat_vars
     ]
     invalid_vars, valid_vars = util.partition_list(is_valid, flat_vars)
@@ -131,10 +131,10 @@ class DebuggerFrame:
 
 class Debugger(Protocol):
 
-  def __call__(self, frames: List[DebuggerFrame], thread_id: Optional[int],
+  def __call__(self, frames: list[DebuggerFrame], thread_id: Optional[int],
       **kwargs: Any) -> None:
     ...
-_debugger_registry: Dict[str, Tuple[int, Debugger]] = {}
+_debugger_registry: dict[str, tuple[int, Debugger]] = {}
 
 
 def get_debugger(backend: Optional[str] = None) -> Debugger:

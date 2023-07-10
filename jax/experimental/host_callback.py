@@ -209,9 +209,9 @@ to return the entire array, which will then be sent in a single infeed to the
 same device that issued the outfeed. This device is then responsible for
 sending the required shards to the other devices::
 
-  with maps.Mesh(jax.local_devices()[:2], ["d"]):
-    pjit.pjit(power3, in_axis_resources=(P("d"),),
-              out_axis_resources=(P("d"),))(np.array([3., 4.]))
+  with jax.sharding.Mesh(jax.local_devices()[:2], ["d"]):
+    pjit.pjit(power3, in_shardings=(P("d"),),
+              out_shardings=(P("d"),))(np.array([3., 4.]))
 
   # device=TPU:0 what=x,x^2: ( [3., 4.],
   #                            [9., 16.] )
@@ -498,30 +498,31 @@ import atexit
 import functools
 import itertools
 import logging
+import math
 import threading
 import traceback
-from typing import (Any, Callable, Dict, List, Optional, Sequence,
-                    Tuple, cast)
+from typing import Any, Callable, Optional, Sequence, cast
 import warnings
 
 from jax._src import api
-from jax import core
-from jax.config import config
+from jax._src import core
+from jax import config
 from jax import custom_derivatives
 from jax._src import dtypes
 from jax import lax
 from jax.experimental import pjit
-from jax.interpreters import ad, xla, batching, pxla
-from jax.interpreters import partial_eval as pe
-from jax.interpreters import mlir
+from jax._src.interpreters import ad, batching, pxla
+from jax._src.interpreters import mlir
+from jax._src.interpreters import partial_eval as pe
+from jax._src.interpreters import xla
 from jax._src import ad_checkpoint
 from jax._src import dispatch
 from jax._src import pretty_printer as pp
+from jax._src import sharding_impls
 from jax._src import source_info_util
 from jax._src import util
-from jax._src import lib as jaxlib
 from jax._src.lib import pytree
-from jax._src.lib import xla_bridge as xb
+from jax._src import xla_bridge as xb
 from jax._src.lib import xla_client
 from jax._src.lib import xla_extension
 from jax._src.lib.mlir.dialects import hlo
@@ -540,6 +541,20 @@ def _inline_host_callback() -> bool:
 
 def _use_outfeed(platform: str) -> bool:
   return (platform in ("tpu", "gpu", "cuda", "rocm") or FLAGS.jax_host_callback_outfeed)
+
+
+def _raise_if_using_outfeed_with_pjrt_c_api(backend: xb.XlaBackend):
+  """Should be called whenever outfeed (or infeed) will be used."""
+  if xb.using_pjrt_c_api(backend):
+    raise NotImplementedError(
+        "host_callback functionality isn't supported with the new Cloud TPU "
+        "runtime. See https://jax.readthedocs.io/en/latest/debugging/index.html"
+        " and "
+        "https://jax.readthedocs.io/en/latest/notebooks/external_callbacks.html"
+        " for alternatives. Please file a feature request at "
+        "https://github.com/google/jax/issues if none of the alternatives are "
+        "sufficent.")
+
 
 xops = xla_client._xla.ops
 
@@ -772,7 +787,7 @@ def _call(callback_func: Callable,
   for arg in flat_args:
     dispatch.check_arg(arg)
   # See definition of outside_call_p for what parameters it takes
-  params: Dict[str, Any] = {}
+  params: dict[str, Any] = {}
   # TODO: wrap function
   params["callback"] = _CallbackWrapper(callback_func, identity,
                                         call_with_device)
@@ -998,11 +1013,8 @@ outside_call_p.def_abstract_eval(_outside_call_abstract_eval)
 def _outside_call_impl(*args, **params):
   assert "has_token" not in params
   if _inline_host_callback():
-    if jaxlib.xla_extension_version >= 112:
-      device_index = params["device_index"]
-      device = api.devices()[device_index]
-    else:
-      device = api.devices()[0]
+    device_index = params["device_index"]
+    device = xb.devices()[device_index]
     results = _outside_call_run_callback(args, device, send_infeed=False, **params)
     return results
   else:
@@ -1050,6 +1062,7 @@ def _outside_call_translation_rule(ctx,
   send_infeed = use_outfeed and need_callback_results_on_device
   generated_infeed = False  # Keep track if we emitted an infeed op
   if use_outfeed:
+    _raise_if_using_outfeed_with_pjrt_c_api(xb.get_backend(ctx.platform))
     callback_id = _register_callback(
         functools.partial(
             _outside_call_run_callback,
@@ -1057,12 +1070,8 @@ def _outside_call_translation_rule(ctx,
             identity=identity,
             flat_results_aval=flat_results_aval,
             **params))
-    if jaxlib.xla_extension_version >= 112:
-      next_token = _callback_handler_data.receiver.add_outfeed(
-          comp, current_token, callback_id, args_to_outfeed, device_index)
-    else:
-      next_token = _callback_handler_data.receiver.add_outfeed(
-          comp, current_token, callback_id, args_to_outfeed)
+    next_token = _callback_handler_data.receiver.add_outfeed(
+        comp, current_token, callback_id, args_to_outfeed, device_index)
     if identity:
       results = list(args_to_outfeed)
       next_itoken = current_itoken
@@ -1081,10 +1090,7 @@ def _outside_call_translation_rule(ctx,
         array_sharding_proto = xla_client.OpSharding()
         array_sharding_proto.type = xla_client.OpSharding.Type.MAXIMAL
         array_sharding_proto.tile_assignment_dimensions = [1]
-        if jaxlib.xla_extension_version >= 112:
-          array_sharding_proto.tile_assignment_devices = [device_index]
-        else:
-          array_sharding_proto.tile_assignment_devices = [0]
+        array_sharding_proto.tile_assignment_devices = [device_index]
 
         token_sharding_proto = xla_client.OpSharding()
         token_sharding_proto.type = xla_client.OpSharding.Type.REPLICATED
@@ -1239,16 +1245,15 @@ def _outside_call_lowering(ctx: mlir.LoweringRuleContext,
       result_arrays = ()
     return result_arrays
 
-  if isinstance(ctx.module_context.axis_context,
-                (mlir.SPMDAxisContext, mlir.ShardingContext)):
+  if isinstance(
+      ctx.module_context.axis_context,
+      (sharding_impls.SPMDAxisContext, sharding_impls.ShardingContext),
+  ):
     # Apply maximal sharding so pjit only executes the callback on device device_index.
     sharding = xla_client.OpSharding()
     sharding.type = xla_client.OpSharding.Type.MAXIMAL
     sharding.tile_assignment_dimensions = [1]
-    if jaxlib.xla_extension_version >= 112:
-      sharding.tile_assignment_devices = [device_index]
-    else:
-      sharding.tile_assignment_devices = [0]
+    sharding.tile_assignment_devices = [device_index]
   else:
     sharding = None
   results, next_token, keep_alive = mlir.emit_python_callback(ctx,
@@ -1285,7 +1290,7 @@ def _outside_call_run_callback(
   the flat list of results to the device.
   """
 
-  def _unpack_transforms(transforms) -> Tuple[Tuple[str, Dict[str, Any]], ...]:
+  def _unpack_transforms(transforms) -> tuple[tuple[str, dict[str, Any]], ...]:
     def _unpack_transform(name, *params):
       if name == "batch":
         return name, dict(batch_dims=params[0])
@@ -1363,7 +1368,7 @@ def _outside_call_run_callback(
     raise e  # Let the exception propagate
 
 
-def _add_transform(params: Dict, name: str, *transform_params) -> Dict:
+def _add_transform(params: dict, name: str, *transform_params) -> dict:
   """Adds the `transform` to the params["transforms"].
 
   Uses a tuple representation internally, will be unpacked before the
@@ -1375,7 +1380,7 @@ def _add_transform(params: Dict, name: str, *transform_params) -> Dict:
 
 
 def _aval_is_empty(aval) -> bool:
-  return np.prod(aval.shape) == 0
+  return math.prod(aval.shape) == 0
 
 def _instantiate_zeros(tan, arg):
   """Turn special ad.zero tangents into arrays of 0s for sending to host.
@@ -1388,14 +1393,7 @@ def _instantiate_zeros(tan, arg):
   """
   if type(tan) is not ad.Zero:
     return tan
-  if tan.aval is not core.abstract_unit:
-    return ad.instantiate_zeros_aval(tan.aval, tan)
-
-  if ad.is_undefined_primal(arg):
-    aval = arg.aval
-  else:
-    aval = core.raise_to_shaped(core.get_aval(arg))
-  return ad.instantiate_zeros_aval(aval, tan)
+  return ad.instantiate_zeros_aval(tan.aval, tan)
 
 def _outside_call_jvp_rule(primals, tangents, **params):
   assert "has_token" not in params
@@ -1546,7 +1544,7 @@ def _rewrite_jaxpr(jaxpr: core.Jaxpr, has_input_token: bool,
 
   mk_new_var = core.gensym([jaxpr])
 
-  eqns: List[core.JaxprEqn] = []
+  eqns: list[core.JaxprEqn] = []
   # store the incoming tokens
   last_token_var = mk_new_var(core.abstract_token)
   last_itoken_var = mk_new_var(core.abstract_token)
@@ -1578,7 +1576,7 @@ def _rewrite_jaxpr(jaxpr: core.Jaxpr, has_input_token: bool,
   return new_jaxpr
 
 
-def _rewrite_eqn(eqn: core.JaxprEqn, eqns: List[core.JaxprEqn],
+def _rewrite_eqn(eqn: core.JaxprEqn, eqns: list[core.JaxprEqn],
                  input_token_var: core.Var, output_token_var: core.Var,
                  input_itoken_var: core.Var, output_itoken_var: core.Var,
                  mk_new_var: Callable[[core.AbstractValue], core.Var]):
@@ -1659,16 +1657,6 @@ def _rewrite_eqn(eqn: core.JaxprEqn, eqns: List[core.JaxprEqn],
                 jaxpr=new_jaxpr,
                 num_carry=num_carry + 2,
                 linear=linear[0:nr_const_and_carry] + (False, False) + linear[nr_const_and_carry:])))
-  elif eqn.primitive is xla.xla_call_p:
-    call_jaxpr = cast(core.Jaxpr, eqn.params["call_jaxpr"])
-    eqns.append(
-        eqn.replace(
-            invars=eqn.invars + [input_token_var, input_itoken_var],
-            outvars=eqn.outvars + [output_token_var, output_itoken_var],
-            params=dict(
-                eqn.params,
-                call_jaxpr=_rewrite_jaxpr(call_jaxpr, True, True),
-                donated_invars=eqn.params["donated_invars"] + (False, False))))
   elif eqn.primitive is pxla.xla_pmap_p:
     # We broadcast the input token into an array of tokens
     call_jaxpr = cast(core.Jaxpr, eqn.params["call_jaxpr"])
@@ -1729,11 +1717,17 @@ def _rewrite_eqn(eqn: core.JaxprEqn, eqns: List[core.JaxprEqn],
                 eqn.params,
                 jaxpr=_rewrite_closed_jaxpr(jaxpr, True, True),
                 donated_invars=eqn.params["donated_invars"] + (False, False),
-                in_shardings=(eqn.params["in_shardings"] +
-                              (pjit._UNSPECIFIED, pjit._UNSPECIFIED)),
-                out_shardings=(eqn.params["out_shardings"] +
-                               (pjit._UNSPECIFIED, pjit._UNSPECIFIED)),
-            )))
+                in_shardings=(
+                    eqn.params["in_shardings"]
+                    + (sharding_impls.UNSPECIFIED, sharding_impls.UNSPECIFIED)
+                ),
+                out_shardings=(
+                    eqn.params["out_shardings"]
+                    + (sharding_impls.UNSPECIFIED, sharding_impls.UNSPECIFIED)
+                ),
+            ),
+        )
+    )
   elif eqn.primitive is ad_checkpoint.remat_p:
     jaxpr_ = cast(core.Jaxpr, eqn.params["jaxpr"])
     eqns.append(
@@ -1748,7 +1742,7 @@ def _rewrite_eqn(eqn: core.JaxprEqn, eqns: List[core.JaxprEqn],
     raise NotImplementedError(f"outfeed rewrite {eqn.primitive}")
 
 
-def _rewrite_while_outfeed_cond(eqn: core.JaxprEqn, eqns: List[core.JaxprEqn],
+def _rewrite_while_outfeed_cond(eqn: core.JaxprEqn, eqns: list[core.JaxprEqn],
                                 input_token_var: core.Var,
                                 output_token_var: core.Var,
                                 input_itoken_var: core.Var,
@@ -1766,12 +1760,10 @@ def _rewrite_while_outfeed_cond(eqn: core.JaxprEqn, eqns: List[core.JaxprEqn],
   eqns.append(
       core.new_jaxpr_eqn(
           eqn.invars[0:cond_nconsts] + carry_invars + [input_token_var, input_itoken_var],
-          pred1_and_token1, xla.xla_call_p,
+          pred1_and_token1, core.call_p,
           dict(
               call_jaxpr=transformed_cond_jaxpr.jaxpr,
-              name="cond_before",
-              donated_invars=(False,) * len(transformed_cond_jaxpr.in_avals),
-              inline=False),
+              name="cond_before"),
           transformed_cond_jaxpr.jaxpr.effects,
           eqn.source_info))
   # Make a new cond "lambda pred, carry, token, itoken: pred"
@@ -1812,22 +1804,18 @@ def _rewrite_while_outfeed_cond(eqn: core.JaxprEqn, eqns: List[core.JaxprEqn],
           new_body_invars_body_constvars + new_body_invars_carry +
           [new_body_invars_token, new_body_invars_itoken],
           new_body_carry2 + [new_body_token2, new_body_itoken2],
-          xla.xla_call_p,
+          core.call_p,
           dict(
               call_jaxpr=transformed_body_jaxpr.jaxpr,
-              name="body",
-              donated_invars=(False,) * len(transformed_body_jaxpr.in_avals),
-              inline=False),
+              name="body"),
           transformed_body_jaxpr.effects,
           eqn.source_info),
       core.new_jaxpr_eqn(
           new_body_invars_cond_constvars + new_body_carry2 + [new_body_token2, new_body_itoken2],
-          [new_body_pred2, new_body_token3, new_body_itoken3], xla.xla_call_p,
+          [new_body_pred2, new_body_token3, new_body_itoken3], core.call_p,
           dict(
               call_jaxpr=transformed_cond_jaxpr.jaxpr,
-              name="cond_body",
-              donated_invars=(False,) * len(transformed_cond_jaxpr.in_avals),
-              inline=False),
+              name="cond_body"),
           transformed_cond_jaxpr.effects,
           eqn.source_info)
   ]
@@ -1881,11 +1869,11 @@ class _CallbackHandlerData:
   initialized: bool
   on_exit: bool
   lock: threading.Lock
-  last_callback_exception: Optional[Tuple[Exception, str]]
-  clients: Tuple[XlaLocalClient, ...]
-  devices: Tuple[XlaDevice, ...]
-  consumer_registry: Dict[Callable, int]
-  consumer_registry_by_id: Dict[int, Callable]
+  last_callback_exception: Optional[tuple[Exception, str]]
+  clients: tuple[XlaLocalClient, ...]
+  devices: tuple[XlaDevice, ...]
+  consumer_registry: dict[Callable, int]
+  consumer_registry_by_id: dict[int, Callable]
 
   def __init__(self):
     self.receiver = None  # Initialize lazily, when first needed
@@ -1918,7 +1906,7 @@ _callback_handler_data = _CallbackHandlerData()
 
 
 # This function is called from C++; it must not allow exceptions through.
-def _callback_input_received(device, consumer_id, arrays: Tuple):
+def _callback_input_received(device, consumer_id, arrays: tuple):
   array_repr = ", ".join([f"({a.dtype}{a.shape})" for a in arrays])
   logger.debug("Callback input received on device %s for consumer %s arrays: %s",
     device, consumer_id, array_repr)
@@ -1975,6 +1963,8 @@ def _initialize_outfeed_receiver(
     _callback_handler_data.clients = clients  # type: ignore[assignment]
     _callback_handler_data.devices = devices  # type: ignore[assignment]
     clients_with_outfeed = [c for c in clients if _use_outfeed(c.platform)]
+    for client in clients_with_outfeed:
+      _raise_if_using_outfeed_with_pjrt_c_api(client)
     if clients_with_outfeed:
       devices_with_outfeed = list(
         itertools.chain(*[backend.local_devices() for backend in clients_with_outfeed]))
@@ -1984,7 +1974,8 @@ def _initialize_outfeed_receiver(
                        device_repr, max_callback_queue_size_bytes)
       _callback_handler_data.receiver = outfeed_receiver_module.start(
           _callback_input_received, tuple(clients_with_outfeed),
-          max_callback_queue_size_bytes)
+          max_callback_queue_size_bytes,
+          xb.get_compile_options(1, 1).executable_build_options)  # type:ignore
 
     def exit_handler():
       # Prevent logging usage during compilation, gives errors under pytest

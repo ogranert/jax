@@ -15,12 +15,13 @@ Experimental Modules
     :maxdepth: 1
 
     jax.experimental.checkify
-    jax.experimental.global_device_array
     jax.experimental.host_callback
     jax.experimental.maps
     jax.experimental.pjit
     jax.experimental.sparse
     jax.experimental.jet
+    jax.experimental.custom_partitioning
+    jax.experimental.multihost_utils
 
 Experimental APIs
 -----------------

@@ -20,14 +20,19 @@ load(
     "jax_extra_deps",
     "jax_internal_packages",
     "jax_test_util_visibility",
+    "jax_visibility",
     "py_deps",
     "py_library_providing_imports_info",
     "pytype_library",
+    "pytype_strict_library",
+)
+
+package(
+    default_applicable_licenses = [],
+    default_visibility = [":internal"],
 )
 
 licenses(["notice"])
-
-package(default_visibility = [":internal"])
 
 bool_flag(
     name = "build_jaxlib",
@@ -73,12 +78,54 @@ py_library(
     ] + py_deps("absl/testing") + py_deps("numpy"),
 )
 
+py_library(
+    name = "internal_test_util",
+    testonly = 1,
+    srcs = glob(["_src/internal_test_util/**/*.py"]),
+    visibility = [":internal"],
+    deps = [
+        ":jax",
+    ] + py_deps("numpy"),
+)
+
 py_library_providing_imports_info(
     name = "jax",
-    srcs = glob(
+    srcs = [
+        "_src/__init__.py",
+        "_src/ad_checkpoint.py",
+        "_src/api.py",
+        "_src/array.py",
+        "_src/callback.py",
+        "_src/checkify.py",
+        "_src/custom_batching.py",
+        "_src/custom_derivatives.py",
+        "_src/custom_transpose.py",
+        "_src/debugging.py",
+        "_src/dispatch.py",
+        "_src/dlpack.py",
+        "_src/flatten_util.py",
+        "_src/interpreters/__init__.py",
+        "_src/interpreters/ad.py",
+        "_src/interpreters/batching.py",
+        "_src/interpreters/pxla.py",
+        "_src/maps.py",
+        "_src/pjit.py",
+        "_src/prng.py",
+        "_src/public_test_util.py",
+        "_src/random.py",
+        "_src/stages.py",
+    ] + glob(
         [
             "*.py",
-            "_src/**/*.py",
+            "_src/debugger/**/*.py",
+            "_src/image/**/*.py",
+            "_src/lax/**/*.py",
+            "_src/nn/**/*.py",
+            "_src/numpy/**/*.py",
+            "_src/ops/**/*.py",
+            "_src/scipy/**/*.py",
+            "_src/state/**/*.py",
+            "_src/third_party/**/*.py",
             "image/**/*.py",
             "interpreters/**/*.py",
             "lax/**/*.py",
@@ -90,46 +137,498 @@ py_library_providing_imports_info(
             "third_party/**/*.py",
         ],
         exclude = [
-            "_src/test_util.py",
             "*_test.py",
             "**/*_test.py",
+            "_src/internal_test_util/**",
         ],
     ) + [
         # until new parallelism APIs are moved out of experimental
         "experimental/maps.py",
         "experimental/pjit.py",
-        "experimental/global_device_array.py",
         "experimental/multihost_utils.py",
+        "experimental/shard_map.py",
         # until checkify is moved out of experimental
         "experimental/checkify.py",
-        # to avoid circular dependencies
         "experimental/compilation_cache/compilation_cache.py",
-        "experimental/compilation_cache/gfile_cache.py",
-        "experimental/compilation_cache/cache_interface.py",
     ],
     lib_rule = pytype_library,
-    pytype_srcs = glob(["_src/**/*.pyi"]),
+    pytype_srcs = glob(
+        ["_src/**/*.pyi"],
+        exclude = [
+            "_src/basearray.pyi",
+        ],
+    ),
     visibility = ["//visibility:public"],
-    deps = select({
-               ":enable_jaxlib_build": [":jaxlib_deps"],
-               "//conditions:default": [],
-           }) +
-           py_deps("numpy") + py_deps("scipy") + jax_extra_deps,
+    deps = [
+        ":abstract_arrays",
+        ":ad_util",
+        ":api_util",
+        ":basearray",
+        ":cloud_tpu_init",
+        ":compilation_cache_internal",
+        ":config",
+        ":core",
+        ":custom_api_util",
+        ":deprecations",
+        ":dtypes",
+        ":effects",
+        ":environment_info",
+        ":lazy_loader",
+        ":mesh",
+        ":mlir",
+        ":monitoring",
+        ":op_shardings",
+        ":partial_eval",
+        ":partition_spec",
+        ":path",
+        ":pickle_util",
+        ":pretty_printer",
+        ":profiler",
+        ":sharding",
+        ":sharding_impls",
+        ":sharding_specs",
+        ":source_info_util",
+        ":traceback_util",
+        ":tree_util",
+        ":typing",
+        ":util",
+        ":version",
+        ":xla",
+        ":xla_bridge",
+        "//jax/_src/lib",
+    ] + py_deps("numpy") + py_deps("scipy") + py_deps("opt_einsum") + jax_extra_deps,
 )
 
-py_library(
-    name = "jaxlib_deps",
+pytype_strict_library(
+    name = "abstract_arrays",
+    srcs = ["_src/abstract_arrays.py"],
     deps = [
-        "//jaxlib",
+        ":ad_util",
+        ":core",
+        ":dtypes",
+        ":traceback_util",
+    ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "ad_util",
+    srcs = ["_src/ad_util.py"],
+    deps = [
+        ":core",
+        ":traceback_util",
+        ":tree_util",
+        ":typing",
+        ":util",
     ],
 )
+
+pytype_strict_library(
+    name = "api_util",
+    srcs = ["_src/api_util.py"],
+    deps = [
+        ":abstract_arrays",
+        ":config",
+        ":core",
+        ":dtypes",
+        ":traceback_util",
+        ":tree_util",
+        ":util",
+    ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "basearray",
+    srcs = ["_src/basearray.py"],
+    pytype_srcs = ["_src/basearray.pyi"],
+    deps = [
+        ":sharding",
+        "//jax/_src/lib",
+    ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "cloud_tpu_init",
+    srcs = ["_src/cloud_tpu_init.py"],
+)
+
+pytype_strict_library(
+    name = "compilation_cache_internal",
+    srcs = ["_src/compilation_cache.py"],
+    visibility = [":internal"] + jax_visibility("compilation_cache"),
+    deps = [
+        ":compilation_cache_interface",
+        ":config",
+        ":gfile_cache",
+        ":path",
+        "//jax/_src/lib",
+    ] + py_deps("numpy") + py_deps("zstandard"),
+)
+
+pytype_strict_library(
+    name = "compilation_cache_interface",
+    srcs = ["_src/compilation_cache_interface.py"],
+    deps = [":path"],
+)
+
+pytype_strict_library(
+    name = "config",
+    srcs = ["_src/config.py"],
+    deps = [
+        "//jax/_src/lib",
+    ],
+)
+
+pytype_strict_library(
+    name = "core",
+    srcs = [
+        "_src/core.py",
+        "_src/errors.py",
+        "_src/linear_util.py",
+    ],
+    deps = [
+        ":config",
+        ":dtypes",
+        ":effects",
+        ":pretty_printer",
+        ":source_info_util",
+        ":traceback_util",
+        ":tree_util",
+        ":typing",
+        ":util",
+        "//jax/_src/lib",
+    ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "custom_api_util",
+    srcs = ["_src/custom_api_util.py"],
+)
+
+pytype_strict_library(
+    name = "deprecations",
+    srcs = ["_src/deprecations.py"],
+)
+
+pytype_strict_library(
+    name = "dtypes",
+    srcs = [
+        "_src/dtypes.py",
+    ],
+    deps = [
+        ":config",
+        ":traceback_util",
+        ":typing",
+    ] + py_deps("ml_dtypes") + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "effects",
+    srcs = ["_src/effects.py"],
+)
+
+pytype_strict_library(
+    name = "environment_info",
+    srcs = ["_src/environment_info.py"],
+    deps = [
+        ":version",
+        ":xla_bridge",
+        "//jax/_src/lib",
+    ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "gfile_cache",
+    srcs = ["_src/gfile_cache.py"],
+    deps = [
+        ":compilation_cache_interface",
+        ":path",
+    ],
+)
+
+pytype_library(
+    name = "iree",
+    srcs = ["_src/iree.py"],
+    deps = [
+        ":config",
+        "//jax/_src/lib",
+    ] + py_deps("numpy"),
+)
+
+pytype_library(
+    name = "lax_reference",
+    srcs = ["_src/lax_reference.py"],
+    visibility = [":internal"] + jax_visibility("lax_reference"),
+    deps = [
+        ":core",
+        ":util",
+    ] + py_deps("numpy") + py_deps("scipy") + py_deps("opt_einsum"),
+)
+
+pytype_strict_library(
+    name = "lazy_loader",
+    srcs = ["_src/lazy_loader.py"],
+)
+
+pytype_strict_library(
+    name = "mesh",
+    srcs = ["_src/mesh.py"],
+    deps = [
+        ":config",
+        ":util",
+        ":xla_bridge",
+        "//jax/_src/lib",
+    ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "mlir",
+    srcs = ["_src/interpreters/mlir.py"],
+    deps = [
+        ":ad_util",
+        ":config",
+        ":core",
+        ":dtypes",
+        ":effects",
+        ":op_shardings",
+        ":partial_eval",
+        ":pickle_util",
+        ":sharding_impls",
+        ":source_info_util",
+        ":util",
+        ":xla",
+        ":xla_bridge",
+        "//jax/_src/lib",
+    ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "monitoring",
+    srcs = ["_src/monitoring.py"],
+)
+
+pytype_strict_library(
+    name = "op_shardings",
+    srcs = ["_src/op_shardings.py"],
+    deps = [
+        "//jax/_src/lib",
+    ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "partial_eval",
+    srcs = ["_src/interpreters/partial_eval.py"],
+    deps = [
+        ":ad_util",
+        ":api_util",
+        ":config",
+        ":core",
+        ":dtypes",
+        ":effects",
+        ":profiler",
+        ":source_info_util",
+        ":state_types",
+        ":tree_util",
+        ":util",
+    ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "partition_spec",
+    srcs = ["_src/partition_spec.py"],
+)
+
+pytype_strict_library(
+    name = "path",
+    srcs = ["_src/path.py"],
+    deps = py_deps("epath"),
+)
+
+pytype_library(
+    name = "experimental_profiler",
+    srcs = ["experimental/profiler.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//jax/_src/lib",
+    ],
+)
+
+pytype_strict_library(
+    name = "pickle_util",
+    srcs = ["_src/pickle_util.py"],
+    deps = [":profiler"] + py_deps("cloudpickle"),
+)
+
+pytype_strict_library(
+    name = "pretty_printer",
+    srcs = ["_src/pretty_printer.py"],
+    deps = [":config"] + py_deps("colorama"),
+)
+
+pytype_strict_library(
+    name = "profiler",
+    srcs = ["_src/profiler.py"],
+    deps = [
+        ":traceback_util",
+        ":xla_bridge",
+        "//jax/_src/lib",
+    ],
+)
+
+pytype_strict_library(
+    name = "sharding",
+    srcs = ["_src/sharding.py"],
+    deps = [
+        ":util",
+        ":xla_bridge",
+        "//jax/_src/lib",
+    ],
+)
+
+pytype_strict_library(
+    name = "sharding_impls",
+    srcs = ["_src/sharding_impls.py"],
+    deps = [
+        ":mesh",
+        ":op_shardings",
+        ":partition_spec",
+        ":sharding",
+        ":sharding_specs",
+        ":tree_util",
+        ":util",
+        ":xla_bridge",
+        "//jax/_src/lib",
+    ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "sharding_specs",
+    srcs = ["_src/sharding_specs.py"],
+    deps = [
+        ":op_shardings",
+        ":util",
+        "//jax/_src/lib",
+    ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "source_info_util",
+    srcs = ["_src/source_info_util.py"],
+    visibility = [":internal"] + jax_visibility("source_info_util"),
+    deps = [
+        ":traceback_util",
+        ":version",
+        "//jax/_src/lib",
+    ],
+)
+
+pytype_strict_library(
+    name = "state_types",
+    srcs = [
+        "_src/state/__init__.py",
+        "_src/state/types.py",
+    ],
+    deps = [
+        ":core",
+        ":effects",
+        ":pretty_printer",
+        ":util",
+    ],
+)
+
+pytype_strict_library(
+    name = "tree_util",
+    srcs = ["_src/tree_util.py"],
+    visibility = [":internal"] + jax_visibility("tree_util"),
+    deps = [
+        ":traceback_util",
+        ":util",
+        "//jax/_src/lib",
+    ],
+)
+
+pytype_strict_library(
+    name = "traceback_util",
+    srcs = ["_src/traceback_util.py"],
+    visibility = [":internal"] + jax_visibility("traceback_util"),
+    deps = [
+        ":config",
+        ":util",
+        "//jax/_src/lib",
+    ],
+)
+
+pytype_strict_library(
+    name = "typing",
+    srcs = [
+        "_src/typing.py",
+    ],
+    deps = [":basearray"] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "util",
+    srcs = ["_src/util.py"],
+    deps = [
+        ":config",
+        "//jax/_src/lib",
+    ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "version",
+    srcs = ["version.py"],
+)
+
+pytype_strict_library(
+    name = "xla",
+    srcs = ["_src/interpreters/xla.py"],
+    deps = [
+        ":abstract_arrays",
+        ":config",
+        ":core",
+        ":dtypes",
+        ":sharding_impls",
+        ":source_info_util",
+        ":typing",
+        ":util",
+        ":xla_bridge",
+        "//jax/_src/lib",
+    ] + py_deps("numpy"),
+)
+
+# TODO(phawkins): break up this SCC.
+pytype_strict_library(
+    name = "xla_bridge",
+    srcs = [
+        "_src/clusters/__init__.py",
+        "_src/clusters/cloud_tpu_cluster.py",
+        "_src/clusters/cluster.py",
+        "_src/clusters/ompi_cluster.py",
+        "_src/clusters/slurm_cluster.py",
+        "_src/distributed.py",
+        "_src/xla_bridge.py",
+    ],
+    visibility = [":internal"] + jax_visibility("xla_bridge"),
+    deps = [
+        ":cloud_tpu_init",
+        ":config",
+        ":iree",
+        ":traceback_util",
+        ":util",
+        "//jax/_src/lib",
+    ] + py_deps("numpy"),
+)
+
+# Public JAX libraries below this point.
 
 py_library_providing_imports_info(
     name = "experimental",
-    srcs = glob([
-        "experimental/*.py",
-        "example_libraries/*.py",
-    ]),
+    srcs = glob(
+        [
+            "experimental/*.py",
+            "example_libraries/*.py",
+        ],
+    ),
     visibility = ["//visibility:public"],
     deps = [
         ":jax",
@@ -192,7 +691,10 @@ pytype_library(
     name = "maps",
     srcs = ["experimental/maps.py"],
     visibility = ["//visibility:public"],
-    deps = [":jax"],
+    deps = [
+        ":jax",
+        ":mesh",
+    ],
 )
 
 # TODO(apaszke): Remove this target
@@ -226,7 +728,6 @@ pytype_library(
     name = "compilation_cache",
     srcs = [
         "experimental/compilation_cache/compilation_cache.py",
-        "experimental/compilation_cache/gfile_cache.py",
     ],
     visibility = ["//visibility:public"],
     deps = [":jax"],

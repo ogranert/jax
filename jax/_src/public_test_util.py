@@ -15,13 +15,12 @@
 from functools import partial
 import operator
 
-from jax import config
-from jax.tree_util import tree_map, tree_reduce
 from jax._src import api
 from jax._src import dtypes as _dtypes
-from jax._src.config import flags
-from jax._src.lib import xla_client
-from jax._src.lib import xla_bridge
+from jax._src import xla_bridge
+from jax._src.config import config, flags
+from jax._src.tree_util import tree_map, tree_reduce
+
 import numpy as np
 
 
@@ -34,7 +33,6 @@ __all__ = ['check_grads', 'check_jvp', 'check_vjp']
 FLAGS = flags.FLAGS
 
 EPS = 1e-4
-_fp8_enabled = xla_client._version >= 117
 
 
 def _dtype(x):
@@ -49,14 +47,19 @@ def _dtype(x):
 _default_tolerance = {
   _dtypes.float0: 0,
   np.dtype(np.bool_): 0,
+  np.dtype(_dtypes.int4): 0,
   np.dtype(np.int8): 0,
   np.dtype(np.int16): 0,
   np.dtype(np.int32): 0,
   np.dtype(np.int64): 0,
+  np.dtype(_dtypes.uint4): 0,
   np.dtype(np.uint8): 0,
   np.dtype(np.uint16): 0,
   np.dtype(np.uint32): 0,
   np.dtype(np.uint64): 0,
+  np.dtype(_dtypes.float8_e4m3b11fnuz): 1e-1,
+  np.dtype(_dtypes.float8_e4m3fn): 1e-1,
+  np.dtype(_dtypes.float8_e5m2): 1e-1,
   np.dtype(_dtypes.bfloat16): 1e-2,
   np.dtype(np.float16): 1e-3,
   np.dtype(np.float32): 1e-6,
@@ -64,12 +67,6 @@ _default_tolerance = {
   np.dtype(np.complex64): 1e-6,
   np.dtype(np.complex128): 1e-15,
 }
-if _fp8_enabled:
-  _default_tolerance.update({
-    np.dtype(_dtypes.float8_e4m3fn): 1e-1,
-    np.dtype(_dtypes.float8_e5m2): 1e-1,
-  })
-
 
 def default_tolerance():
   if device_under_test() != "tpu":
@@ -81,6 +78,9 @@ def default_tolerance():
 
 
 default_gradient_tolerance = {
+  np.dtype(_dtypes.float8_e4m3b11fnuz): 1e-1,
+  np.dtype(_dtypes.float8_e4m3fn): 1e-1,
+  np.dtype(_dtypes.float8_e5m2): 1e-1,
   np.dtype(_dtypes.bfloat16): 1e-1,
   np.dtype(np.float16): 1e-2,
   np.dtype(np.float32): 2e-3,
@@ -88,11 +88,6 @@ default_gradient_tolerance = {
   np.dtype(np.complex64): 1e-3,
   np.dtype(np.complex128): 1e-5,
 }
-if _fp8_enabled:
-  default_gradient_tolerance.update({
-    np.dtype(_dtypes.float8_e4m3fn): 1e-1,
-    np.dtype(_dtypes.float8_e5m2): 1e-1,
-  })
 
 def is_python_scalar(val):
   return not isinstance(val, np.generic) and isinstance(val, (bool, int, float, complex))
@@ -101,10 +96,8 @@ def _assert_numpy_allclose(a, b, atol=None, rtol=None, err_msg=''):
   if a.dtype == b.dtype == _dtypes.float0:
     np.testing.assert_array_equal(a, b, err_msg=err_msg)
     return
-  if _fp8_enabled:
-    custom_dtypes = [_dtypes.float8_e4m3fn, _dtypes.float8_e5m2, _dtypes.bfloat16]
-  else:
-    custom_dtypes = [_dtypes.bfloat16]
+  custom_dtypes = [_dtypes.float8_e4m3b11fnuz, _dtypes.float8_e4m3fn,
+                   _dtypes.float8_e5m2, _dtypes.bfloat16]
   a = a.astype(np.float32) if a.dtype in custom_dtypes else a
   b = b.astype(np.float32) if b.dtype in custom_dtypes else b
   kw = {}

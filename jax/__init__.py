@@ -35,10 +35,15 @@ del _cloud_tpu_init
 from jax import config as _config_module
 del _config_module
 
+# Force early import, allowing use of `jax.core` after importing `jax`.
+import jax.core as _core
+del _core
+
 # Note: import <name> as <name> is required for names to be exported.
 # See PEP 484 & https://github.com/google/jax/issues/7570
 
 from jax._src.basearray import Array as Array
+from jax import typing as typing
 
 from jax._src.config import (
   config as config,
@@ -46,6 +51,7 @@ from jax._src.config import (
   check_tracer_leaks as check_tracer_leaks,
   checking_leaks as checking_leaks,
   enable_custom_prng as enable_custom_prng,
+  softmax_custom_jvp as softmax_custom_jvp,
   enable_custom_vjp_by_custom_transpose as enable_custom_vjp_by_custom_transpose,
   debug_nans as debug_nans,
   debug_infs as debug_infs,
@@ -64,61 +70,69 @@ from jax._src.config import (
 )
 from jax._src.core import ensure_compile_time_eval as ensure_compile_time_eval
 from jax._src.environment_info import print_environment_info as print_environment_info
-from jax._src.api import (
-  ad,  # TODO(phawkins): update users to avoid this.
-  effects_barrier,
-  block_until_ready as block_until_ready,
-  checkpoint as checkpoint,
-  checkpoint_policies as checkpoint_policies,
-  clear_backends as clear_backends,
-  closure_convert as closure_convert,
-  curry,  # TODO(phawkins): update users to avoid this.
-  custom_gradient as custom_gradient,
-  custom_jvp as custom_jvp,
-  custom_vjp as custom_vjp,
-  default_backend as default_backend,
-  device_count as device_count,
-  device_get as device_get,
-  device_put as device_put,
-  device_put_sharded as device_put_sharded,
-  device_put_replicated as device_put_replicated,
-  devices as devices,
-  disable_jit as disable_jit,
-  eval_shape as eval_shape,
-  flatten_fun_nokwargs,  # TODO(phawkins): update users to avoid this.
-  float0 as float0,
-  grad as grad,
-  hessian as hessian,
-  host_count as host_count,
-  host_id as host_id,
-  host_ids as host_ids,
-  jacobian as jacobian,
-  jacfwd as jacfwd,
-  jacrev as jacrev,
-  jit as jit,
-  jvp as jvp,
-  local_device_count as local_device_count,
-  local_devices as local_devices,
-  linearize as linearize,
-  linear_transpose as linear_transpose,
-  live_arrays as live_arrays,
-  make_jaxpr as make_jaxpr,
-  named_call as named_call,
-  named_scope as named_scope,
-  pmap as pmap,
-  process_count as process_count,
-  process_index as process_index,
-  pure_callback as pure_callback,
-  pxla,  # TODO(phawkins): update users to avoid this.
-  remat as remat,
-  ShapedArray as ShapedArray,
-  ShapeDtypeStruct as ShapeDtypeStruct,
-  value_and_grad as value_and_grad,
-  vjp as vjp,
-  vmap as vmap,
-  xla,  # TODO(phawkins): update users to avoid this.
-  xla_computation as xla_computation,
-)
+
+from jax._src.lib import xla_client as _xc
+Device = _xc.Device
+del _xc
+
+from jax._src.api import effects_barrier as effects_barrier
+from jax._src.api import block_until_ready as block_until_ready
+from jax._src.ad_checkpoint import checkpoint_wrapper as checkpoint
+from jax._src.ad_checkpoint import checkpoint_policies as checkpoint_policies
+from jax._src.api import clear_backends as clear_backends
+from jax._src.api import clear_caches as clear_caches
+from jax._src.custom_derivatives import closure_convert as closure_convert
+from jax._src.util import curry as _deprecated_curry
+from jax._src.custom_derivatives import custom_gradient as custom_gradient
+from jax._src.custom_derivatives import custom_jvp as custom_jvp
+from jax._src.custom_derivatives import custom_vjp as custom_vjp
+from jax._src.xla_bridge import default_backend as default_backend
+from jax._src.xla_bridge import device_count as device_count
+from jax._src.api import device_get as device_get
+from jax._src.api import device_put as device_put
+from jax._src.api import device_put_sharded as device_put_sharded
+from jax._src.api import device_put_replicated as device_put_replicated
+from jax._src.xla_bridge import devices as devices
+from jax._src.api import disable_jit as disable_jit
+from jax._src.api import eval_shape as eval_shape
+from jax._src.api_util import flatten_fun_nokwargs as _deprecated_flatten_fun_nokwargs
+from jax._src.dtypes import float0 as float0
+from jax._src.api import grad as grad
+from jax._src.api import hessian as hessian
+from jax._src.xla_bridge import host_count as host_count
+from jax._src.xla_bridge import host_id as host_id
+from jax._src.xla_bridge import host_ids as host_ids
+from jax._src.api import jacobian as jacobian
+from jax._src.api import jacfwd as jacfwd
+from jax._src.api import jacrev as jacrev
+from jax._src.api import jit as jit
+from jax._src.api import jvp as jvp
+from jax._src.xla_bridge import local_device_count as local_device_count
+from jax._src.xla_bridge import local_devices as local_devices
+from jax._src.api import linearize as linearize
+from jax._src.api import linear_transpose as linear_transpose
+from jax._src.api import live_arrays as live_arrays
+from jax._src.api import make_jaxpr as make_jaxpr
+from jax._src.api import named_call as named_call
+from jax._src.api import named_scope as named_scope
+from jax._src.api import pmap as pmap
+from jax._src.xla_bridge import process_count as process_count
+from jax._src.xla_bridge import process_index as process_index
+from jax._src.callback import pure_callback_api as pure_callback
+from jax._src.ad_checkpoint import checkpoint_wrapper as remat
+from jax._src.core import ShapedArray as _deprecated_ShapedArray
+from jax._src.api import ShapeDtypeStruct as ShapeDtypeStruct
+from jax._src.api import value_and_grad as value_and_grad
+from jax._src.api import vjp as vjp
+from jax._src.api import vmap as vmap
+from jax._src.api import xla_computation as xla_computation
+
+from jax.interpreters import ad as _deprecated_ad
+import jax.interpreters.batching
+import jax.interpreters.mlir
+from jax.interpreters import partial_eval as _deprecated_partial_eval
+from jax.interpreters import pxla as _deprecated_pxla
+from jax.interpreters import xla as _deprecated_xla
 
 from jax._src.array import (
     make_array_from_single_device_arrays as make_array_from_single_device_arrays,
@@ -141,7 +155,10 @@ from jax._src.tree_util import (
 
 # These submodules are separate because they are in an import cycle with
 # jax and rely on the names imported above.
-from jax import abstract_arrays as abstract_arrays
+from jax import abstract_arrays as _deprecated_abstract_arrays
+from jax import custom_derivatives as custom_derivatives
+from jax import custom_batching as custom_batching
+from jax import custom_transpose as custom_transpose
 from jax import api_util as api_util
 from jax import distributed as distributed
 from jax import debug as debug
@@ -150,6 +167,7 @@ from jax import errors as errors
 from jax import image as image
 from jax import lax as lax
 from jax import linear_util as linear_util
+from jax import monitoring as monitoring
 from jax import nn as nn
 from jax import numpy as numpy
 from jax import ops as ops
@@ -161,13 +179,74 @@ from jax import stages as stages
 from jax import tree_util as tree_util
 from jax import util as util
 
+# Also circular dependency.
+from jax._src.array import Shard as Shard
+
+import jax.experimental.compilation_cache.compilation_cache as _ccache
+del _ccache
+
+_deprecations = {
+  # Added 06 June 2023
+  "abstract_arrays": (
+    "jax.abstract_arrays is deprecated. Refer to jax.core.",
+    _deprecated_abstract_arrays
+  ),
+  # Added 28 March 2023
+  "ShapedArray": (
+    "jax.ShapedArray is deprecated. Use jax.core.ShapedArray",
+    _deprecated_ShapedArray,
+  ),
+  "ad": (
+    "jax.ad is deprecated. Use jax.interpreters.ad",
+    _deprecated_ad,
+  ),
+  "partial_eval": (
+    "jax.partial_eval is deprecated. Use jax.interpreters.partial_eval",
+    _deprecated_partial_eval,
+  ),
+  "pxla": (
+    "jax.pxla is deprecated. Use jax.interpreters.pxla",
+    _deprecated_pxla,
+  ),
+  "xla": (
+    "jax.xla is deprecated. Use jax.interpreters.xla",
+    _deprecated_xla,
+  ),
+  "curry": (
+    "jax.curry is deprecated. Use curry = lambda f: partial(partial, f)",
+    _deprecated_curry,
+  ),
+  "flatten_fun_nokwargs": (
+    "jax.flatten_fun_nokwargs is deprecated. Use jax.api_util.flatten_fun_nokwargs.",
+    _deprecated_flatten_fun_nokwargs,
+  ),
+}
+
+import typing as _typing
+if _typing.TYPE_CHECKING:
+  from jax._src import abstract_arrays as abstract_arrays
+  from jax._src.core import ShapedArray as ShapedArray
+  from jax.interpreters import ad as ad
+  from jax.interpreters import partial_eval as partial_eval
+  from jax.interpreters import pxla as pxla
+  from jax.interpreters import xla as xla
+  from jax._src.util import curry as curry
+  from jax._src.api_util import flatten_fun_nokwargs as flatten_fun_nokwargs
+else:
+  from jax._src.deprecations import deprecation_getattr as _deprecation_getattr
+  __getattr__ = _deprecation_getattr(__name__, _deprecations)
+  del _deprecation_getattr
+del _typing
+
+
+# TODO(yashkatariya): Remove after 2 jax releases from 0.4.6
+if not config.jax_jit_pjit_api_merge:
+  raise ValueError(
+      'jax.config.jax_jit_pjit_api_merge cannot be disabled after jax 0.4.7'
+      ' release. Please downgrade to jax and jaxlib 0.4.6 if you want to'
+      ' disable jax.config.jax_jit_pjit_api_merge.'
+  )
+
 import jax.lib  # TODO(phawkins): remove this export.
 
-if hasattr(jax, '_src'):
-  del jax._src
-else:
-  from warnings import warn as _warn
-  _warn("The jax module appears to have been reloaded within the python process. "
-        "This is not well-supported and can cause unpredictable side-effects. "
-        "For information see https://github.com/google/jax/issues/13857.")
-  del _warn
+# trailer

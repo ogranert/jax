@@ -17,6 +17,7 @@ Subpackages
    jax.debug
    jax.dlpack
    jax.distributed
+   jax.dtypes
    jax.flatten_util
    jax.image
    jax.nn
@@ -24,6 +25,8 @@ Subpackages
    jax.profiler
    jax.stages
    jax.tree_util
+   jax.typing
+   jax.extend
    jax.example_libraries
    jax.experimental
 
@@ -67,6 +70,7 @@ Just-in-time compilation (:code:`jit`)
     xla_computation
     make_jaxpr
     eval_shape
+    ShapeDtypeStruct
     device_put
     device_put_replicated
     device_put_sharded
@@ -104,6 +108,7 @@ jax.Array (:code:`jax.Array`)
 .. autosummary::
   :toctree: _autosummary
 
+    Array
     make_array_from_callback
     make_array_from_single_device_arrays
 
@@ -137,7 +142,9 @@ Callbacks
   :toctree: _autosummary
 
     pure_callback
+    experimental.io_callback
     debug.callback
+    debug.print
 
 Miscellaneous
 -------------
@@ -145,4 +152,7 @@ Miscellaneous
 .. autosummary::
   :toctree: _autosummary
 
+    Device
     print_environment_info
+    live_arrays
+    clear_caches

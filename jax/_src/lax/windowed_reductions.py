@@ -13,23 +13,22 @@
 # limitations under the License.
 
 from functools import partial
-from typing import (Any, Callable, Optional, Sequence, Union, Tuple)
+from typing import Any, Callable, Optional, Sequence, Union
 import warnings
 
 import numpy as np
-
-from jax.interpreters import ad
-from jax.interpreters import batching
-from jax.interpreters import mlir
-from jax.interpreters import xla
 
 from jax import tree_util
 
 from jax._src import ad_util
 from jax._src import core
+from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import util
 from jax._src.core import ShapedArray, ConcreteArray
+from jax._src.interpreters import ad
+from jax._src.interpreters import batching
+from jax._src.interpreters import mlir
 from jax._src.lax import lax
 from jax._src.lax import convolution
 from jax._src.lax import slicing
@@ -45,7 +44,7 @@ Array = Any
 
 def reduce_window(operand, init_value, computation: Callable,
                   window_dimensions: core.Shape, window_strides: Sequence[int],
-                  padding: Union[str, Sequence[Tuple[int, int]]],
+                  padding: Union[str, Sequence[tuple[int, int]]],
                   base_dilation: Optional[Sequence[int]] = None,
                   window_dilation: Optional[Sequence[int]] = None) -> Array:
   """Wraps XLA's `ReduceWindowWithGeneralPadding
@@ -113,7 +112,7 @@ def _get_monoid_window_reducer(monoid_op: Callable,
 
 def _reduce_window_sum(operand: Array, window_dimensions: core.Shape,
                        window_strides: Sequence[int],
-                       padding: Sequence[Tuple[int, int]],
+                       padding: Sequence[tuple[int, int]],
                        base_dilation: Optional[Sequence[int]] = None,
                        window_dilation: Optional[Sequence[int]] = None) -> Array:
   if base_dilation is None:
@@ -128,7 +127,7 @@ def _reduce_window_sum(operand: Array, window_dimensions: core.Shape,
 
 def _reduce_window_prod(operand: Array, window_dimensions: core.Shape,
                         window_strides: Sequence[int],
-                        padding: Sequence[Tuple[int, int]],
+                        padding: Sequence[tuple[int, int]],
                         base_dilation: Optional[Sequence[int]] = None,
                         window_dilation: Optional[Sequence[int]] = None) -> Array:
   init_value = lax._const(operand, 1)
@@ -147,7 +146,7 @@ def _reduce_window_prod(operand: Array, window_dimensions: core.Shape,
 
 def _reduce_window_max(operand: Array, window_dimensions: core.Shape,
                        window_strides: Sequence[int],
-                       padding: Sequence[Tuple[int, int]],
+                       padding: Sequence[tuple[int, int]],
                        base_dilation: Optional[Sequence[int]] = None,
                        window_dilation: Optional[Sequence[int]] = None) -> Array:
   if base_dilation is None:
@@ -162,7 +161,7 @@ def _reduce_window_max(operand: Array, window_dimensions: core.Shape,
 
 def _reduce_window_min(operand: Array, window_dimensions: core.Shape,
                        window_strides: Sequence[int],
-                       padding: Sequence[Tuple[int, int]],
+                       padding: Sequence[tuple[int, int]],
                        base_dilation: Optional[Sequence[int]] = None,
                        window_dilation: Optional[Sequence[int]] = None) -> Array:
   if base_dilation is None:
@@ -178,7 +177,7 @@ def _reduce_window_min(operand: Array, window_dimensions: core.Shape,
 def _reduce_window_logaddexp(
     operand: Array, window_dimensions: core.Shape,
     window_strides: Sequence[int],
-    padding: Sequence[Tuple[int, int]],
+    padding: Sequence[tuple[int, int]],
     base_dilation: Optional[Sequence[int]] = None,
     window_dilation: Optional[Sequence[int]] = None) -> Array:
   init_value = lax._const(operand, -np.inf)
@@ -198,7 +197,7 @@ def _reduce_window_logaddexp(
 def _select_and_scatter(operand: Array, select: Callable,
                         window_dimensions: core.Shape,
                         window_strides: Sequence[int],
-                        padding: Sequence[Tuple[int, int]], source: Array,
+                        padding: Sequence[tuple[int, int]], source: Array,
                         init_value: Array, scatter: Callable) -> Array:
   select_jaxpr, select_consts = lax._reduction_jaxpr(
     select, lax._abstractify(init_value))
@@ -214,7 +213,7 @@ def _select_and_scatter_add(source: Array, operand: Array,
                             select_prim: core.Primitive,
                             window_dimensions: core.Shape,
                             window_strides: Sequence[int],
-                            padding: Sequence[Tuple[int, int]]) -> Array:
+                            padding: Sequence[tuple[int, int]]) -> Array:
   return select_and_scatter_add_p.bind(
       source, operand, select_prim=select_prim,
       window_dimensions=tuple(window_dimensions),
@@ -224,7 +223,7 @@ def _select_and_gather_add(tangents: Array, operand: Array,
                            select_prim: core.Primitive,
                            window_dimensions: core.Shape,
                            window_strides: Sequence[int],
-                           padding: Sequence[Tuple[int, int]],
+                           padding: Sequence[tuple[int, int]],
                            base_dilation: Sequence[int],
                            window_dilation: Sequence[int]) -> Array:
   """Extracts the tangent corresponding to the minimum or maximum element in
@@ -306,7 +305,7 @@ def _generic_reduce_window_batch_rule(
 
 reduce_window_p = core.Primitive('reduce_window')
 reduce_window_p.multiple_results = True
-reduce_window_p.def_impl(partial(xla.apply_primitive, reduce_window_p))
+reduce_window_p.def_impl(partial(dispatch.apply_primitive, reduce_window_p))
 reduce_window_p.def_abstract_eval(_reduce_window_abstract_eval_rule)
 batching.primitive_batchers[reduce_window_p] = _generic_reduce_window_batch_rule
 
@@ -315,26 +314,26 @@ def _generic_reduce_window_lower(ctx, *args, jaxpr, consts,
                                  base_dilation, window_dilation):
   operands, init_values = util.split_list(args, [len(args) // 2])
   _, init_value_avals = util.split_list(ctx.avals_in, [len(operands)])
-  scalar_types = [mlir.aval_to_ir_type(aval) for aval in init_value_avals]
-  rw = hlo.ReduceWindowOp(
-      map(mlir.aval_to_ir_type, ctx.avals_out),
-      operands,
-      init_values,
-      mlir.dense_int_elements(window_dimensions),
-      window_strides=mlir.dense_int_elements(window_strides),
-      base_dilations=mlir.dense_int_elements(base_dilation),
-      window_dilations=mlir.dense_int_elements(window_dilation),
-      padding=ir.DenseIntElementsAttr.get(np.asarray(padding, np.int64),
-                                          shape=(len(padding), 2)))
-  reducer = rw.regions[0].blocks.append(*(scalar_types + scalar_types))
-  with ir.InsertionPoint(reducer):
+
+  def reducer_body(reducer: ir.Block) -> Sequence[ir.Value]:
     if jaxpr.effects:
       raise NotImplementedError('Cannot lower effectful `reduce_window`.')
     out_nodes, _ = mlir.jaxpr_subcomp(ctx.module_context, jaxpr,
         mlir.TokenSet(), consts, *([a] for a in reducer.arguments),
         dim_var_values=ctx.dim_var_values)
-    hlo.ReturnOp(util.flatten(out_nodes))
-  return rw.results
+    return util.flatten(out_nodes)
+
+  return mlir.reduce_window(
+      ctx,
+      reducer_name="generic_reduce_window_reducer",
+      reducer_body=reducer_body,
+      operands=operands,
+      init_values=init_values, init_values_avals=init_value_avals,
+      out_avals=ctx.avals_out,
+      window_dimensions=window_dimensions, window_strides=window_strides,
+      base_dilation=base_dilation, window_dilation=window_dilation,
+      padding=padding)
+
 
 mlir.register_lowering(reduce_window_p, _generic_reduce_window_lower)
 
@@ -462,25 +461,26 @@ batching.primitive_batchers[reduce_window_min_p] = partial(
 
 
 def _reduce_window_lower(
-    reduce_op, init_value, ctx, operand, *,
-    window_dimensions, window_strides, padding, base_dilation, window_dilation):
-  aval_out, = ctx.avals_out
+    reduce_op,
+    init_value, ctx, operand, *,
+    window_dimensions, window_strides, padding, base_dilation,
+    window_dilation):
+
   operand_aval, = ctx.avals_in
   scalar_aval = operand_aval.update(shape=())
-  scalar_type = mlir.aval_to_ir_type(scalar_aval)
-  rw = hlo.ReduceWindowOp(
-      mlir.aval_to_ir_types(aval_out), [operand],
-      [mlir.full_like_aval(ctx, init_value(scalar_aval.dtype), scalar_aval)],
-      mlir.dense_int_elements(window_dimensions),
-      window_strides=mlir.dense_int_elements(window_strides),
-      base_dilations=mlir.dense_int_elements(base_dilation),
-      window_dilations=mlir.dense_int_elements(window_dilation),
-      padding=ir.DenseIntElementsAttr.get(np.asarray(padding, np.int64),
-                                          shape=(len(padding), 2)))
-  reducer = rw.regions[0].blocks.append(scalar_type, scalar_type)
-  with ir.InsertionPoint(reducer):
-    hlo.ReturnOp(reduce_op(*reducer.arguments))
-  return rw.results
+
+  return mlir.reduce_window(ctx,
+      reducer_name=f"reduce_window_{scalar_aval.dtype}_reducer",
+      reducer_body=lambda reducer: reduce_op(*reducer.arguments),
+      operands=[operand],
+      init_values=[mlir.full_like_aval(ctx, init_value(scalar_aval.dtype),
+                                       scalar_aval)],
+      init_values_avals=[scalar_aval],
+      out_avals=ctx.avals_out,
+      window_dimensions=window_dimensions,
+      window_strides=window_strides, base_dilation=base_dilation,
+      window_dilation=window_dilation, padding=padding)
+
 
 mlir.register_lowering(reduce_window_sum_p, partial(
     _reduce_window_lower, hlo.AddOp, lambda _: 0))
@@ -660,6 +660,7 @@ def _select_and_gather_add_lowering(
     max_bits=64):
   _, operand_aval, = ctx.avals_in
   out_aval, = ctx.avals_out
+  assert isinstance(operand_aval, core.ShapedArray), operand_aval
   dtype = operand_aval.dtype
   etype = mlir.dtype_to_ir_type(dtype)
   nbits = dtypes.finfo(dtype).bits
@@ -682,7 +683,6 @@ def _select_and_gather_add_lowering(
     word_dtype = lax._UINT_DTYPES[nbits]
     double_word_dtype = lax._UINT_DTYPES[nbits * 2]
     word_type = mlir.dtype_to_ir_type(word_dtype)  # type: ignore
-    double_word_type = mlir.dtype_to_ir_type(double_word_dtype)  # type: ignore
     # Packs two values into a double_word_type.
     def pack(a, b, ab_aval):
       word_type_ab_aval = ab_aval.update(dtype=word_dtype)
@@ -724,7 +724,6 @@ def _select_and_gather_add_lowering(
     nmant = r_nbits - nexp - 1
 
     double_word_dtype = word_dtype = lax._UINT_DTYPES[nbits]
-    double_word_type = word_type = mlir.dtype_to_ir_type(word_dtype)  # type: ignore
 
     # Packs two values into a double_word_type.
     def pack(a, b, ab_aval):
@@ -756,25 +755,27 @@ def _select_and_gather_add_lowering(
   assert select_prim is lax.ge_p or select_prim is lax.le_p, select_prim
   init = -np.inf if select_prim is lax.ge_p else np.inf
   double_word_out_aval = out_aval.update(dtype=double_word_dtype)
-  rw = hlo.ReduceWindowOp(
-      [mlir.aval_to_ir_type(double_word_out_aval)],
-      pack(operand, tangents, operand_aval),
-      pack(const(dtype, init), const(dtype, 0), core.ShapedArray((), dtype)),
-      mlir.dense_int_elements(window_dimensions),
-      window_strides=mlir.dense_int_elements(window_strides),
-      base_dilations=mlir.dense_int_elements(base_dilation),
-      window_dilations=mlir.dense_int_elements(window_dilation),
-      padding=ir.DenseIntElementsAttr.get(np.asarray(padding, np.int64),
-                                          shape=(len(padding), 2)))
-  scalar_type = ir.RankedTensorType.get([], double_word_type)
-  reducer = rw.regions[0].blocks.append(scalar_type, scalar_type)
-  with ir.InsertionPoint(reducer):
+
+  def reducer_body(reducer: ir.Block) -> Sequence[ir.Value]:
     x, y = reducer.arguments
     assert select_prim is lax.ge_p or select_prim is lax.le_p
     cmp_op = "GE" if select_prim is lax.ge_p else "LE"
     out = hlo.SelectOp(mlir.compare_hlo(fst(x), fst(y), cmp_op), x, y)
-    hlo.ReturnOp(out)
-  return [snd(rw.result, double_word_out_aval)]
+    return out
+
+  res, = mlir.reduce_window(ctx,
+      reducer_name="reduce_window_select_and_gather_add",
+      reducer_body=reducer_body,
+      operands=[pack(operand, tangents, operand_aval)],
+      init_values=[pack(const(dtype, init), const(dtype, 0), core.ShapedArray((), dtype))],
+      init_values_avals=[core.ShapedArray((), double_word_dtype)],
+      out_avals=[double_word_out_aval],
+      window_dimensions=window_dimensions,
+      window_strides=window_strides,
+      base_dilation=base_dilation,
+      window_dilation=window_dilation,
+      padding=padding)
+  return [snd(res, double_word_out_aval)]
 
 # TODO(phawkins): use this translation rule on all platforms.
 def _select_and_gather_add_using_variadic_reducewindow(

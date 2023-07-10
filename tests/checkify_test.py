@@ -23,12 +23,12 @@ import jax
 from jax import lax
 import jax._src.test_util as jtu
 from jax._src.lib import xla_extension
-from jax.config import config
+from jax import config
 from jax.experimental import checkify
 from jax.experimental import pjit
-from jax.experimental import maps
-from jax._src.sharding import NamedSharding
+from jax.sharding import NamedSharding
 from jax._src import array
+from jax._src import core
 from jax._src.checkify import JaxRuntimeError, FailedCheckError, ErrorEffect, OOBError
 import jax.numpy as jnp
 
@@ -74,13 +74,18 @@ class CheckifyTransformTests(jtu.JaxTestCase):
     self.assertIsNotNone(err.get())
     self.assertStartsWith(err.get(), "out-of-bounds indexing")
 
-  @jtu.sample_product(update_fn=["set", "add", "multiply", "divide", "power",
-                                 "min", "max", "get"])
+  @parameterized.named_parameters(
+      ("get", lambda x: x.get()),
+      ("set", lambda x: x.set(1)),
+      ("add", lambda x: x.add(1)),
+      ("mul", lambda x: x.multiply(1)),
+      ("div", lambda x: x.divide(1)),
+      ("pow", lambda x: x.power(1)),
+      ("min", lambda x: x.min(1)),
+      ("max", lambda x: x.max(1)),
+  )
   def test_jit_oob_update(self, update_fn):
-    def f(x, i):
-      return getattr(x.at[i], update_fn)(1)
-
-    f = jax.jit(f)
+    f = jax.jit(lambda x, i: update_fn(x.at[i]))
     checked_f = checkify.checkify(f, errors=checkify.index_checks)
 
     err, _ = checked_f(jnp.arange(3), 2)
@@ -136,6 +141,7 @@ class CheckifyTransformTests(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
       ("gather", lambda x: x.get()),
+      ("scatter_update", lambda x: x.set(1.)),
       ("scatter_add", lambda x: x.add(1.)),
       ("scatter_mul", lambda x: x.multiply(1.)),
       ("scatter_div", lambda x: x.divide(1.)),
@@ -174,6 +180,41 @@ class CheckifyTransformTests(jtu.JaxTestCase):
     raises_oob(multi_idx, (-5, 9), "index -3", axis0_msg)
     raises_oob(multi_idx, (5, -9), "index 5", axis0_msg)
     raises_oob(multi_idx, ((0, 9), 0), "index 9", axis0_msg)
+
+  def test_dynamic_slice_oobs(self):
+    def raises_oob(fn, x, idx, *expected_strs):
+      err, _ = checkify.checkify(jax.jit(fn), errors=checkify.index_checks)(x, idx)
+      error_txt = err.get()
+      self.assertIsNotNone(error_txt)
+      self.assertStartsWith(error_txt, "out-of-bounds indexing")
+      for s in expected_strs:
+        self.assertIn(s, error_txt)
+
+    x = jnp.ones((2, 3, 7))
+    raises_oob(partial(lax.dynamic_slice, slice_sizes=(1, 1, 1)), x, (2, 0, 0), 'index 2')
+    raises_oob(partial(lax.dynamic_slice, slice_sizes=(1, 1, 1)), x, (-3, 0, 0), 'index -1')
+    raises_oob(partial(lax.dynamic_slice, slice_sizes=(1, 1, 1)), x, (0, 3, 0), 'index 3')
+    raises_oob(partial(lax.dynamic_slice, slice_sizes=(1, 1, 1)), x, (0, -5, 0), 'index -2')
+    raises_oob(partial(lax.dynamic_slice, slice_sizes=(1, 1, 1)), x, (0, 1, 8), 'index 8')
+    raises_oob(partial(lax.dynamic_slice, slice_sizes=(1, 1, 1)), x, (0, 1, -10), 'index -3')
+
+  def test_dynamic_update_slice_oobs(self):
+    def raises_oob(fn, x, y, idx, *expected_strs):
+      err, _ = checkify.checkify(jax.jit(fn), errors=checkify.index_checks)(x, y, idx)
+      error_txt = err.get()
+      self.assertIsNotNone(error_txt)
+      self.assertStartsWith(error_txt, "out-of-bounds indexing")
+      for s in expected_strs:
+        self.assertIn(s, error_txt)
+
+    x = jnp.ones((2, 3, 7))
+    y = jnp.zeros((1, 1, 1))
+    raises_oob(lax.dynamic_update_slice, x, y, (2, 0, 0), 'index 2')
+    raises_oob(lax.dynamic_update_slice, x, y, (-3, 0, 0), 'index -1')
+    raises_oob(lax.dynamic_update_slice, x, y, (0, 3, 0), 'index 3')
+    raises_oob(lax.dynamic_update_slice, x, y, (0, -5, 0), 'index -2')
+    raises_oob(lax.dynamic_update_slice, x, y, (0, 1, 8), 'index 8')
+    raises_oob(lax.dynamic_update_slice, x, y, (0, 1, -10), 'index -3')
 
   @jtu.sample_product(jit=[False, True])
   def test_jit_ordering(self, jit):
@@ -479,18 +520,14 @@ class CheckifyTransformTests(jtu.JaxTestCase):
       # binary func
       return x / y
 
-    mesh = maps.Mesh(np.array(jax.devices()), ["dev"])
-    if config.jax_array:
-      ps = NamedSharding(mesh, pjit.PartitionSpec("dev"))
-      inp = np.arange(8)
-      x = array.make_array_from_callback(inp.shape, ps, lambda idx: inp[idx])
-    else:
-      ps = pjit.PartitionSpec("dev")
-      x = jnp.arange(8)
+    mesh = jax.sharding.Mesh(np.array(jax.devices()), ["dev"])
+    ps = NamedSharding(mesh, jax.sharding.PartitionSpec("dev"))
+    inp = np.arange(8)
+    x = array.make_array_from_callback(inp.shape, ps, lambda idx: inp[idx])
 
-    f = pjit.pjit(f, in_axis_resources=ps, out_axis_resources=ps)
+    f = pjit.pjit(f, in_shardings=ps, out_shardings=ps)
     f = checkify.checkify(f, errors=checkify.float_checks)
-    g = pjit.pjit(g, in_axis_resources=ps, out_axis_resources=ps)
+    g = pjit.pjit(g, in_shardings=ps, out_shardings=ps)
     g = checkify.checkify(g, errors=checkify.float_checks)
     with mesh:
       u_err, _ = f(x)
@@ -734,7 +771,7 @@ class CheckifyTransformTests(jtu.JaxTestCase):
     cf = checkify.checkify(f, errors=checkify.nan_checks)
     err, _ = cf(jnp.array([-jnp.inf, 0, jnp.inf]), jnp.ones((3, 2)))
     self.assertIsNotNone(err.get())
-    self.assertStartsWith(err.get(), "nan generated by primitive: psum")
+    self.assertStartsWith(err.get(), "nan generated by primitive")
 
   def test_different_payload_effects(self):
     def f(x, y):
@@ -772,6 +809,65 @@ class CheckifyTransformTests(jtu.JaxTestCase):
     checked_f = jax.jit(checked_f)
     err, _ = checked_f(jnp.ones((2, 4)))
     self.assertIsNone(err.get())
+
+  def test_retracing(self):
+    f = checkify.checkify(jax.jit(lambda x: jnp.sin(x) ** 2))
+    _ = f(3.)
+    with jtu.count_jit_and_pmap_compiles() as count:
+      _ = f(3.)
+    self.assertEqual(count[0], 0)
+
+  def test_goodfellow_custom_jvp(self):
+    def h(fext):
+      checkify.check(True, "")
+      return jax.nn.relu(fext)
+
+    h = checkify.checkify(h)
+
+    def h_out(fext):
+      _, out = h(fext)
+      return out
+
+    h_grad = jax.grad(h_out)
+    h_grad(0.)  # doesn't crash
+
+  def test_goodfellow_custom_vjp(self):
+    @jax.custom_vjp
+    def sin(x):
+      return jnp.sin(x)
+    def sin_fwd(x):
+      return jnp.sin(x), 2. * x
+    def sin_bwd(x2, g):
+      return jnp.cos(x2 / 2.) * g,
+    sin.defvjp(sin_fwd, sin_bwd)
+
+    def h(fext):
+      checkify.check(True, "")
+      return sin(fext)
+
+    h = checkify.checkify(h)
+
+    def h_out(fext):
+      _, out = h(fext)
+      return out
+
+    h_grad = jax.grad(h_out)
+    h_grad(0.)  # doesn't crash
+
+  def test_closed_call(self):
+    # lots of golfing went into this test
+    y = jnp.array([3.14])
+    summify = lambda f: lambda x: f(x).sum()
+    f = checkify.checkify(jax.grad(summify(jax.remat(
+        partial(partial, jax.lax.map)(lambda x: jnp.sin(x * y))))))
+    f(jnp.array([3.]))  # don't crash
+
+  def test_while_loop_leaks(self):
+    def f(x):
+      n = jnp.minimum(1, 2)
+      return jax.lax.while_loop(lambda i: i < n, lambda i: i + 1, x)
+
+    jax.jit(checkify.checkify(f))(0)  # Does not crash bc of leaked tracer.
 
 
 @jtu.with_config(jax_check_tracer_leaks=True)
@@ -1167,11 +1263,41 @@ class AssertPrimitiveTests(jtu.JaxTestCase):
       return x
     x = jnp.ones(())
     jaxpr = jax.make_jaxpr(f)(x)
-    roundtrip_f = partial(jax.core.eval_jaxpr, jaxpr.jaxpr, jaxpr.consts)
+    roundtrip_f = partial(core.eval_jaxpr, jaxpr.jaxpr, jaxpr.consts)
     checked_f = checkify.checkify(jax.jit(roundtrip_f))
     err, _ = checked_f(jnp.ones(()))
     self.assertIsNotNone(err.get())
     self.assertStartsWith(err.get(), "1.0 cannot be 1.0")
+
+  def test_fmt_args_array_type_error(self):
+    args_error = lambda: checkify.check(False, "{} world", "hello")
+    with self.assertRaisesRegex(TypeError, "Formatting arguments"):
+      checkify.checkify(args_error)()
+
+    kwargs_error = lambda: checkify.check(False, "{hello} world", hello="hello")
+    with self.assertRaisesRegex(TypeError, "Formatting arguments"):
+      checkify.checkify(kwargs_error)()
+
+    np_arrays_ok = lambda: checkify.check(False, "{} world", np.array(1.))
+    checkify.checkify(np_arrays_ok)()
+
+    trees_ok = lambda: checkify.check(False, "{}", {"hello": jnp.array(1.)})
+    checkify.checkify(trees_ok)()
+
+  def test_checkify_non_jax_type_input(self):
+    _ = checkify.checkify(lambda x: 1.)("hi")  # does not crash
+
+  def test_checkify_static_args(self):
+    @checkify.checkify
+    def f(x):
+      if x:
+        return
+
+    _ = jax.jit(f, static_argnums=(0,))(True)
+
+  def test_check_pp_rule(self):
+    jaxpr = jax.make_jaxpr(lambda: checkify.check(False, "hi"))()
+    jaxpr.pretty_print(source_info=True, name_stack=True)  # Does not crash.
 
 
 class LowerableChecksTest(jtu.JaxTestCase):

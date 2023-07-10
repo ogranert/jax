@@ -106,17 +106,18 @@ Here is a short summary:
 .. table::
    :widths: auto
 
-   =================================   ========  ===  ==========  =======  ==============
-   Property                            Threefry  rbg  unsafe_rbg  rbg (*)  unsafe_rbg (*)
-   =================================   ========  ===  ==========  =======  ==============
-   Fastest on TPU                                ✅   ✅          ✅       ✅
-   efficiently shardable (w/ pjit)                                ✅       ✅
-   identical across shardings           ✅       ✅   ✅
-   identical across CPU/GPU/TPU         ✅
-   identical across JAX/XLA versions    ✅
-   =================================   ========  ===  ==========  =======  ==============
+   =================================   ========  =========  ===  ==========  =====  ============
+   Property                            Threefry  Threefry*  rbg  unsafe_rbg  rbg**  unsafe_rbg**
+   =================================   ========  =========  ===  ==========  =====  ============
+   Fastest on TPU                                           ✅   ✅          ✅     ✅
+   efficiently shardable (w/ pjit)                ✅                         ✅     ✅
+   identical across shardings           ✅        ✅        ✅   ✅
+   identical across CPU/GPU/TPU         ✅        ✅
+   identical across JAX/XLA versions    ✅        ✅
+   =================================   ========  =========  ===  ==========  =====  ============
 
-(*): with XLA_FLAGS=xla_tpu_spmd_rng_bit_generator_unsafe=1 set
+(*): with jax_threefry_partitionable=1 set
+(**): with XLA_FLAGS=--xla_tpu_spmd_rng_bit_generator_unsafe=1 set
 
 The difference between "rbg" and "unsafe_rbg" is that while "rbg" uses a less
 robust/studied hash function for random value generation (but not for
@@ -124,6 +125,9 @@ robust/studied hash function for random value generation (but not for
 robust hash functions for `jax.random.split` and `jax.random.fold_in`. Therefore
 less safe in the sense that the quality of random streams it generates from
 different keys is less well understood.
+
+For more about jax_threefry_partitionable, see
+https://jax.readthedocs.io/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html#generating-random-numbers
 """
 
 from jax._src.prng import PRNGKeyArray as _PRNGKeyArray
@@ -151,17 +155,22 @@ from jax._src.random import (
   ball as ball,
   bernoulli as bernoulli,
   beta as beta,
+  bits as bits,
   categorical as categorical,
   cauchy as cauchy,
+  chisquare as chisquare,
   choice as choice,
   default_prng_impl as default_prng_impl,
   dirichlet as dirichlet,
   double_sided_maxwell as double_sided_maxwell,
   exponential as exponential,
+  f as f,
   fold_in as fold_in,
   gamma as gamma,
   generalized_normal as generalized_normal,
+  geometric as geometric,
   gumbel as gumbel,
+  key as key,
   key_data as key_data,
   laplace as laplace,
   logistic as logistic,
@@ -176,6 +185,7 @@ from jax._src.random import (
   rademacher as rademacher,
   randint as randint,
   random_gamma_p as random_gamma_p,
+  rayleigh as rayleigh,
   rbg_key as rbg_key,
   shuffle as shuffle,
   split as split,
@@ -186,5 +196,6 @@ from jax._src.random import (
   truncated_normal as truncated_normal,
   uniform as uniform,
   unsafe_rbg_key as unsafe_rbg_key,
+  wald as wald,
   weibull_min as weibull_min,
 )

@@ -14,9 +14,10 @@
 # ==============================================================================
 """Utils for building a device mesh."""
 
+import collections
 import itertools
 import logging
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Optional, Sequence
 
 import jax
 import numpy as np
@@ -32,8 +33,8 @@ _TPU_V4 = 'TPU v4'
 #
 # The trick only works for certain topologies and mesh shapes. Trivial dims of
 # size 1 can be added to the shapes listed, and they are also supported.
-_TRANSPOSE_TRICKS: Dict[Tuple[int, ...],
-                        Dict[Tuple[int, ...], Tuple[int, ...]]] = {
+_TRANSPOSE_TRICKS: dict[tuple[int, ...],
+                        dict[tuple[int, ...], tuple[int, ...]]] = {
     (2, 2, 1): {
         (2, 2): (0, 1, 2),
     },
@@ -62,7 +63,7 @@ _TRAY_RING_ORDER = (0, 1, 2, 3, 6, 7, 4, 5)
 
 def _create_device_mesh_for_nd_torus(
     physical_mesh: np.ndarray, mesh_shape: Sequence[int],
-) -> Tuple[np.ndarray, List[Tuple[int, ...]]]:
+) -> tuple[np.ndarray, list[tuple[int, ...]]]:
   """Assigns logical parallelism axes to physical axes of an N-D torus network.
 
   Given logical parallelism axes with sizes in `mesh_shape` and devices in an
@@ -107,7 +108,7 @@ def _create_device_mesh_for_nd_torus(
   # Remaining physical axes to be assigned to logical axes.
   assignable_physical_mesh = list(physical_mesh.shape)
   # Map each logical axis to a subset of physical axes.
-  assignment: List[Tuple[int, ...]] = [() for _ in mesh_shape]
+  assignment: list[tuple[int, ...]] = [() for _ in mesh_shape]
 
   # Assign logical axes from highest network intensity to lowest.
   # `mesh_shape` is assumed to ordered by lowest network intensity first, so
@@ -127,7 +128,7 @@ def _create_device_mesh_for_nd_torus(
         # 4x8 or a single axis. If XLA 2D collectives support non-square plane
         # soon, we can continue to preferentially map to 2D plane in general,
         # otherwise, we should treat non-square 2D plane and 1D submesh equally.
-        if np.product(c_axes) == logical_axis_size:
+        if np.prod(c_axes) == logical_axis_size:
           assignment[logical_axis_index] = c_indices
           # Zero the assigned physical axes.
           assignable_physical_mesh = [
@@ -142,10 +143,16 @@ def _create_device_mesh_for_nd_torus(
       # If the num_axes for loop did not break, i.e. none of the candidates work
       # goto here with this while-else construct.
       if logical_axis_size > 1:
-        raise NotImplementedError(f'Failed to find assignment for '
-                                  f'logical_axis_index {logical_axis_index}')
+        raise NotImplementedError(
+            'Failed to find assignment for logical_axis_index'
+            f' {logical_axis_index} of size {logical_axis_size} with remaining'
+            f' assignable mesh {assignable_physical_mesh}. The size of each'
+            ' axis in your logical mesh must be equal to the product of'
+            ' some subset of the physical mesh axis sizes. E.g logical mesh (4,'
+            ' 16) is compatible with physical mesh 4x4x4 since 4=4 and 16=4x4.'
+        )
   # Flatten the assignment, e.g., [(), (2,), (0, 1)] -> (2, 0, 1).
-  transpose: List[int] = []
+  transpose: list[int] = []
   for x in assignment:
     for y in x:
       transpose.append(int(y))
@@ -174,20 +181,26 @@ def _get_physical_tpu_mesh(jax_devices: Sequence[Any]) -> np.ndarray:
       v2 and v3, global_z is instead cores_per_chip (i.e., 2).
   """
   device_kind = jax_devices[0].device_kind
-  def sort_key(device):
-    x, y, z = device.coords
-    core = device.core_on_chip
-    if device_kind in (_TPU_V2, _TPU_V3):
-      assert z == 0
-      return (x, y, core)
-    else:
-      if core != 0:
-        raise ValueError(
-            'Creating meshes for TPU >v3 requires one device per chip')
-      return (x, y, z)
-  sorted_devices = sorted(jax_devices, key=sort_key)
-  x, y, *_ = _bounds_from_last_device(sorted_devices[-1])
-  return np.array(sorted_devices).reshape((x, y, -1))
+  device_coords = [d.coords for d in jax_devices]
+  dims = tuple(d + 1 for d in max(device_coords))
+  assert len(dims) == 3, dims
+  if device_kind in (_TPU_V2, _TPU_V3):
+    cores_per_chip = max(d.core_on_chip for d in jax_devices) + 1
+    out = np.empty(dims[:2] + (cores_per_chip,), dtype=object)
+    for coords, d in zip(device_coords, jax_devices):
+      assert coords[2] == 0, d
+      out[coords[0], coords[1], d.core_on_chip] = d
+  else:
+    out = np.empty(dims, dtype=object)
+    for coords, d in zip(device_coords, jax_devices):
+      if d.core_on_chip != 0:
+        raise AssertionError(
+            'Creating meshes for TPU >v3 requires one device per chip.'
+            f'Got device id {d.core_on_chip} for a device of kind {device_kind}'
+            f': {d}'
+        )
+      out[coords[0], coords[1], coords[2]] = d
+  return out
 
 
 # jekbradbury's famous trick for creating contiguous submeshes (where available)
@@ -200,7 +213,7 @@ def _transpose_trick(physical_mesh: np.ndarray,
         f"create_device_mesh cannot create contiguous submeshes for "
         f"physical mesh topology {topology}")
 
-  mesh_shape_no_trivial_dims: Tuple[int, ...] = ()
+  mesh_shape_no_trivial_dims: tuple[int, ...] = ()
   for dim_size in mesh_shape:
     if dim_size != 1:
       mesh_shape_no_trivial_dims += (dim_size,)
@@ -219,7 +232,7 @@ def create_device_mesh(
     mesh_shape: Sequence[int],
     devices: Optional[Sequence[Any]] = None, *,
     contiguous_submeshes: bool = False) -> np.ndarray:
-  """Creates a performant device mesh for jax.experimental.maps.Mesh.
+  """Creates a performant device mesh for jax.sharding.Mesh.
 
   Args:
     mesh_shape: shape of logical mesh, ordered by increasing network-intensity
@@ -234,7 +247,7 @@ def create_device_mesh(
 
   Returns:
     A np.ndarray of JAX devices with mesh_shape as its shape that can be fed
-    into jax.experimental.maps.Mesh with good collective performance.
+    into jax.sharding.Mesh with good collective performance.
   """
   if devices is None:
     devices = jax.devices()
@@ -293,23 +306,20 @@ def create_hybrid_device_mesh(mesh_shape: Sequence[int],
 
   Returns:
     A np.ndarray of JAX devices with mesh_shape * dcn_mesh_shape as its shape
-    that can be fed into jax.experimental.maps.Mesh for hybrid parallelism.
+    that can be fed into jax.sharding.Mesh for hybrid parallelism.
   """
   if devices is None:
     devices = jax.devices()
   attr = 'process_index' if process_is_granule else 'slice_index'
   assert hasattr(devices[0], attr)
-  granule_id, granules = 0, []
-  while True:
-    granule = [dev for dev in devices if getattr(dev, attr) == granule_id]
-    if granule:
-      granules.append(granule)
-      granule_id += 1
-    else:
-      break
+  granule_dict = collections.defaultdict(list)
+  for dev in devices:
+    granule_dict[getattr(dev, attr)].append(dev)
+  granules = list(granule_dict[key] for key in sorted(granule_dict.keys()))
   if np.prod(dcn_mesh_shape) != len(granules):
     raise ValueError(
-        'Number of slices must equal the product of dcn_mesh_shape')
+        f'Number of slices {len(granules)} must equal the product of '
+        f'dcn_mesh_shape {dcn_mesh_shape}')
   per_granule_meshes = [create_device_mesh(mesh_shape, granule)
                         for granule in granules]
   # TODO(jekbradbury): handle non-uniform DCN topologies

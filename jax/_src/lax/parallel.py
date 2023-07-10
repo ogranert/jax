@@ -17,28 +17,31 @@ Parallelization primitives.
 
 from functools import partial
 import itertools
+import math
 import string
 from typing import Sequence, Union
-import warnings
 
 import numpy as np
 
 from jax import tree_util
-from jax.interpreters import ad
-from jax.interpreters import mlir
-from jax.interpreters import xla
-from jax.interpreters import pxla
-from jax.interpreters import batching
+
 from jax._src import core
 from jax._src import dtypes
+from jax._src import sharding_impls
+from jax._src import util
 from jax._src.core import ShapedArray, AxisName, raise_to_shaped
+from jax._src.interpreters import ad
+from jax._src.interpreters import batching
+from jax._src.interpreters import mlir
+from jax._src.interpreters import pxla
+from jax._src.interpreters import xla
 from jax._src.lax import lax
 from jax._src.lax import slicing
-from jax._src.numpy import lax_numpy
-import jax._src.util as util
-from jax._src.util import unzip2, prod, canonicalize_axis, safe_map, safe_zip, moveaxis
 from jax._src.lib.mlir import ir
-from jax._src.lib.mlir.dialects import hlo, use_stablehlo
+from jax._src.lib.mlir.dialects import hlo
+from jax._src.numpy import lax_numpy
+from jax._src.util import (
+    unzip2, canonicalize_axis, safe_map, safe_zip, moveaxis)
 
 unsafe_map, map = map, safe_map  # type: ignore
 
@@ -747,8 +750,10 @@ def _allreduce_lowering(prim, pos_fn, ctx, *args, axes, axis_index_groups):
       _replica_groups(ctx.module_context.axis_env, named_axes,
                       axis_index_groups))
   axis_context = ctx.module_context.axis_context
-  is_spmd = isinstance(axis_context,
-                       (mlir.SPMDAxisContext, mlir.ShardingContext))
+  is_spmd = isinstance(
+      axis_context,
+      (sharding_impls.SPMDAxisContext, sharding_impls.ShardingContext),
+  )
 
   def all_reduce(aval, x):
     if is_spmd:
@@ -826,7 +831,7 @@ def psum_bind(*args, axes, axis_index_groups):
       assert not pos_axes
       size = len(axis_index_groups[0])
     else:
-      size = prod([core.axis_frame(name).size for name in named_axes])  # type: ignore
+      size = math.prod([core.axis_frame(name).size for name in named_axes])  # type: ignore
     return tuple(lax._const(x, size) * pos_reduce(x) for x in args)
   return core.AxisPrimitive.bind(
       psum_p, *args, axes=axes, axis_index_groups=axis_index_groups)
@@ -877,7 +882,10 @@ def _ppermute_lowering(ctx, x, *, axis_name, perm):
   full_perm = full_perm.reshape((-1, 2))
 
   axis_context = ctx.module_context.axis_context
-  is_manual = isinstance(axis_context, mlir.SPMDAxisContext) and axis_context.manual_axes
+  is_manual = (
+      isinstance(axis_context, sharding_impls.SPMDAxisContext)
+      and axis_context.manual_axes
+  )
   if is_manual:
     channel = ctx.module_context.new_channel()
     other_args = dict(
@@ -951,16 +959,6 @@ def _index_in_group(axis_name, axis_index_groups):
   return lax.squeeze(
       slicing.dynamic_slice_in_dim(device_id_to_idx, cur_device_id, 1), [0])
 
-def _all_to_all_via_all_gather(x, *, axis_name, split_axis, concat_axis, axis_index_groups):
-  idx = _index_in_group(axis_name, axis_index_groups)
-  full = all_gather(x, axis_name, axis_index_groups=axis_index_groups)
-  axis_size = full.shape[0]
-  tile_size = x.shape[split_axis] // axis_size
-  tile_base_idx = idx * tile_size
-  sliced = slicing.dynamic_slice_in_dim(full, tile_base_idx, tile_size,
-                                        split_axis + 1)
-  return _foldaxis(concat_axis, _moveaxis(0, concat_axis, sliced))
-
 
 def _all_to_all_lowering(ctx, x, *,
                          split_axis, concat_axis, axis_name, axis_index_groups):
@@ -969,44 +967,29 @@ def _all_to_all_lowering(ctx, x, *,
                                    axis_index_groups)
   if len(replica_groups[0]) == 1:
     return [x]
-  elif ((ctx.module_context.platform == "tpu") or
-        ((ctx.module_context.platform in ("cuda", "rocm"))
-         and (split_axis == 0) and (concat_axis == 0))):
-    split_count = len(replica_groups[0])
-    if not all(split_count == len(g) for g in replica_groups):
-      raise ValueError('Replica groups must be equally sized')
-    is_spmd = isinstance(ctx.module_context.axis_context,
-                         (mlir.SPMDAxisContext, mlir.ShardingContext))
-    if is_spmd:
-      # We want to emit the all-gather with global device IDs and a unique
-      # channel ID, as otherwise it interprets the devices as replicas instead
-      # of partitions - and XLA is configured with only a single replica.
-      channel = ctx.module_context.new_channel()
-      other_args = dict(
-          channel_handle=hlo.ChannelHandle.get(channel,
-                                               mlir.DEVICE_TO_DEVICE_TYPE))
-    else:
-      other_args = {}
-    return hlo.AllToAllOp(
-        x if use_stablehlo else [x],
-        split_dimension=mlir.i64_attr(split_axis),
-        concat_dimension=mlir.i64_attr(concat_axis),
-        split_count=mlir.i64_attr(split_count),
-        replica_groups=_replica_groups_hlo(replica_groups),
-        **other_args).results
+  split_count = len(replica_groups[0])
+  if not all(split_count == len(g) for g in replica_groups):
+    raise ValueError('Replica groups must be equally sized')
+  is_spmd = isinstance(
+      ctx.module_context.axis_context,
+      (sharding_impls.SPMDAxisContext, sharding_impls.ShardingContext),
+  )
+  if is_spmd:
+    # We want to emit the all-gather with global device IDs and a unique
+    # channel ID, as otherwise it interprets the devices as replicas instead
+    # of partitions - and XLA is configured with only a single replica.
+    channel = ctx.module_context.new_channel()
+    channel_handle = hlo.ChannelHandle.get(channel, mlir.DEVICE_TO_DEVICE_TYPE)
+    other_args = dict(channel_handle=channel_handle)
   else:
-    warnings.warn(
-        "all_to_all (and pswapaxes) are only implemented properly for TPUs and GPUs (if "
-        "split_axis and concat_axis are both 0). All other backends emulate it using a "
-        "very slow and memory intensive algorithm, so expect significant slowdowns."
-    )
-    lowering = mlir.lower_fun(_all_to_all_via_all_gather,
-                              multiple_results=False)
-    return lowering(ctx, x,
-                    axis_name=axis_name,
-                    split_axis=split_axis,
-                    concat_axis=concat_axis,
-                    axis_index_groups=axis_index_groups)
+    other_args = {}
+  return hlo.AllToAllOp(
+      x,
+      split_dimension=mlir.i64_attr(split_axis),
+      concat_dimension=mlir.i64_attr(concat_axis),
+      split_count=mlir.i64_attr(split_count),
+      replica_groups=_replica_groups_hlo(replica_groups),
+      **other_args).results
 
 def _all_to_all_transpose_rule(cts, x, axis_name, split_axis, concat_axis, axis_index_groups):
   return (all_to_all(
@@ -1206,8 +1189,10 @@ def _all_gather_lowering(ctx, x, *, all_gather_dimension, axis_name,
   x_aval, = ctx.avals_in
   out_aval, = ctx.avals_out
   axis_context = ctx.module_context.axis_context
-  is_spmd = isinstance(axis_context,
-                       (mlir.SPMDAxisContext, mlir.ShardingContext))
+  is_spmd = isinstance(
+      axis_context,
+      (sharding_impls.SPMDAxisContext, sharding_impls.ShardingContext),
+  )
   if (ctx.module_context.platform == 'tpu' or
       ctx.module_context.platform in ('cuda', 'rocm')
       and all_gather_dimension == 0):
@@ -1351,8 +1336,10 @@ def _reduce_scatter_lowering(prim, reducer, ctx, x,
     scatter_out_shape = list(x_aval.shape)
     scatter_out_shape[scatter_dimension] //= axis_size
     axis_context = ctx.module_context.axis_context
-    is_spmd = isinstance(axis_context,
-                        (mlir.SPMDAxisContext, mlir.ShardingContext))
+    is_spmd = isinstance(
+        axis_context,
+        (sharding_impls.SPMDAxisContext, sharding_impls.ShardingContext),
+    )
     if is_spmd:
       # We want to emit the all-gather with global device IDs and a unique
       # channel ID, as otherwise it interprets the devices as replicas instead
@@ -1561,13 +1548,18 @@ def _build_axis_index_lowering_hlo(ctx, axis_name, axis_env):
           '`axis_index` translation rule does not support multiple axis names.')
     axis_name, = axis_name
   axis_pos = list(axis_env.names).index(axis_name)
-  nreplicas = axis_env.nreps // prod(axis_env.sizes)
-  div = mlir.ir_constant(np.array(nreplicas * prod(axis_env.sizes[axis_pos+1:]),
-                                  dtype=np.uint32))
+  nreplicas = axis_env.nreps // math.prod(axis_env.sizes)
+  div = mlir.ir_constant(
+      np.array(
+          nreplicas * math.prod(axis_env.sizes[axis_pos + 1 :]), dtype=np.uint32
+      )
+  )
   mod = mlir.ir_constant(np.array(axis_env.sizes[axis_pos], dtype=np.uint32))
   axis_context = ctx.module_context.axis_context
-  is_spmd = isinstance(axis_context,
-                       (mlir.SPMDAxisContext, mlir.ShardingContext))
+  is_spmd = isinstance(
+      axis_context,
+      (sharding_impls.SPMDAxisContext, sharding_impls.ShardingContext),
+  )
   if is_spmd:
     device_id = hlo.PartitionIdOp()
   else:
@@ -1686,15 +1678,15 @@ mlir.register_lowering(
     pdot_p,
     mlir.lower_fun(_pdot_lowering, multiple_results=False))
 
-def _pdot_transpose_lhs(g, y, *, axis_name, pos_contract, pos_batch, precision):
+def _pdot_transpose_lhs(g, x, y, *, axis_name, pos_contract, pos_batch, precision):
   # TODO: avals with names, call pbroadcast with axis_name
   return lax._dot_general_transpose_lhs(
-      g, y, dimension_numbers=[pos_contract, pos_batch], precision=precision,
+      g, x, y, dimension_numbers=[pos_contract, pos_batch], precision=precision,
       preferred_element_type=None)
-def _pdot_transpose_rhs(g, x, *, axis_name, pos_contract, pos_batch, precision):
+def _pdot_transpose_rhs(g, x, y, *, axis_name, pos_contract, pos_batch, precision):
   # TODO: avals with names, call pbroadcast with axis_name
   return lax._dot_general_transpose_rhs(
-      g, x, dimension_numbers=[pos_contract, pos_batch], precision=precision,
+      g, x, y, dimension_numbers=[pos_contract, pos_batch], precision=precision,
       preferred_element_type=None)
 ad.defbilinear(pdot_p, _pdot_transpose_lhs, _pdot_transpose_rhs)
 

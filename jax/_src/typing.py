@@ -29,7 +29,10 @@ from __future__ import annotations
 from typing import Any, Protocol, Sequence, Union
 import numpy as np
 
-from jax._src.basearray import Array
+from jax._src.basearray import (
+    Array as Array,
+    ArrayLike as ArrayLike,
+)
 
 DType = np.dtype
 
@@ -54,6 +57,12 @@ DTypeLike = Union[Any, str, np.dtype, SupportsDType]
 DimSize = Union[int, Any]  # extensible
 Shape = Sequence[DimSize]
 
+class DuckTypedArray(Protocol):
+  @property
+  def dtype(self) -> DType: ...
+  @property
+  def shape(self) -> Shape: ...
+
 # Array is a type annotation for standard JAX arrays and tracers produced by
 # core functions in jax.lax and jax.numpy; it is not meant to include
 # future non-standard array types like KeyArray and BInt. It is imported above.
@@ -62,9 +71,3 @@ Shape = Sequence[DimSize]
 # JAX array (i.e. not including future non-standard array types like KeyArray and BInt).
 # It's different than np.typing.ArrayLike in that it doesn't accept arbitrary sequences,
 # nor does it accept string data.
-ArrayLike = Union[
-  Array,  # JAX array type
-  np.ndarray,  # NumPy array type
-  np.bool_, np.number,  # NumPy scalar types
-  bool, int, float, complex,  # Python scalar types
-]

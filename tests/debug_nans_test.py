@@ -25,7 +25,7 @@ from jax._src import test_util as jtu
 from jax import numpy as jnp
 from jax.experimental import pjit, maps
 
-from jax.config import config
+from jax import config
 config.parse_flags_with_absl()
 
 
@@ -96,7 +96,7 @@ class DebugNaNsTest(jtu.JaxTestCase):
       f(1)
 
   def testPmap(self):
-    pmap_funcs = [api._python_pmap, api._cpp_pmap]
+    pmap_funcs = [api._cpp_pmap]
 
     for pmap in pmap_funcs:
       f = pmap(lambda x: 0. / x)
@@ -147,10 +147,8 @@ class DebugNaNsTest(jtu.JaxTestCase):
     if jax.device_count() < 2:
       raise SkipTest("test requires >=2 devices")
 
-    p = pjit.PartitionSpec('x')
-    f = pjit.pjit(lambda x: 0. / x,
-                  in_axis_resources=p,
-                  out_axis_resources=p)
+    p = jax.sharding.PartitionSpec('x')
+    f = pjit.pjit(lambda x: 0. / x, in_shardings=p, out_shardings=p)
 
     with jax.sharding.Mesh(np.array(jax.local_devices()[:2]), ('x',)):
       with self.assertRaises(FloatingPointError):
@@ -175,10 +173,10 @@ class DebugNaNsTest(jtu.JaxTestCase):
     if jax.device_count() < 2:
       raise SkipTest("test requires >=2 devices")
 
-    p = pjit.PartitionSpec('x')
+    p = jax.sharding.PartitionSpec('x')
     f = pjit.pjit(lambda x: 0. / x,
-                  in_axis_resources=p,
-                  out_axis_resources=p,
+                  in_shardings=p,
+                  out_shardings=p,
                   donate_argnums=(0,))
 
     with jax.sharding.Mesh(np.array(jax.local_devices()[:2]), ('x',)):
@@ -186,7 +184,19 @@ class DebugNaNsTest(jtu.JaxTestCase):
         ans = f(jnp.array([0., 1.]))
         ans.block_until_ready()
 
-  # TODO(skye): add parallel inf tests, ideally by factoring out test logic
+  def testDebugNansZeroDiv(self):
+    inp = jnp.zeros(())
+    def f(x, y):
+      return x / y
+
+    with self.assertRaisesRegex(
+        FloatingPointError, r"invalid value \(nan\) encountered in jit\(div\)"):
+      f(inp, inp)
+
+    with self.assertRaisesRegex(
+        FloatingPointError, r"invalid value \(nan\) encountered in jit\(div\)"):
+      jax.jit(f)(inp, inp)
+
 
 class DebugInfsTest(jtu.JaxTestCase):
 

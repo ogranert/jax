@@ -16,6 +16,7 @@
 import collections
 from functools import partial
 import itertools
+import math
 from unittest import SkipTest
 
 from absl.testing import absltest
@@ -28,9 +29,8 @@ from jax import dtypes
 from jax import lax
 from jax._src import test_util as jtu
 from jax.test_util import check_grads
-from jax._src.util import prod
 
-from jax.config import config
+from jax import config
 config.parse_flags_with_absl()
 FLAGS = config.FLAGS
 
@@ -131,7 +131,7 @@ LAX_GRAD_OPS = [
     grad_test_spec(lax.rsqrt, nargs=1, order=2, rng_factory=jtu.rand_positive,
                    dtypes=grad_float_dtypes),
     grad_test_spec(lax.rsqrt, nargs=1, order=2, rng_factory=jtu.rand_default,
-                   dtypes=grad_complex_dtypes),
+                   dtypes=grad_complex_dtypes, tol={np.float64: 2e-3}),
     grad_test_spec(lax.cbrt, nargs=1, order=2, rng_factory=jtu.rand_default,
                    dtypes=grad_float_dtypes, tol={np.float64: 5e-3}),
     grad_test_spec(lax.logistic, nargs=1, order=2,
@@ -423,6 +423,14 @@ class LaxAutodiffTest(jtu.JaxTestCase):
     gresult = lax.zeros_like_array(result)
     s = str(jax.make_jaxpr(pullback)(gresult))
     assert "Precision.HIGHEST" in s
+
+  def testDotPreferredElementType(self):
+    # https://github.com/google/jax/issues/10818
+    x = jax.numpy.ones((), jax.numpy.float16)
+    def f(x):
+      return jax.lax.dot_general(x, x, (((), ()), ((), ())),
+                                 preferred_element_type=jax.numpy.float32)
+    jax.jacrev(f)(x)  # don't crash!
 
   @jtu.sample_product(
     shape=[(), (2, 3)],
@@ -832,7 +840,7 @@ class LaxAutodiffTest(jtu.JaxTestCase):
     # too, since we don't guarantee the same ordering of values with equal keys.
     # To avoid that case, we generate unique keys (globally in the key array).
     def args_maker():
-      flat_keys = np.arange(prod(shape), dtype=key_dtype)
+      flat_keys = np.arange(math.prod(shape), dtype=key_dtype)
       keys = self.rng().permutation(flat_keys).reshape(shape)
       values = rng(shape, val_dtype)
       return keys, values
@@ -847,7 +855,7 @@ class LaxAutodiffTest(jtu.JaxTestCase):
     k=[1, 3],
   )
   def testTopKGrad(self, shape, dtype, k):
-    flat_values = np.arange(prod(shape), dtype=dtype)
+    flat_values = np.arange(math.prod(shape), dtype=dtype)
     values = self.rng().permutation(flat_values).reshape(shape)
     fun = lambda vs: lax.top_k(vs, k=k)[0]
     check_grads(fun, (values,), 2, ["fwd", "rev"], eps=1e-2)

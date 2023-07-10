@@ -18,17 +18,17 @@ from functools import partial
 import operator
 import warnings
 import numpy as np
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
 import jax
-from jax import custom_jvp
-from jax._src import dtypes
-from jax import lax
-from jax import core
-from jax.core import AxisName
-from jax._src import util
-from jax._src.ops.special import logsumexp as _logsumexp
 import jax.numpy as jnp
+from jax import custom_jvp
+from jax import lax
+from jax._src import core
+from jax._src import dtypes
+from jax._src import util
+from jax._src.core import AxisName
+from jax._src.ops.special import logsumexp as _logsumexp
 
 Array = Any
 
@@ -293,7 +293,7 @@ logsumexp = _logsumexp
 
 @partial(jax.jit, static_argnames=("axis",))
 def log_softmax(x: Array,
-                axis: Optional[Union[int, Tuple[int, ...]]] = -1,
+                axis: Optional[Union[int, tuple[int, ...]]] = -1,
                 where: Optional[Array] = None,
                 initial: Optional[Array] = None) -> Array:
   r"""Log-Softmax function.
@@ -302,7 +302,7 @@ def log_softmax(x: Array,
   elements to the range :math:`[-\infty, 0)`.
 
   .. math ::
-    \mathrm{log\_softmax}(x) = \log \left( \frac{\exp(x_i)}{\sum_j \exp(x_j)}
+    \mathrm{log\_softmax}(x)_i = \log \left( \frac{\exp(x_i)}{\sum_j \exp(x_j)}
     \right)
 
   Args:
@@ -317,13 +317,16 @@ def log_softmax(x: Array,
   shifted = x - lax.stop_gradient(x_max)
   shifted_logsumexp = jnp.log(
       jnp.sum(jnp.exp(shifted), axis, where=where, keepdims=True))
-  return shifted - shifted_logsumexp
+  result = shifted - shifted_logsumexp
+  if where is not None:
+    return jnp.where(where, result, -jnp.inf)
+  return result
 
 
 # TODO(phawkins): this jit was found to change numerics in a test. Debug this.
 #@partial(jax.jit, static_argnames=("axis",))
 def softmax(x: Array,
-            axis: Optional[Union[int, Tuple[int, ...]]] = -1,
+            axis: Optional[Union[int, tuple[int, ...]]] = -1,
             where: Optional[Array] = None,
             initial: Optional[Array] = None) -> Array:
   r"""Softmax function.
@@ -343,13 +346,43 @@ def softmax(x: Array,
     initial: The minimum value used to shift the input array. Must be present
       when :code:`where` is not None.
   """
+  if jax.config.jax_softmax_custom_jvp:
+    return _softmax(x, axis, where, initial)
+  else:
+    return _softmax_deprecated(x, axis, where, initial)
+
+# TODO(mattjj): replace softmax with _softmax when deprecation flag is removed
+@partial(jax.custom_jvp, nondiff_argnums=(1,))
+def _softmax(
+    x,
+    axis: Optional[Union[int, tuple[int, ...]]] = -1,
+    where: Optional[Array] = None,
+    initial: Optional[Array] = None) -> Array:
+  x_max = jnp.max(x, axis, where=where, initial=initial, keepdims=True)
+  unnormalized = jnp.exp(x - x_max)
+  result = unnormalized / jnp.sum(unnormalized, axis, where=where, keepdims=True)
+  if where is not None:
+    result = jnp.where(where, result, 0)
+  return result
+
+@_softmax.defjvp
+def _softmax_jvp(axis, primals, tangents):
+  (x, where, initial), (x_dot, _, _) = primals, tangents
+  y = _softmax(x, axis, where, initial)
+  return y, y * (x_dot - (y * x_dot).sum(axis, where=where, keepdims=True))
+
+def _softmax_deprecated(x, axis, where, initial):
   x_max = jnp.max(x, axis, where=where, initial=initial, keepdims=True)
   unnormalized = jnp.exp(x - lax.stop_gradient(x_max))
-  return unnormalized / jnp.sum(unnormalized, axis, where=where, keepdims=True)
+  result = unnormalized / jnp.sum(unnormalized, axis, where=where, keepdims=True)
+  if where is not None:
+    result = jnp.where(where, result, 0)
+  return result
+
 
 @partial(jax.jit, static_argnames=("axis",))
 def standardize(x: Array,
-              axis: Optional[Union[int, Tuple[int, ...]]] = -1,
+              axis: Optional[Union[int, tuple[int, ...]]] = -1,
               mean: Optional[Array] = None,
               variance: Optional[Array] = None,
               epsilon: Array = 1e-5,
@@ -367,7 +400,7 @@ def standardize(x: Array,
   return (x - mean) * lax.rsqrt(variance + epsilon)
 
 def normalize(x: Array,
-              axis: Optional[Union[int, Tuple[int, ...]]] = -1,
+              axis: Optional[Union[int, tuple[int, ...]]] = -1,
               mean: Optional[Array] = None,
               variance: Optional[Array] = None,
               epsilon: Array = 1e-5,
@@ -379,8 +412,8 @@ def normalize(x: Array,
 @partial(jax.jit, static_argnames=("num_classes", "dtype", "axis"))
 def _one_hot(x: Array, num_classes: int, *,
              dtype: Any, axis: Union[int, AxisName]) -> Array:
-  num_classes = core.concrete_or_error(
-      int, num_classes,
+  num_classes = core.concrete_dim_or_error(
+      num_classes,
       "The error arose in jax.nn.one_hot argument `num_classes`.")
   dtype = dtypes.canonicalize_dtype(dtype)
   x = jnp.asarray(x)
@@ -402,7 +435,7 @@ def _one_hot(x: Array, num_classes: int, *,
 
 def one_hot(x: Array, num_classes: int, *,
             dtype: Any = jnp.float_, axis: Union[int, AxisName] = -1) -> Array:
-  """One-hot encodes the given indicies.
+  """One-hot encodes the given indices.
 
   Each index in the input ``x`` is encoded as a vector of zeros of length
   ``num_classes`` with the element at ``index`` set to one::
@@ -412,7 +445,7 @@ def one_hot(x: Array, num_classes: int, *,
            [0., 1., 0.],
            [0., 0., 1.]], dtype=float32)
 
-  Indicies outside the range [0, num_classes) will be encoded as zeros::
+  Indices outside the range [0, num_classes) will be encoded as zeros::
 
     >>> jax.nn.one_hot(jnp.array([-1, 3]), 3)
     Array([[0., 0., 0.],
@@ -425,12 +458,13 @@ def one_hot(x: Array, num_classes: int, *,
     axis: the axis or axes along which the function should be
       computed.
   """
-  num_classes = core.concrete_or_error(
-      int, num_classes,
+  num_classes = core.concrete_dim_or_error(
+      num_classes,
       "The error arose in jax.nn.one_hot argument `num_classes`.")
   return _one_hot(x, num_classes, dtype=dtype, axis=axis)
 
 
+@jax.custom_jvp
 @jax.jit
 def relu6(x: Array) -> Array:
   r"""Rectified Linear Unit 6 activation function.
@@ -440,10 +474,23 @@ def relu6(x: Array) -> Array:
   .. math::
     \mathrm{relu6}(x) = \min(\max(x, 0), 6)
 
+  except under differentiation, we take:
+
+  .. math::
+    \nabla \mathrm{relu}(0) = 0
+
+  and
+
+  .. math::
+    \nabla \mathrm{relu}(6) = 0
+
+
   Args:
     x : input array
   """
   return jnp.minimum(jnp.maximum(x, 0), 6.)
+relu6.defjvps(lambda g, ans, x:
+              lax.select((x > 0) & (x < 6), g, lax.full_like(g, 0)))
 
 @jax.jit
 def hard_sigmoid(x: Array) -> Array:

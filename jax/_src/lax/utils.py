@@ -16,23 +16,20 @@
 # avoid cyclic dependencies. Definitions that are used at import time by
 # multiple modules can go here.
 
-import builtins
 from functools import partial
 import operator
 from typing import Callable
 
-from jax.interpreters import xla
 from jax._src import core
+from jax._src import dispatch
 from jax._src import dtypes
+from jax._src.interpreters import xla
 from jax._src.util import safe_zip
 from jax._src.lib import xla_client
 
+import numpy as np
+
 xops = xla_client.ops
-
-_max = builtins.max
-
-# ### primitives
-
 
 _input_dtype: Callable = lambda *args, **_: dtypes.canonicalize_dtype(args[0].dtype, allow_opaque_dtype=True)
 
@@ -44,7 +41,7 @@ def standard_primitive(shape_rule, dtype_rule, name, translation_rule=None,
   weak_type_rule = weak_type_rule or _standard_weak_type_rule
   named_shape_rule = named_shape_rule or standard_named_shape_rule
   prim = core.Primitive(name)
-  prim.def_impl(partial(xla.apply_primitive, prim))
+  prim.def_impl(partial(dispatch.apply_primitive, prim))
   prim.def_abstract_eval(
       partial(standard_abstract_eval, prim, shape_rule, dtype_rule,
               weak_type_rule, named_shape_rule))
@@ -57,8 +54,8 @@ def standard_abstract_eval(prim, shape_rule, dtype_rule, weak_type_rule,
   assert all(isinstance(aval, core.UnshapedArray) for aval in avals), avals
   assert not prim.multiple_results
   weak_type = weak_type_rule(*avals, **kwargs)
-  least_specialized = _max(map(type, avals),
-                           key=operator.attrgetter('array_abstraction_level'))
+  least_specialized = max(map(type, avals),
+                          key=operator.attrgetter('array_abstraction_level'))
   if least_specialized is core.ConcreteArray:
     out = prim.impl(*[x.val for x in avals], **kwargs)
     return core.ConcreteArray(out.dtype, out, weak_type=weak_type)
@@ -81,8 +78,8 @@ def standard_multi_result_abstract_eval(
     named_shape_rule, *avals, **kwargs):
   assert prim.multiple_results
   assert all(isinstance(aval, core.UnshapedArray) for aval in avals), avals
-  least_specialized = _max(map(type, avals),
-                           key=operator.attrgetter('array_abstraction_level'))
+  least_specialized = max(map(type, avals),
+                          key=operator.attrgetter('array_abstraction_level'))
   weak_types = weak_type_rule(*avals, **kwargs)
   if least_specialized is core.ConcreteArray:
     out_vals = prim.impl(*[x.val for x in avals], **kwargs)
@@ -115,3 +112,14 @@ def standard_named_shape_rule(*avals, **kwargs):
 
 def _standard_weak_type_rule(*avals, **kwargs):
   return all(aval.weak_type for aval in avals)
+
+def dtype_to_string(dtype):
+  try:
+    return str(np.dtype(dtype).name)
+  except TypeError:
+    pass
+  try:
+    return dtype.name
+  except AttributeError:
+    pass
+  return str(dtype)

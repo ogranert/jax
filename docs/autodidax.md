@@ -460,6 +460,8 @@ that now we can add some real transformations.
 First, a few helper functions:
 
 ```{code-cell}
+import builtins
+
 def zeros_like(val):
   aval = get_aval(val)
   return np.zeros(aval.shape, aval.dtype)
@@ -471,17 +473,15 @@ def unzip2(pairs):
     lst2.append(x2)
   return lst1, lst2
 
-map_ = map
 def map(f, *xs):
-  return list(map_(f, *xs))
+  return list(builtins.map(f, *xs))
 
-zip_ = zip
 def zip(*args):
   fst, *rest = args = map(list, args)
   n = len(fst)
   for arg in rest:
     assert len(arg) == n
-  return list(zip_(*args))
+  return list(builtins.zip(*args))
 ```
 
 The `Tracer` for forward-mode autodiff carries a primal-tangent pair. The
@@ -1551,7 +1551,7 @@ class IDHashable:
 Next, we'll define the evaluation rule for `xla_call`:
 
 ```{code-cell}
-from jax._src.lib import xla_bridge as xb
+from jax._src import xla_bridge as xb
 from jax._src.lib import xla_client as xc
 xe = xc._xla
 xops = xc._xla.ops
@@ -1575,7 +1575,8 @@ def xla_callable(hashable_jaxpr: IDHashable,
   xla_params = _xla_params(c, in_avals)
   outs = jaxpr_subcomp(c, jaxpr, xla_consts + xla_params)
   out = xops.Tuple(c, outs)
-  compiled = xb.get_backend(None).compile(c.build(out))
+  compiled = xb.get_backend(None).compile(
+    xc._xla.mlir.xla_computation_to_mlir_module(c.build(out)))
   return partial(execute_compiled, compiled, [v.aval for v in jaxpr.outs])
 
 def _xla_consts(c: xe.XlaBuilder, consts: List[Any]) -> List[xe.XlaOp]:
@@ -1597,7 +1598,7 @@ compiled program:
 
 ```{code-cell}
 def jaxpr_subcomp(c: xe.XlaBuilder, jaxpr: Jaxpr, args: List[xe.XlaOp]
-                  ) -> xe.XlaOp:
+                  ) -> List[xe.XlaOp]:
   env: Dict[Var, xe.XlaOp] = {}
 
   def read(x: Atom) -> xe.XlaOp:

@@ -143,7 +143,7 @@ reverse-mode vector-Jacobian products and
 forward-mode Jacobian-vector products. The two can be composed arbitrarily with
 one another, and with other JAX transformations. Here's one way to compose those
 to make a function that efficiently computes [full Hessian
-matrices](https://jax.readthedocs.io/en/latest/jax.html#jax.hessian):
+matrices](https://jax.readthedocs.io/en/latest/_autosummary/jax.hessian.html#jax.hessian):
 
 ```python
 from jax import jit, jacfwd, jacrev
@@ -391,16 +391,13 @@ installed as the `jaxlib` package. Use the following instructions to install a
 binary package with `pip` or `conda`, or to [build JAX from
 source](https://jax.readthedocs.io/en/latest/developer.html#building-from-source).
 
-We support installing or building `jaxlib` on Linux (Ubuntu 16.04 or later) and
-macOS (10.12 or later) platforms.
+We support installing or building `jaxlib` on Linux (Ubuntu 20.04 or later) and
+macOS (10.12 or later) platforms. There is also *experimental* native Windows
+support.
 
 Windows users can use JAX on CPU and GPU via the [Windows Subsystem for
-Linux](https://docs.microsoft.com/en-us/windows/wsl/about). In addition, there
-is some initial community-driven native Windows support, but since it is still
-somewhat immature, there are no official binary releases and it must be [built
-from source for Windows](https://jax.readthedocs.io/en/latest/developer.html#additional-notes-for-building-jaxlib-from-source-on-windows).
-For an unofficial discussion of native Windows builds, see also the [Issue #5795
-thread](https://github.com/google/jax/issues/5795).
+Linux](https://docs.microsoft.com/en-us/windows/wsl/about), or alternatively
+they can use the *experimental* native Windows CPU-only support.
 
 ### pip installation: CPU
 
@@ -413,70 +410,98 @@ pip install --upgrade "jax[cpu]"
 ```
 
 On Linux, it is often necessary to first update `pip` to a version that supports
-`manylinux2014` wheels. Also note that for Linux, we currently release wheels for `x86_64` architectures only, other architectures require building from source. Trying to pip install with other Linux architectures may lead to `jaxlib` not being installed alongside `jax`, although `jax` may successfully install (but fail at runtime). 
-**These `pip` installations do not work with Windows, and may fail silently; see
-[above](#installation).**
+`manylinux2014` wheels. We currently release `jaxlib` wheels for the following
+operating systems and architectures:
+* Linux, x86-64
+* Mac, Intel
+* Mac, ARM
+* Windows, x86-64 (*experimental*)
 
-### pip installation: GPU (CUDA)
+Other operating systems and architectures require building from source. Trying
+to pip install on other operating systems and architectures may lead to `jaxlib`
+not being installed alongside `jax`, although `jax` may successfully install
+(but fail at runtime).
 
-If you want to install JAX with both CPU and NVidia GPU support, you must first
-install [CUDA](https://developer.nvidia.com/cuda-downloads) and
-[CuDNN](https://developer.nvidia.com/CUDNN),
-if they have not already been installed. Unlike some other popular deep
-learning systems, JAX does not bundle CUDA or CuDNN as part of the `pip`
-package.
+### pip installation: GPU (CUDA, installed via pip, easier)
 
-JAX provides pre-built CUDA-compatible wheels for **Linux only**,
-with CUDA 11.4 or newer, and CuDNN 8.2 or newer. Note these existing wheels are currently for `x86_64` architectures only. Other combinations of
-operating system, CUDA, and CuDNN are possible, but require [building from
-source](https://jax.readthedocs.io/en/latest/developer.html#building-from-source).
+There are two ways to install JAX with NVIDIA GPU support: using CUDA and CUDNN
+installed from pip wheels, and using a self-installed CUDA/CUDNN. We recommend
+installing CUDA and CUDNN using the pip wheels, since it is much easier!
 
-* CUDA 11.4 or newer is *required*.
-  * Your CUDA installation must be new enough to support your GPU. If you have
-    an Ada Lovelace (e.g., RTX 4080) or Hopper (e.g., H100) GPU,
-    you must use CUDA 11.8 or newer.
-* The supported cuDNN versions for the prebuilt wheels are:
-  * cuDNN 8.6 or newer. We recommend using the cuDNN 8.6 wheel if your cuDNN
-    installation is new enough, since it supports additional functionality.
-  * cuDNN 8.2 or newer.
-* You *must* use an NVidia driver version that is at least as new as your
-  [CUDA toolkit's corresponding driver version](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html#cuda-major-component-versions__table-cuda-toolkit-driver-versions).
-  For example, if you have CUDA 11.4 update 4 installed, you must use NVidia
-  driver 470.82.01 or newer if on Linux. This is a strict requirement that
-  exists because JAX relies on JIT-compiling code; older drivers may lead to
-  failures.
-  * If you need to use an newer CUDA toolkit with an older driver, for example
-    on a cluster where you cannot update the NVidia driver easily, you may be
-    able to use the
-    [CUDA forward compatibility packages](https://docs.nvidia.com/deploy/cuda-compatibility/)
-    that NVidia provides for this purpose.
+JAX supports NVIDIA GPUs that have SM version 5.2 (Maxwell) or newer.
+Note that Kepler-series GPUs are no longer supported by JAX since
+NVIDIA has dropped support for Kepler GPUs in its software.
 
+You must first install the NVIDIA driver. We
+recommend installing the newest driver available from NVIDIA, but the driver
+must be version >= 525.60.13 for CUDA 12 and >= 450.80.02 for CUDA 11 on Linux.
+If you need to use an newer CUDA toolkit with an older driver, for example
+on a cluster where you cannot update the NVIDIA driver easily, you may be
+able to use the
+[CUDA forward compatibility packages](https://docs.nvidia.com/deploy/cuda-compatibility/)
+that NVIDIA provides for this purpose.
 
-Next, run
 
 ```bash
 pip install --upgrade pip
+
+# CUDA 12 installation
+# Note: wheels only available on linux.
+pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+
+# CUDA 11 installation
+# Note: wheels only available on linux.
+pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+```
+
+### pip installation: GPU (CUDA, installed locally, harder)
+
+If you prefer to use a preinstalled copy of CUDA, you must first
+install [CUDA](https://developer.nvidia.com/cuda-downloads) and
+[CuDNN](https://developer.nvidia.com/CUDNN).
+
+JAX provides pre-built CUDA-compatible wheels for **Linux x86_64 only**. Other
+combinations of operating system and architecture are possible, but require
+[building from source](https://jax.readthedocs.io/en/latest/developer.html#building-from-source).
+
+You should use an NVIDIA driver version that is at least as new as your
+[CUDA toolkit's corresponding driver version](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html#cuda-major-component-versions__table-cuda-toolkit-driver-versions).
+If you need to use an newer CUDA toolkit with an older driver, for example
+on a cluster where you cannot update the NVIDIA driver easily, you may be
+able to use the
+[CUDA forward compatibility packages](https://docs.nvidia.com/deploy/cuda-compatibility/)
+that NVIDIA provides for this purpose.
+
+JAX currently ships two CUDA wheel variants:
+* CUDA 12.0 and CuDNN 8.9.
+* CUDA 11.8 and CuDNN 8.6.
+
+You may use a JAX wheel provided the major version of your CUDA and CuDNN
+installation matches, and the minor version is at least as new as the version
+JAX expects. For example, you would be able to use the CUDA 12.0 wheel with
+CUDA 12.1 and CuDNN 8.9.
+
+Your CUDA installation must also be new enough to support your GPU. If you have
+an Ada Lovelace (e.g., RTX 4080) or Hopper (e.g., H100) GPU,
+you must use CUDA 11.8 or newer.
+
+
+To install, run
+
+```bash
+pip install --upgrade pip
+
+# Installs the wheel compatible with CUDA 12 and cuDNN 8.9 or newer.
+# Note: wheels only available on linux.
+pip install --upgrade "jax[cuda12_local]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+
 # Installs the wheel compatible with CUDA 11 and cuDNN 8.6 or newer.
 # Note: wheels only available on linux.
-pip install --upgrade "jax[cuda]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+pip install --upgrade "jax[cuda11_local]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 ```
 
 **These `pip` installations do not work with Windows, and may fail silently; see
 [above](#installation).**
-
-The jaxlib version must correspond to the version of the existing CUDA
-installation you want to use. You can specify a particular CUDA and CuDNN
-version for jaxlib explicitly:
-
-```bash
-pip install --upgrade pip
-
-# Installs the wheel compatible with Cuda >= 11.8 and cudnn >= 8.6
-pip install "jax[cuda11_cudnn86]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-
-# Installs the wheel compatible with Cuda >= 11.4 and cudnn >= 8.2
-pip install "jax[cuda11_cudnn82]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-```
 
 You can find your CUDA version with the command:
 
@@ -497,23 +522,33 @@ Please let us know on [the issue tracker](https://github.com/google/jax/issues)
 if you run into any errors or problems with the prebuilt wheels.
 
 ### pip installation: Google Cloud TPU
-JAX also provides pre-built wheels for
+
+JAX provides pre-built wheels for
 [Google Cloud TPU](https://cloud.google.com/tpu/docs/users-guide-tpu-vm).
 To install JAX along with appropriate versions of `jaxlib` and `libtpu`, you can run
 the following in your cloud TPU VM:
 ```bash
-pip install --upgrade pip
-pip install "jax[tpu]>=0.2.16" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 ```
 
-### pip installation: Colab TPU
-Colab TPU runtimes come with JAX pre-installed, but before importing JAX you must run the following code to initialize the TPU:
-```python
-import jax.tools.colab_tpu
-jax.tools.colab_tpu.setup_tpu()
-```
-Colab TPU runtimes use an older TPU architecture than Cloud TPU VMs, so installing `jax[tpu]` should be avoided on Colab.
-If for any reason you would like to update the jax & jaxlib libraries on a Colab TPU runtime, follow the CPU instructions above (i.e. install `jax[cpu]`).
+For interactive notebook users: Colab TPUs no longer support JAX as of
+JAX version 0.4. However, for an interactive TPU notebook in the cloud, you can
+use [Kaggle TPU notebooks](https://www.kaggle.com/docs/tpu), which fully
+support JAX.
+
+### pip installation: Apple GPUs
+
+Apple provides an experimental Metal plugin for Apple GPU hardware. For details,
+see
+[Apple's JAX on Metal documentation](https://developer.apple.com/metal/jax/).
+
+There are several caveats with the Metal plugin:
+* the Metal plugin is new and experimental and has a number of
+  [known issues](https://github.com/google/jax/issues?q=is%3Aissue+is%3Aopen+label%3A%22Apple+GPU+%28Metal%29+plugin%22).
+  Please report any issues on the JAX issue tracker.
+* the Metal plugin currently requires very specific versions of `jax` and
+  `jaxlib`. This restriction will be relaxed over time as the plugin API
+  matures.
 
 ### Conda installation
 
@@ -524,16 +559,16 @@ simply run
 conda install jax -c conda-forge
 ```
 
-To install on a machine with an NVidia GPU, run
+To install on a machine with an NVIDIA GPU, run
 ```bash
-conda install jax cuda-nvcc -c conda-forge -c nvidia
+conda install jaxlib=*=*cuda* jax cuda-nvcc -c conda-forge -c nvidia
 ```
 
 Note the `cudatoolkit` distributed by `conda-forge` is missing `ptxas`, which
 JAX requires. You must therefore either install the `cuda-nvcc` package from
 the `nvidia` channel, or install CUDA on your machine separately so that `ptxas`
 is in your path. The channel order above is important (`conda-forge` before
-`nvidia`). We are working on simplifying this.
+`nvidia`).
 
 If you would like to override which release of CUDA is used by JAX, or to
 install the CUDA build on a machine without GPUs, follow the instructions in the

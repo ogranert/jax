@@ -14,20 +14,24 @@ List of Available Functions
 
 .. autosummary::
   :toctree: _autosummary
-      
+
     PRNGKey
     ball
     bernoulli
     beta
+    bits
     categorical
     cauchy
+    chisquare
     choice
     dirichlet
     double_sided_maxwell
     exponential
+    f
     fold_in
     gamma
     generalized_normal
+    geometric
     gumbel
     laplace
     loggamma
@@ -41,10 +45,12 @@ List of Available Functions
     poisson
     rademacher
     randint
+    rayleigh
     shuffle
     split
     t
     truncated_normal
     uniform
+    wald
     weibull_min
 

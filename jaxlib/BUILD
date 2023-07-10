@@ -18,14 +18,19 @@ load("//jaxlib:symlink_files.bzl", "symlink_files")
 load(
     "//jaxlib:jax.bzl",
     "if_windows",
+    "py_library_providing_imports_info",
     "pybind_extension",
+    "pytype_library",
 )
 
 licenses(["notice"])
 
-package(default_visibility = ["//:__subpackages__"])
+package(
+    default_applicable_licenses = [],
+    default_visibility = ["//:__subpackages__"],
+)
 
-py_library(
+py_library_providing_imports_info(
     name = "jaxlib",
     srcs = [
         "ducc_fft.py",
@@ -34,6 +39,7 @@ py_library(
         "gpu_rnn.py",
         "gpu_solver.py",
         "gpu_sparse.py",
+        "gpu_triton.py",
         "hlo_helpers.py",
         "init.py",
         "lapack.py",
@@ -41,8 +47,10 @@ py_library(
         ":xla_client",
     ],
     data = [":xla_extension"],
+    lib_rule = pytype_library,
     deps = [
         ":cpu_feature_guard",
+        ":utils",
         "//jaxlib/cpu:_ducc_fft",
         "//jaxlib/cpu:_lapack",
         "//jaxlib/mlir",
@@ -50,6 +58,7 @@ py_library(
         "//jaxlib/mlir:chlo_dialect",
         "//jaxlib/mlir:func_dialect",
         "//jaxlib/mlir:ir",
+        "//jaxlib/mlir:jax",
         "//jaxlib/mlir:mhlo_dialect",
         "//jaxlib/mlir:ml_program_dialect",
         "//jaxlib/mlir:pass_manager",
@@ -67,7 +76,7 @@ symlink_files(
 
 symlink_files(
     name = "xla_client",
-    srcs = ["@org_tensorflow//tensorflow/compiler/xla/python:xla_client"],
+    srcs = ["@xla//xla/python:xla_client"],
     dst = ".",
     flatten = True,
 )
@@ -75,8 +84,8 @@ symlink_files(
 symlink_files(
     name = "xla_extension",
     srcs = if_windows(
-        ["@org_tensorflow//tensorflow/compiler/xla/python:xla_extension.pyd"],
-        ["@org_tensorflow//tensorflow/compiler/xla/python:xla_extension.so"],
+        ["@xla//xla/python:xla_extension.pyd"],
+        ["@xla//xla/python:xla_extension.so"],
     ),
     dst = ".",
     flatten = True,
@@ -139,7 +148,19 @@ pybind_extension(
     srcs = ["cpu_feature_guard.c"],
     module_name = "cpu_feature_guard",
     deps = [
-        "@org_tensorflow//third_party/python_runtime:headers",
+        "@xla//third_party/python_runtime:headers",
+    ],
+)
+
+pybind_extension(
+    name = "utils",
+    srcs = ["utils.cc"],
+    module_name = "utils",
+    deps = [
+        "@xla//third_party/python_runtime:headers",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/container:inlined_vector",
+        "@pybind11",
     ],
 )
 

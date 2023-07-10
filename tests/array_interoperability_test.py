@@ -17,23 +17,17 @@ import unittest
 from absl.testing import absltest
 
 import jax
-from jax.config import config
+from jax import config
 import jax.dlpack
-from jax._src.lib import xla_bridge, xla_client
 import jax.numpy as jnp
 from jax._src import test_util as jtu
+from jax._src.lib import xla_extension_version
 
 import numpy as np
 
 numpy_version = jtu.numpy_version()
 
 config.parse_flags_with_absl()
-
-try:
-  import torch
-  import torch.utils.dlpack
-except ImportError:
-  torch = None
 
 try:
   import cupy
@@ -44,14 +38,18 @@ try:
   import tensorflow as tf
   tf_version = tuple(
     int(x) for x in tf.version.VERSION.split("-")[0].split("."))
-except:
+except ImportError:
   tf = None
 
 
 dlpack_dtypes = sorted(list(jax.dlpack.SUPPORTED_DTYPES),
                        key=lambda x: x.__name__)
-torch_dtypes = [jnp.int8, jnp.int16, jnp.int32, jnp.int64,
-                jnp.uint8, jnp.float16, jnp.float32, jnp.float64]
+
+numpy_dtypes = sorted(
+    [dt for dt in jax.dlpack.SUPPORTED_DTYPES if dt != jnp.bfloat16],
+    key=lambda x: x.__name__)
+
+cuda_array_interface_dtypes = [dt for dt in dlpack_dtypes if dt != jnp.bfloat16]
 
 nonempty_nonscalar_array_shapes = [(4,), (3, 4), (2, 3, 4)]
 empty_array_shapes = []
@@ -145,62 +143,8 @@ class DLPackTest(jtu.JaxTestCase):
 
   @jtu.sample_product(
     shape=all_shapes,
-    dtype=torch_dtypes,
+    dtype=numpy_dtypes,
   )
-  @unittest.skipIf(not torch, "Test requires PyTorch")
-  def testTorchToJax(self, shape, dtype):
-    if not config.x64_enabled and dtype in [jnp.int64, jnp.float64]:
-      self.skipTest("x64 types are disabled by jax_enable_x64")
-    rng = jtu.rand_default(self.rng())
-    np = rng(shape, dtype)
-    x = torch.from_numpy(np)
-    x = x.cuda() if jtu.device_under_test() == "gpu" else x
-    dlpack = torch.utils.dlpack.to_dlpack(x)
-    y = jax.dlpack.from_dlpack(dlpack)
-    self.assertAllClose(np, y)
-
-  @unittest.skipIf(not torch, "Test requires PyTorch")
-  def testTorchToJaxFailure(self):
-    x = torch.arange(6).reshape((2, 3))
-    y = torch.utils.dlpack.to_dlpack(x[:, :2])
-
-    backend = xla_bridge.get_backend()
-    client = getattr(backend, "client", backend)
-
-    regex_str = (r'UNIMPLEMENTED: Only DLPack tensors with trivial \(compact\) '
-                 r'striding are supported')
-    with self.assertRaisesRegex(RuntimeError, regex_str):
-      xla_client._xla.dlpack_managed_tensor_to_buffer(
-          y, client)
-
-  @jtu.sample_product(
-    shape=all_shapes,
-    dtype=torch_dtypes,
-  )
-  @unittest.skipIf(not torch, "Test requires PyTorch")
-  def testJaxToTorch(self, shape, dtype):
-    if not config.x64_enabled and dtype in [jnp.int64, jnp.float64]:
-      self.skipTest("x64 types are disabled by jax_enable_x64")
-    rng = jtu.rand_default(self.rng())
-    np = rng(shape, dtype)
-    x = jnp.array(np)
-    dlpack = jax.dlpack.to_dlpack(x)
-    y = torch.utils.dlpack.from_dlpack(dlpack)
-    self.assertAllClose(np, y.cpu().numpy())
-
-  @unittest.skipIf(not torch, "Test requires PyTorch")
-  def testTorchToJaxInt64(self):
-    # See https://github.com/google/jax/issues/11895
-    x = jax.dlpack.from_dlpack(
-        torch.utils.dlpack.to_dlpack(torch.ones((2, 3), dtype=torch.int64)))
-    dtype_expected = jnp.int64 if config.x64_enabled else jnp.int32
-    self.assertEqual(x.dtype, dtype_expected)
-
-  @jtu.sample_product(
-    shape=all_shapes,
-    dtype=torch_dtypes,
-  )
-  @unittest.skipIf(numpy_version < (1, 22, 0), "Requires numpy 1.22 or newer")
   def testNumpyToJax(self, shape, dtype):
     rng = jtu.rand_default(self.rng())
     x_np = rng(shape, dtype)
@@ -209,7 +153,7 @@ class DLPackTest(jtu.JaxTestCase):
 
   @jtu.sample_product(
     shape=all_shapes,
-    dtype=torch_dtypes,
+    dtype=numpy_dtypes,
   )
   @unittest.skipIf(numpy_version < (1, 23, 0), "Requires numpy 1.23 or newer")
   @jtu.skip_on_devices("gpu") #NumPy only accepts cpu DLPacks
@@ -220,6 +164,7 @@ class DLPackTest(jtu.JaxTestCase):
     self.assertAllClose(x_np, x_jax)
 
 
+@unittest.skipIf(xla_extension_version < 163, "Test requires jaxlib 0.4.13")
 class CudaArrayInterfaceTest(jtu.JaxTestCase):
 
   def setUp(self):
@@ -229,12 +174,30 @@ class CudaArrayInterfaceTest(jtu.JaxTestCase):
 
   @jtu.sample_product(
     shape=all_shapes,
-    dtype=dlpack_dtypes,
+    dtype=cuda_array_interface_dtypes,
+  )
+  def testCudaArrayInterfaceWorks(self, shape, dtype):
+    rng = jtu.rand_default(self.rng())
+    x = rng(shape, dtype)
+    y = jnp.array(x)
+    z = np.asarray(y)
+    a = y.__cuda_array_interface__
+    self.assertEqual(shape, a["shape"])
+    self.assertEqual(z.__array_interface__["typestr"], a["typestr"])
+
+  def testCudaArrayInterfaceBfloat16Fails(self):
+    rng = jtu.rand_default(self.rng())
+    x = rng((2, 2), jnp.bfloat16)
+    y = jnp.array(x)
+    with self.assertRaisesRegex(RuntimeError, ".*not supported for bfloat16.*"):
+      _ = y.__cuda_array_interface__
+
+  @jtu.sample_product(
+    shape=all_shapes,
+    dtype=cuda_array_interface_dtypes,
   )
   @unittest.skipIf(not cupy, "Test requires CuPy")
   def testJaxToCuPy(self, shape, dtype):
-    if dtype == jnp.bfloat16:
-      raise unittest.SkipTest("cupy does not support bfloat16")
     rng = jtu.rand_default(self.rng())
     x = rng(shape, dtype)
     y = jnp.array(x)

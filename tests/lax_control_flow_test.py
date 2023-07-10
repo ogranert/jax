@@ -26,7 +26,7 @@ from absl.testing import parameterized
 import numpy as np
 
 import jax
-from jax import core
+from jax._src import core
 from jax import dtypes
 from jax.errors import UnexpectedTracerError
 from jax import lax
@@ -41,7 +41,7 @@ import jax.scipy as jsp
 from jax._src.lax import control_flow as lax_control_flow
 from jax._src.lax.control_flow import for_loop
 
-from jax.config import config
+from jax import config
 config.parse_flags_with_absl()
 
 
@@ -91,13 +91,6 @@ def scan_with_for(f, *args, **kwargs):
 
 def scan_with_remat_for(f, *args, **kwargs):
   return jax.remat(lambda *args: for_loop.scan(f, *args, **kwargs))(*args)
-
-SCAN_IMPLS = [
-    (lax.scan, 'unroll1'),
-    (partial(lax.scan, unroll=2), 'unroll2'),
-    (scan_with_new_checkpoint , 'new_checkpoint'),
-    (scan_with_new_checkpoint2, 'new_checkpoint2'),
-]
 
 SCAN_IMPLS_WITH_FOR = [
     (lax.scan, 'unroll1'),
@@ -489,10 +482,21 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     vmap_test(arr, arr)
 
   def testForiLoopErrors(self):
-    """Test typing error messages for while."""
+    """Test typing error messages for fori_loop."""
     with self.assertRaisesRegex(
       TypeError, "arguments to fori_loop must have equal types"):
       lax.fori_loop(np.int16(0), jnp.int32(10), (lambda i, c: c), jnp.float32(7))
+
+  def testForiLoopScalarLimits(self):
+    """Test that scalar limits passed to fori_loop do not cause typing errors."""
+    body = lambda i, c: c + 1
+    init = jnp.float32(10)
+
+    result = lax.fori_loop(np.int16(0), 10, body, init)
+    self.assertEqual(result, init + 10)
+
+    result = lax.fori_loop(0, np.int16(10), body, init)
+    self.assertEqual(result, init + 10)
 
   def testForiLoopBatched(self):
     def body_fun(i, loop_carry):
@@ -691,6 +695,39 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     cfun = jax.jit(cfun)
     self.assertEqual(fun(0), cfun(0))
     self.assertEqual(fun(1), cfun(1))
+
+  def testCondCallableOperands(self):
+    # see https://github.com/google/jax/issues/16413
+
+    @tree_util.register_pytree_node_class
+    class Foo:
+      def __init__(self, x):
+        self.x = x
+
+      def __call__(self, *xs):
+        assert False
+        return xs
+
+      def tree_flatten(self):
+        return (self.x,), None
+
+      @classmethod
+      def tree_unflatten(cls, _, xs):
+        return cls(*xs)
+
+    f_00 = lambda a, b: a + b
+    f_01 = lambda a, b: a + b.x
+    f_10 = lambda a, b: a.x + b
+    f_11 = lambda a, b: a.x + b.x
+
+    # these don't raise
+    a = lax.cond(True, f_00, f_00, 3, 4)
+    b = lax.cond(True, f_01, f_01, 3, Foo(4))
+    c = lax.cond(True, f_10, f_10, Foo(3), 4)
+    d = lax.cond(True, f_11, f_11, Foo(3), Foo(4))
+    self.assertEqual(a, b)
+    self.assertEqual(a, c)
+    self.assertEqual(a, d)
 
   def testSwitch(self):
     def branch(x):
@@ -1762,31 +1799,92 @@ class LaxControlFlowTest(jtu.JaxTestCase):
         'scan got value with no leading axis to scan over.*',
         lambda: lax.scan(plus_one, p0, list(range(5))))
 
-  def testScanTypeErrors(self):
-    """Test typing error messages for scan."""
-    a = jnp.arange(5)
-    # Body output not a tuple
-    with self.assertRaisesRegex(TypeError,
-        re.escape("scan body output must be a pair, got ShapedArray(float32[]).")):
-      lax.scan(lambda c, x: np.float32(0.), 0, a)
-    with  self.assertRaisesRegex(TypeError,
-        re.escape("scan carry output and input must have same type structure, "
-                  f"got {tree_util.tree_structure((0, 0, 0,))} "
-                  f"and {tree_util.tree_structure((1, (2, 3)))}")):
-      lax.scan(lambda c, x: ((0, 0, 0), x), (1, (2, 3)), a)
-    with self.assertRaisesRegex(TypeError,
-        re.escape("scan carry output and input must have same type structure, "
-                  f"got {tree_util.tree_structure(a)} and {tree_util.tree_structure(None)}.")):
-      lax.scan(lambda c, x: (0, x), None, a)
-    with self.assertRaisesWithLiteralMatch(
+  def testScanBodyOutputError(self):
+    with self.assertRaisesRegex(
         TypeError,
-        "scan carry output and input must have identical types, got\n"
-        "DIFFERENT ShapedArray(int32[]) vs. ShapedArray(float32[])."):
-      lax.scan(lambda c, x: (np.int32(0), x), np.float32(1.0), a)
-    with self.assertRaisesRegex(TypeError,
-        re.escape("scan carry output and input must have same type structure, "
-                  f"got {tree_util.tree_structure(a)} and {tree_util.tree_structure((1, 2))}.")):
-      lax.scan(lambda c, x: (0, x), (1, 2), a)
+        re.escape("scan body output must be a pair, got ShapedArray(float32[]).")):
+      lax.scan(lambda c, x: np.float32(0.), 0, jnp.arange(5.))
+
+  def testScanBodyCarryPytreeMismatchErrors(self):
+    with self.assertRaisesRegex(
+        TypeError,
+        re.escape("Scanned function carry input and carry output must have "
+                  "the same pytree structure, but they differ:\n"
+                  "  * the input carry c is a tuple of length 2")):
+      lax.scan(lambda c, x: ((0, 0, 0), x), (1, (2, 3)), jnp.arange(5.))
+
+    with self.assertRaisesRegex(
+        TypeError,
+        re.escape("Scanned function carry input and carry output must have the "
+                  "same pytree structure, but they differ:\n"
+                  "  * the input carry x is a tuple of length 2")):
+      lax.scan(lambda x, _: ((x[0].astype('float32'),), None),
+               (jnp.array(0, 'int32'),) * 2, None, length=1)
+
+    with self.assertRaisesRegex(
+        TypeError,
+        re.escape("Scanned function carry input and carry output must have the "
+                  "same pytree structure, but they differ:\n"
+                  "  * the input carry x is a <class 'tuple'> but the corres")):
+      jax.lax.scan(lambda x, _: ([x[0].astype('float32'),] * 2, None),
+                   (jnp.array(0, 'int32'),) * 2, None, length=1)
+
+    with self.assertRaisesRegex(
+        TypeError,
+        re.escape("Scanned function carry input and carry output must have the "
+                  "same pytree structure, but they differ:\n"
+                  "  * the input carry x is a <class 'dict'> with 1 child but")):
+      jax.lax.scan(lambda x, _: ({'a': x['a'], 'b': x['a']}, None),
+                   {'a': jnp.array(0, 'int32')}, None, length=1)
+
+    with self.assertRaisesRegex(
+        TypeError,
+        re.escape("Scanned function carry input and carry output must have the "
+                  "same pytree structure, but they differ:\n"
+                  "  * the input carry component x[0] is a <class 'dict'> with "
+                  "1 child but the corresponding component of the carry "
+                  "output is a <class 'dict'> with 2 children")):
+      jax.lax.scan(lambda x, _: (({'a': x[0]['a'], 'b': x[0]['a']},) * 2, None),
+                   ({'a': jnp.array(0, 'int32')},) * 2, None, length=1)
+
+  def testScanBodyCarryTypeMismatchErrors(self):
+    with self.assertRaisesRegex(
+        TypeError,
+        re.escape("Scanned function carry input and carry output must have equal "
+                  "types (e.g. shapes and dtypes of arrays), but they differ:\n"
+                  "  * the input carry x has type int32[] but the corresponding "
+                  "output carry component has type float32[], so the dtypes do "
+                  "not match"
+                  )):
+      jax.lax.scan(lambda x, _: (x.astype('float32'), None),
+                   jnp.array(0, 'int32'), None, length=1)
+
+    with self.assertRaisesRegex(
+        TypeError,
+        re.escape("Scanned function carry input and carry output must have equal "
+                  "types (e.g. shapes and dtypes of arrays), but they differ:\n"
+                  "  * the input carry component x[1] has type int32[] but the "
+                  "corresponding output carry component has type float32[], "
+                  "so the dtypes do not match"
+                  )):
+      jax.lax.scan(lambda x, _: ((x[0], x[1].astype('float32')), None),
+                   (jnp.array(0, 'int32'),) * 2, None, length=1)
+
+    with self.assertRaisesRegex(
+        TypeError,
+        re.escape("Scanned function carry input and carry output must have equal "
+                  "types (e.g. shapes and dtypes of arrays), but they differ:\n"
+                  "  * the input carry component x[0] has type int32[] but the "
+                  "corresponding output carry component has type float32[], "
+                  "so the dtypes do not match\n\n"
+                  "  * the input carry component x[1] has type int32[] but the "
+                  "corresponding output carry component has type float32[1,1], "
+                  "so the dtypes do not match and also the shapes do not match"
+                  )):
+      jax.lax.scan(lambda x, _: ((x[0].astype('float32'),
+                                  x[1].astype('float32').reshape(1, 1),
+                                  x[2]), None),
+                   (jnp.array(0, 'int32'),) * 3, None, length=1)
 
   @parameterized.named_parameters(
       {"testcase_name": f"_{scan_name}",
@@ -2380,7 +2478,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     self.assertRaisesRegex(
         core.JaxprTypeError,
         r'invalid cond param linear of type str, '
-        r'tuple of bool required:\nmulti\nline',
+        r'tuple of bool required:\r?\nmulti\r?\nline',
         lambda: core.check_jaxpr(jaxpr))
 
   def test_cond_transformation_rule_with_consts(self):

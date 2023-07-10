@@ -25,7 +25,7 @@ import jax
 from jax._src import test_util as jtu
 from jax import numpy as jnp
 
-from jax.config import config
+from jax import config
 config.parse_flags_with_absl()
 FLAGS = config.FLAGS
 npr.seed(0)
@@ -87,7 +87,7 @@ class MultiBackendTest(jtu.JaxTestCase):
       raise SkipTest("Backend is not CPU or the device under test")
     if outer is None and inner == jtu.device_under_test():
       raise SkipTest("(None, device) is allowed")
-    if jax.config.jax_jit_pjit_api_merge and outer is None:
+    if outer is None:
       raise SkipTest("The inner device will dictate the device assignment for "
                      "the entire computation. So if inner is CPU and outer is "
                      "None, then the computation will be execute on CPU.")

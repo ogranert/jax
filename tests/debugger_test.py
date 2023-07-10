@@ -16,22 +16,21 @@ import re
 import textwrap
 import unittest
 
-from typing import IO, Sequence, Tuple
+from typing import IO, Sequence
 
 from absl.testing import absltest
 import jax
-from jax.config import config
-from jax.experimental import maps
+from jax import config
 from jax.experimental import pjit
 from jax._src import debugger
 from jax._src import test_util as jtu
-from jax._src.lib import xla_bridge
+from jax._src import xla_bridge
 import jax.numpy as jnp
 import numpy as np
 
 config.parse_flags_with_absl()
 
-def make_fake_stdin_stdout(commands: Sequence[str]) -> Tuple[IO[str], io.StringIO]:
+def make_fake_stdin_stdout(commands: Sequence[str]) -> tuple[IO[str], io.StringIO]:
   fake_stdin = io.StringIO()
   fake_stdin.truncate(0)
   for command in commands:
@@ -55,7 +54,6 @@ def tearDownModule():
 
 foo = 2
 
-@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # host callback
 class CliDebuggerTest(jtu.JaxTestCase):
 
   def test_debugger_eof(self):
@@ -90,13 +88,9 @@ class CliDebuggerTest(jtu.JaxTestCase):
       y = jnp.sin(x)
       debugger.breakpoint(stdin=stdin, stdout=stdout, backend="cli")
       return y
-    if config.jax_array:
-      arr = "Array"
-    else:
-      arr = "DeviceArray"
-    expected = _format_multiline(rf"""
+    expected = _format_multiline(r"""
     Entering jdb:
-    (jdb) {arr}(2., dtype=float32)
+    (jdb) Array(2., dtype=float32)
     (jdb) """)
     f(jnp.array(2., jnp.float32))
     jax.effects_barrier()
@@ -330,9 +324,12 @@ class CliDebuggerTest(jtu.JaxTestCase):
     def g(x):
       y = f(x)
       return jnp.exp(y)
-    g = pjit.pjit(g, in_axis_resources=pjit.PartitionSpec("dev"),
-                  out_axis_resources=pjit.PartitionSpec("dev"))
-    with maps.Mesh(np.array(jax.devices()), ["dev"]):
+    g = pjit.pjit(
+        g,
+        in_shardings=jax.sharding.PartitionSpec("dev"),
+        out_shardings=jax.sharding.PartitionSpec("dev"),
+    )
+    with jax.sharding.Mesh(np.array(jax.devices()), ["dev"]):
       arr = (1 + np.arange(8)).astype(np.int32)
       expected = _format_multiline(r"""
       Entering jdb:
@@ -361,7 +358,6 @@ class CliDebuggerTest(jtu.JaxTestCase):
     f(2.)
     jax.effects_barrier()
     self.assertRegex(stdout.getvalue(), expected)
-
 
   def test_debugger_accesses_globals(self):
     if xla_bridge.get_backend().runtime_type == 'stream_executor':

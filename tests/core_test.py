@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import unittest
 from collections import namedtuple
 from functools import partial
 import gc
@@ -24,23 +24,23 @@ from absl.testing import absltest
 from absl.testing import parameterized
 
 import jax
-from jax import core
 from jax import lax
 from jax import numpy as jnp
-from jax._src import linear_util as lu
 from jax import jvp, linearize, vjp, jit, make_jaxpr
-from jax.core import UnshapedArray, ShapedArray, DBIdx
+from jax.api_util import flatten_fun_nokwargs
+from jax import config
 from jax.tree_util import (tree_flatten, tree_unflatten, tree_map, tree_reduce,
                            tree_leaves)
-from jax.api_util import flatten_fun_nokwargs
-from jax.interpreters import partial_eval as pe
 
+from jax._src import core
+from jax._src import linear_util as lu
 from jax._src import util
 from jax._src import test_util as jtu
+from jax._src.core import UnshapedArray, ShapedArray, DBIdx
+from jax._src.interpreters import partial_eval as pe
 from jax._src.lax import lax as lax_internal
 from jax._src.lax import control_flow as lax_control_flow
 
-from jax.config import config
 config.parse_flags_with_absl()
 
 _ = pe.PartialVal.unknown(UnshapedArray(np.float32))
@@ -321,6 +321,26 @@ class CoreTest(jtu.JaxTestCase):
     finally:
       gc.set_debug(debug)
 
+  def test_invalid_shape_error_with_jit_tracer_passed(self):
+    @jax.jit
+    def g_jit(x):
+      return jnp.zeros(shape=(2, x))
+
+    @jax.vmap
+    def g_vmap(x):
+      return jnp.zeros(shape=(2, x))
+
+    with self.assertRaisesRegex(
+        TypeError,
+        'This concrete value was not available in'
+        + ' Python because it depends on',
+    ):
+      g_jit(1)
+
+    with self.assertRaisesRegex(TypeError,
+          'This BatchTracer with object id'):
+      g_vmap(jnp.ones((1, )))
+
   def test_comparing_var(self):
     newsym = core.gensym()
     a = newsym(core.ShapedArray((), np.dtype('int32')))
@@ -407,6 +427,15 @@ class JaxprTypeChecks(jtu.JaxTestCase):
   def test_check_jaxpr_cond_correct(self):
     jaxpr = make_jaxpr(lambda x: lax.switch(0, [jnp.sin, jnp.cos], x))(1.).jaxpr
     core.check_jaxpr(jaxpr)
+
+  def test_check_jaxpr_jit_invalid(self):
+    jaxpr = make_jaxpr(jax.jit(lambda x, y: x + 1))(1., 2.).jaxpr
+    pjit_eqn, = jaxpr.eqns
+    jaxpr._eqns[0] = pjit_eqn._replace(invars=())
+    self.assertRaisesRegex(
+        core.JaxprTypeError,
+        '0 operands cannot call jaxpr with 2 inputs',
+        lambda: core.check_jaxpr(jaxpr))
 
   def test_check_jaxpr_cond_invalid(self):
     jaxpr = make_jaxpr(lambda x: lax.switch(0, [jnp.sin, jnp.cos], x))(1.).jaxpr
@@ -596,9 +625,8 @@ class DynamicShapesTest(jtu.JaxTestCase):
     self.assertEqual((jaxpr.invars[0],), jaxpr.outvars[0].aval.shape)
     self.assertEqual((jaxpr.invars[0],), jaxpr.outvars[1].aval.shape)
 
+  @unittest.skip('This test does not work with nested pjit and DShapedArray')
   def test_staging_nested(self):
-    if jax.config.jax_jit_pjit_api_merge:
-      self.skipTest("This test does not work with nested pjit and DShapedArray")
     n = core.ShapedArray((), jnp.dtype('int32'), weak_type=False)
     a = core.DShapedArray((DBIdx(0),), jnp.dtype('float32'), weak_type=False)
     b = core.DShapedArray((DBIdx(0),), jnp.dtype('float32'), weak_type=False)
@@ -633,9 +661,8 @@ class DynamicShapesTest(jtu.JaxTestCase):
     self.assertEqual((inner_jaxpr.invars[0],), inner_jaxpr.invars[3].aval.shape)
     self.assertEqual((inner_jaxpr.invars[0],), inner_jaxpr.invars[4].aval.shape)
 
+  @unittest.skip('This test does not work with nested pjit and DShapedArray')
   def test_staging_nested_including_shape_arg(self):
-    if jax.config.jax_jit_pjit_api_merge:
-      self.skipTest("This test does not work with nested pjit and DShapedArray")
     n = core.ShapedArray((), jnp.dtype('int32'), weak_type=False)
     a = core.DShapedArray((DBIdx(0),), jnp.dtype('float32'), weak_type=False)
     b = core.DShapedArray((DBIdx(0),), jnp.dtype('float32'), weak_type=False)
@@ -695,9 +722,8 @@ class DynamicShapesTest(jtu.JaxTestCase):
     self.assertLen(jaxpr.outvars, 1)
     self.assertEqual(jaxpr.outvars[0].aval.shape, ())
 
+  @unittest.skip('This test does not work with nested pjit and DShapedArray')
   def test_typecheck_staging_nested(self):
-    if jax.config.jax_jit_pjit_api_merge:
-      self.skipTest("This test does not work with nested pjit and DShapedArray")
     n = core.ShapedArray((), jnp.dtype('int32'), weak_type=False)
     m = core.ShapedArray((), jnp.dtype('int32'), weak_type=False)
     a = core.DShapedArray((DBIdx(0),), jnp.dtype('float32'), weak_type=False)

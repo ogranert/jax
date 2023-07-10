@@ -14,7 +14,7 @@
 """Tests for JAX primitive coverage.
 
 The bulk of the testing is done by `test_prim`, which is parameterized by
-about 2000+ test harnesses. See `primitive_harness.py` docstring for a
+about 3500+ test harnesses. See `primitive_harness.py` docstring for a
 description of test harnesses. That module contains also the definitions
 of all the test harnesses, and a specification of which are only partially
 implemented for JAX.
@@ -53,7 +53,7 @@ not need limitations, then it must be listed in the
 
 import datetime
 import os
-from typing import Any, Dict, Tuple
+from typing import Any
 import unittest
 
 from absl import logging
@@ -64,10 +64,10 @@ import jax
 from jax import dtypes
 from jax import numpy as jnp
 from jax._src import test_util as jtu
-from jax.config import config
+from jax import config
 from jax.experimental import jax2tf
 from jax.interpreters import mlir
-from jax.interpreters import xla
+from jax._src.interpreters import xla
 
 import numpy as np
 import tensorflow as tf  # type: ignore[import]
@@ -114,18 +114,44 @@ class JaxPrimitiveTest(tf_test_util.JaxToTfTestCase):
     func_jax = harness.dyn_fun
     args = harness.dyn_args_maker(self.rng())
     enable_xla = harness.params.get("enable_xla", True)
-    if config.jax2tf_default_experimental_native_lowering and not enable_xla:
-      raise unittest.SkipTest("experimental_native_lowering not supported with enable_xla=False")
+    if config.jax2tf_default_native_serialization and not enable_xla:
+      raise unittest.SkipTest("native_serialization not supported with enable_xla=False")
 
     if ("eigh" == harness.group_name and
         np.complex64 == harness.dtype and
         device == "tpu"):
       raise unittest.SkipTest("b/264716764: error on tf.cast from c64 to f32")
 
-    if (not config.jax_array and
-        device == "cpu" and
-        "top_k_sort_inf_nan_inshape=float32[5]_k=5" in harness.fullname):
-      raise unittest.SkipTest("Unexplained failure, but in old no_jax_array")
+    if (config.jax2tf_default_native_serialization and
+        device == "gpu" and
+        "lu" in harness.fullname):
+      raise unittest.SkipTest("b/269388847: lu failures on GPU")
+
+    def skipCustomCallTest(target: str):
+      raise unittest.SkipTest(
+          f"TODO(b/272239584): custom call target not guaranteed stable: {target}")
+    if config.jax2tf_default_native_serialization:
+      if device == "cpu":
+        if "cholesky_shape" in harness.fullname:
+          skipCustomCallTest("lapack_spotrf, lapack_dpotrf, lapack_zpotrf, lapack_cpotrf")
+        if "eig_shape" in harness.fullname:
+          skipCustomCallTest("lapack_cgeev, lapack_sgeev, lapack_dgeev, lapack_zgeev")
+        if "lu_shape" in harness.fullname:
+          skipCustomCallTest("lapack_zgetrf, lapack_sgetrf")
+        if "svd_shape" in harness.fullname:
+          skipCustomCallTest("lapack_sgesdd, lapack_zgesdd, lapack_cgesdd")
+        if "triangular_solve_" in harness.fullname:
+          skipCustomCallTest("blas_ctrsm, blas_dtrsm, blas_ztrsm, blas_strsm")
+        if "custom_linear_solve" in harness.fullname:
+          skipCustomCallTest("lapack_sgetrf, lapack_dgetrf")
+
+      elif device == "gpu":
+        if "custom_linear_solve_" in harness.fullname:
+          skipCustomCallTest("cusolver_geqrf, cublas_geqrf_batched")
+        if "svd_shape" in harness.fullname:
+          skipCustomCallTest("cusolver_gesvdj")
+        if "tridiagonal_solve_shape" in harness.fullname:
+          skipCustomCallTest("cusparse_gtsv2_f32, cusparse_gtsv2_f64")
 
     associative_scan_reductions = harness.params.get("associative_scan_reductions", False)
     try:
@@ -134,10 +160,10 @@ class JaxPrimitiveTest(tf_test_util.JaxToTfTestCase):
                                enable_xla=enable_xla)
     except Exception as e:
       # TODO(b/264596006): custom calls are not registered properly with TF in OSS
-      if (config.jax2tf_default_experimental_native_lowering and
+      if (config.jax2tf_default_native_serialization and
           "does not work with custom calls" in str(e)):
         logging.warning("Supressing error %s", e)
-        raise unittest.SkipTest("b/264596006: custom calls in native lowering fail in TF")
+        raise unittest.SkipTest("b/264596006: custom calls in native serialization fail in TF")
       else:
         raise e
 
@@ -162,8 +188,7 @@ class JaxPrimitiveTest(tf_test_util.JaxToTfTestCase):
     for p in all_primitives:
       if p.name == "axis_index":
         continue
-      # TODO: remove once we delete sharded_jit.py
-      if p.name in ["sharded_call", "sharding_constraint"]:
+      if p.name == "sharding_constraint":
         continue
       # TODO: Remove once tensorflow is 2.10.0 everywhere.
       if p.name == "optimization_barrier":
@@ -193,7 +218,7 @@ class JaxPrimitiveTest(tf_test_util.JaxToTfTestCase):
       return (h.group_name, l.description, l.devices,
               tuple(np.dtype(d).name for d in l.dtypes), l.modes)
 
-    unique_limitations: Dict[Any, Tuple[primitive_harness.Harness, Jax2TfLimitation]] = {}
+    unique_limitations: dict[Any, tuple[primitive_harness.Harness, Jax2TfLimitation]] = {}
     for h in harnesses:
       for l in h.jax_unimplemented:
         if l.enabled:
@@ -288,10 +313,13 @@ class JaxPrimitiveTest(tf_test_util.JaxToTfTestCase):
     y = np.int32(3)
     self.ConvertAndCompare(jnp.floor_divide, x, y)
     expected = jnp.floor_divide(x, y)
-    # Try it with TF 1 as well (#5831)
-    with tf.compat.v1.Session() as sess:
-      tf1_res = sess.run(jax2tf.convert(jnp.floor_divide)(x, y))
-      self.assertAllClose(expected, tf1_res)
+    if not config.jax2tf_default_native_serialization:
+      # With native serialization TF1 seems to want to run the converted code
+      # on the CPU even when the default backend is the TPU.
+      # Try it with TF 1 as well (#5831)
+      with tf.compat.v1.Session() as sess:
+        tf1_res = sess.run(jax2tf.convert(jnp.floor_divide)(x, y))
+        self.assertAllClose(expected, tf1_res)
 
   def test_boolean_gather(self):
     values = np.array([[True, True], [False, True], [False, False]],

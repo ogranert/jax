@@ -13,9 +13,9 @@
 # limitations under the License.
 
 
-import functools
 from functools import partial
-import operator
+import math
+from typing import Sequence
 
 import jaxlib.mlir.ir as ir
 import jaxlib.mlir.dialects.stablehlo as hlo
@@ -24,17 +24,19 @@ import numpy as np
 
 from jaxlib import xla_client
 
-from .hlo_helpers import custom_call
+from .hlo_helpers import (
+    DimensionSize, ShapeTypePair, mk_result_types_and_shapes,
+    custom_call, ensure_hlo_s32, hlo_s32)
 
 try:
-  from .cuda import _blas as _cublas
+  from .cuda import _blas as _cublas  # pytype: disable=import-error
   for _name, _value in _cublas.registrations().items():
     xla_client.register_custom_call_target(_name, _value, platform="CUDA")
 except ImportError:
   _cublas = None
 
 try:
-  from .cuda import _solver as _cusolver
+  from .cuda import _solver as _cusolver  # pytype: disable=import-error
   for _name, _value in _cusolver.registrations().items():
     xla_client.register_custom_call_target(_name, _value, platform="CUDA")
 except ImportError:
@@ -42,14 +44,14 @@ except ImportError:
 
 
 try:
-  from .rocm import _blas as _hipblas
+  from .rocm import _blas as _hipblas  # pytype: disable=import-error
   for _name, _value in _hipblas.registrations().items():
     xla_client.register_custom_call_target(_name, _value, platform="ROCM")
 except ImportError:
   _hipblas = None
 
 try:
-  from .rocm import _solver as _hipsolver
+  from .rocm import _solver as _hipsolver  # pytype: disable=import-error
   for _name, _value in _hipsolver.registrations().items():
     xla_client.register_custom_call_target(_name, _value, platform="ROCM")
 except ImportError:
@@ -60,8 +62,6 @@ def _real_type(dtype):
   """Returns the real equivalent of 'dtype'."""
   return np.finfo(dtype).dtype
 
-_prod = lambda xs: functools.reduce(operator.mul, xs, 1)
-
 
 def _getrf_hlo(platform, gpu_blas, gpu_solver, dtype, a):
   """LU decomposition."""
@@ -71,7 +71,7 @@ def _getrf_hlo(platform, gpu_blas, gpu_solver, dtype, a):
   m, n = dims[-2:]
   batch_dims = tuple(dims[:-2])
   num_bd = len(batch_dims)
-  batch = _prod(batch_dims)
+  batch = math.prod(batch_dims)
 
   if batch > 1 and m == n and m // batch <= 128:
     lwork, opaque = gpu_blas.build_getrf_batched_descriptor(
@@ -118,7 +118,7 @@ def _geqrf_hlo(platform, gpu_solver, dtype, a):
   m, n = dims[-2:]
   batch_dims = tuple(dims[:-2])
   num_bd = len(batch_dims)
-  batch = _prod(batch_dims)
+  batch = math.prod(batch_dims)
 
   lwork, opaque = gpu_solver.build_geqrf_descriptor(
       np.dtype(dtype), batch, m, n)
@@ -156,7 +156,7 @@ def _geqrf_batched_hlo(platform, gpu_blas, dtype, a):
   m, n = dims[-2:]
   batch_dims = tuple(dims[:-2])
   num_bd = len(batch_dims)
-  batch = _prod(batch_dims)
+  batch = math.prod(batch_dims)
 
   lwork, opaque = gpu_blas.build_geqrf_batched_descriptor(
       np.dtype(dtype), batch, m, n)
@@ -220,7 +220,7 @@ def _orgqr_hlo(platform, gpu_solver, dtype, a, tau):
   m, n = dims[-2:]
   batch_dims = tuple(dims[:-2])
   num_bd = len(batch_dims)
-  batch = _prod(batch_dims)
+  batch = math.prod(batch_dims)
 
   tau_dims = ir.RankedTensorType(tau.type).shape
   assert tau_dims[:-1] == dims[:-2]
@@ -256,27 +256,35 @@ cuda_orgqr = partial(_orgqr_hlo, "cu", _cusolver)
 rocm_orgqr = partial(_orgqr_hlo, "hip", _hipsolver)
 
 
-def _syevd_hlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
-               lower=False):
+def _syevd_hlo(platform, gpu_solver, have_jacobi_solver, dtype, a, *,
+               a_shape_vals: tuple[DimensionSize, ...], lower=False):
   """Symmetric (Hermitian) eigendecomposition."""
   a_type = ir.RankedTensorType(a.type)
-  dims = a_type.shape
-  assert len(dims) >= 2
-  m, n = dims[-2:]
-  assert m == n
-  batch_dims = tuple(dims[:-2])
-  num_bd = len(batch_dims)
-  batch = _prod(batch_dims)
+  assert len(a_shape_vals) >= 2
+  m, n = a_shape_vals[-2:]
+  assert type(m) is int and type(n) is int and m == n, a_shape_vals
+  batch_dims_vals = a_shape_vals[:-2]
+
+  num_bd = len(batch_dims_vals)
   layout = (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))
 
-  if have_jacobi_solver and n <= 32:
+  dynamic_batch_dims = any(type(d) != int for d in batch_dims_vals)
+  if dynamic_batch_dims:
+    batch_int = -1  # Signals to the kernel that the batch is an operand.
+  else:
+    batch_int = math.prod(batch_dims_vals)
+
+  if have_jacobi_solver and n <= 32 and not dynamic_batch_dims:
+    # We cannot use syevj for dynamic shapes because the workspace size
+    # depends on the batch size.
     kernel = f"{platform}solver_syevj"
     lwork, opaque = gpu_solver.build_syevj_descriptor(
-        np.dtype(dtype), lower, batch, n)
+        np.dtype(dtype), lower, batch_int, n)
   else:
     kernel = f"{platform}solver_syevd"
     lwork, opaque = gpu_solver.build_syevd_descriptor(
-        np.dtype(dtype), lower, batch, n)
+        np.dtype(dtype), lower, batch_int, n)
+    assert lwork > 0
 
   if ir.ComplexType.isinstance(a_type.element_type):
     eigvals_type = ir.ComplexType(a_type.element_type).element_type
@@ -284,24 +292,35 @@ def _syevd_hlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
     eigvals_type = a_type.element_type
 
   i32_type = ir.IntegerType.get_signless(32)
+  operands = [a]
+  operand_layouts = [layout]
+  if dynamic_batch_dims:
+    batch_size_val = hlo_s32(1)
+    for b_v in batch_dims_vals:
+      batch_size_val = hlo.MulOp(batch_size_val, ensure_hlo_s32(b_v)).result
+    operands.append(batch_size_val)
+    operand_layouts.append(())
+
+  shape_type_pairs: Sequence[ShapeTypePair] = [
+      (a_shape_vals, a_type.element_type),
+      (batch_dims_vals + (n,), eigvals_type),
+      (batch_dims_vals, i32_type),
+      ([lwork], a_type.element_type)]
+  result_types, result_shapes = mk_result_types_and_shapes(shape_type_pairs)
   out = custom_call(
       kernel,
-      [
-          a.type,
-          ir.RankedTensorType.get(batch_dims + (n,), eigvals_type),
-          ir.RankedTensorType.get(batch_dims, i32_type),
-          ir.RankedTensorType.get([lwork], a_type.element_type),
-      ],
-      [a],
+      result_types,
+      operands,
       backend_config=opaque,
-      operand_layouts=[layout],
+      operand_layouts=operand_layouts,
       result_layouts=[
           layout,
           tuple(range(num_bd, -1, -1)),
           tuple(range(num_bd - 1, -1, -1)),
           [0],
       ],
-      operand_output_aliases={0: 0})
+      operand_output_aliases={0: 0},
+      result_shapes=result_shapes)
   return out[:3]
 
 cuda_syevd = partial(_syevd_hlo, "cu", _cusolver, True)
@@ -317,7 +336,7 @@ def _gesvd_hlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
   m, n = dims[-2:]
   batch_dims = tuple(dims[:-2])
   num_bd = len(batch_dims)
-  b = _prod(batch_dims)
+  b = math.prod(batch_dims)
   if ir.ComplexType.isinstance(a_type.element_type):
     singular_vals_type = ir.ComplexType(a_type.element_type).element_type
   else:
@@ -498,10 +517,7 @@ def _sytrd_hlo(platform, gpu_solver, dtype, a, *, lower):
         ir.RankedTensorType.get(s_type.shape, a_type.element_type), s)
     offsets = tuple(hlo.ConstantOp(intattr(i))
                     for i in ((0,) * len(batch_dims) + (0, 1)))
-    if xla_client.mlir_api_version < 40:
-      a = hlo.DynamicUpdateSliceOp(a.type, a, s, offsets).result
-    else:
-      a = hlo.DynamicUpdateSliceOp(a, s, offsets).result
+    a = hlo.DynamicUpdateSliceOp(a, s, offsets).result
 
   return a, d, e, taus, info
 

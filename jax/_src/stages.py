@@ -33,20 +33,18 @@ from __future__ import annotations
 import warnings
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, NamedTuple, Optional, Protocol, Sequence, Tuple
+from typing import Any, NamedTuple, Optional, Protocol, Sequence, Union
 
 import jax
-from jax import tree_util
-from jax.lib import xla_client as xc
 
 from jax._src import core
 from jax._src import source_info_util
 from jax._src import traceback_util
+from jax._src import tree_util
 from jax._src import util
+from jax._src.interpreters import mlir
 from jax._src.lib.mlir import ir
-from jax._src.lib.mlir.dialects import use_stablehlo
-from jax.interpreters import mlir
-from jax.interpreters import xla
+from jax._src.lib import xla_client as xc
 
 
 source_info_util.register_exclusion(__file__)
@@ -56,6 +54,8 @@ traceback_util.register_exclusion(__file__)
 xla_extension = xc._xla
 map, unsafe_map = util.safe_map, map
 zip, unsafe_zip = util.safe_zip, zip
+
+CompilerOptions = dict[str, Union[str, bool]]
 
 
 # -- Internal protocols
@@ -147,7 +147,8 @@ class Executable(Protocol):
 class Lowering(Protocol):
   """Protocol for lowerings, which a user-facing ``Lowered`` encapsulates."""
 
-  def compile(self) -> Executable:
+  def compile(
+      self, compiler_options: Optional[CompilerOptions] = None) -> Executable:
     """Compile and return a corresponding ``Executable``."""
     raise NotImplementedError
 
@@ -175,12 +176,33 @@ class Lowering(Protocol):
     """
     raise NotImplementedError
 
+  def cost_analysis(self) -> Any:
+    """A summary of execution cost estimates.
+
+    Intended for visualization and debugging purposes. The object output by
+    this is some simple data structure that can easily be printed or serialized
+    (e.g. nested dicts, lists, and tuples with numeric leaves). However, its
+    structure can be arbitrary: it need not be consistent across versions of JAX
+    and jaxlib, or even across invocations. It is relayed directly to external
+    callers.
+
+    This function estimates execution cost in the absence of compiler
+    optimizations, which may drastically affect the cost. For execution cost
+    estimates after optimizations, compile this lowering and see
+    ``Compiled.cost_analysis``.
+
+    May raise ``NotImplementedError`` if unavailable, e.g. based on backend,
+    compiler, or runtime.
+    """
+    # TODO(frostig): improve annotation (arbitrary pytree)
+    raise NotImplementedError
+
 
 # -- Internal adapters from XLA-related objects to the above protocols
 
 class XlaExecutable(Executable):
 
-  def xla_extension_executable(self) -> xla.XlaLoadedExecutable:
+  def xla_extension_executable(self) -> xc.LoadedExecutable:
     raise NotImplementedError("must override")
 
   def call(self, *args_flat) -> Sequence[Any]:
@@ -209,11 +231,21 @@ class XlaExecutable(Executable):
       else:
         raise
 
-  def cost_analysis(self) -> List[Dict[str, float]]:
+    # TODO(skyewm): this should return a single dict (I think returning a list
+    # was to support MPMD executables, which never fully landed)
+  def cost_analysis(self) -> list[dict[str, float]]:
     xla_ext_exe = self.xla_extension_executable()
-    err_msg = ("cost analysis unsupported on current XLA backend: "
-               f"{type(xla_ext_exe)}")
+
     # TODO(b/259255524): Unify/merge the two cost_analysis calls below.
+    if hasattr(xla_ext_exe, "cost_analysis"):
+      try:
+        return [xla_ext_exe.cost_analysis()]
+      except xla_extension.XlaRuntimeError as e:
+        msg, *_ = e.args
+        if not (type(msg) is str and msg.startswith("UNIMPLEMENTED")):
+          raise
+
+    # Try client method if executable cost_analysis method is unimplemented
     if hasattr(xla_ext_exe, "client"):
       try:
         return [
@@ -222,21 +254,12 @@ class XlaExecutable(Executable):
         ]
       except xla_extension.XlaRuntimeError as e:
         msg, *_ = e.args
-        if type(msg) is str and msg.startswith("UNIMPLEMENTED"):
-          raise NotImplementedError(err_msg) from e
-        else:
+        if not (type(msg) is str and msg.startswith("UNIMPLEMENTED")):
           raise
-    elif hasattr(xla_ext_exe, "cost_analysis"):
-      try:
-        return xla_ext_exe.cost_analysis()
-      except xla_extension.XlaRuntimeError as e:
-        msg, *_ = e.args
-        if type(msg) is str and msg.startswith("UNIMPLEMENTED"):
-          raise NotImplementedError(err_msg) from e
-        else:
-          raise
-    else:
-      raise NotImplementedError(err_msg)
+
+    raise NotImplementedError(
+        f"cost analysis unsupported on current XLA backend: {type(xla_ext_exe)}"
+    )
 
   def memory_analysis(self) -> Any:
     xla_ext_exe = self.xla_extension_executable()
@@ -260,36 +283,32 @@ class XlaExecutable(Executable):
 class XlaLowering(Lowering):
   """Adapts our various internal XLA-backed computations into a ``Lowering``."""
 
+  compile_args: dict[str, Any]
+
   def hlo(self) -> xc.XlaComputation:
     """Return an HLO representation of this computation."""
-    raise NotImplementedError("must override")
+    return xla_extension.mlir.mlir_module_to_xla_computation(
+        mlir.module_to_string(self.stablehlo()),
+        use_tuple_args=self.compile_args["tuple_args"])
 
   def mhlo(self) -> ir.Module:
     """Return an MHLO representation of this computation."""
-    if use_stablehlo:
-      module_str = xla_extension.mlir.stablehlo_to_mhlo(
-          mlir.module_to_bytecode(self.stablehlo()))
-      with self.stablehlo().context:
-        return ir.Module.parse(module_str)
-    else:
-      raise NotImplementedError("must override")
+    module_str = xla_extension.mlir.stablehlo_to_mhlo(
+        mlir.module_to_bytecode(self.stablehlo()))
+    with self.stablehlo().context:
+      return ir.Module.parse(module_str)
 
   def stablehlo(self) -> ir.Module:
     """Return a StableHLO representation of this computation."""
-    if use_stablehlo:
-      raise NotImplementedError("must override")
-    else:
-      module_str = xla_extension.mlir.mhlo_to_stablehlo(
-          mlir.module_to_bytecode(self.mhlo()))
-      with self.mhlo().context:
-        return ir.Module.parse(module_str)
+    raise NotImplementedError("must override")
 
-  def compile(self) -> Executable:
+  def compile(
+      self, compiler_options: Optional[CompilerOptions] = None) -> Executable:
     raise NotImplementedError("must override")
 
   def as_text(self, dialect: Optional[str] = None) -> str:
     if dialect is None:
-      dialect = "stablehlo" if use_stablehlo else "mhlo"
+      dialect = "stablehlo"
     if dialect == "mhlo":
       return str(self.mhlo())
     elif dialect == "stablehlo":
@@ -301,7 +320,7 @@ class XlaLowering(Lowering):
 
   def compiler_ir(self, dialect: Optional[str] = None) -> Any:
     if dialect is None:
-      dialect = "stablehlo" if use_stablehlo else "mhlo"
+      dialect = "stablehlo"
     if dialect == "mhlo":
       return self.mhlo()
     elif dialect == "stablehlo":
@@ -311,6 +330,8 @@ class XlaLowering(Lowering):
     else:
       raise ValueError(f"unknown dialect: {dialect}")
 
+  def cost_analysis(self) -> dict[str, float]:
+    raise NotImplementedError("must override")
 
 
 # -- Public-facing API, plus helpers
@@ -378,9 +399,7 @@ class Compiled(Stage):
     self.out_tree = out_tree
     self._params = CompiledCallParams(self._executable, self._no_kwargs,
                                       self.in_tree, self.out_tree)
-    self._cpp_call = self._executable.create_cpp_call(self._no_kwargs,
-                                                      self.in_tree,
-                                                      self.out_tree)
+    self._call = None
 
   def compiler_ir(self):
     """Post-compilation IR.
@@ -513,11 +532,17 @@ class Compiled(Stage):
     return outs, out_flat, args_flat
 
   def __call__(self, *args, **kwargs):
-    if self._cpp_call is not None:
-      return self._cpp_call(*args, **kwargs)
-
-    outs, _, _ = Compiled.call(self._params, *args, **kwargs)
-    return outs
+    if self._call is None:
+      self._call = self._executable.create_cpp_call(self._no_kwargs,
+                                                        self.in_tree,
+                                                        self.out_tree)
+      if self._call is None:
+        params = self._params
+        def cpp_call_fallback(*args, **kwargs):
+          outs, _, _ = Compiled.call(params, *args, **kwargs)
+          return outs
+        self._call = cpp_call_fallback
+    return self._call(*args, **kwargs)
 
 
 class Lowered(Stage):
@@ -539,7 +564,7 @@ class Lowered(Stage):
   def __init__(
       self,
       lowering: XlaLowering,
-      args_info,  # PyTreee of ArgInfo
+      args_info,  # PyTree of ArgInfo
       out_tree: tree_util.PyTreeDef,
       no_kwargs: bool = False):
     self._lowering = lowering
@@ -552,7 +577,7 @@ class Lowered(Stage):
                      lowering: XlaLowering,
                      in_tree: tree_util.PyTreeDef,
                      in_avals,
-                     donate_argnums: Tuple[int, ...],
+                     donate_argnums: tuple[int, ...],
                      out_tree: tree_util.PyTreeDef,
                      no_kwargs: bool = False):
     """Initialize from flat info (``in_avals`` etc.) and an input PyTreeDef.
@@ -570,22 +595,16 @@ class Lowered(Stage):
         out_tree,
         no_kwargs=no_kwargs)
 
-  def compile(self) -> Compiled:
+  def compile(
+      self, compiler_options: Optional[CompilerOptions] = None) -> Compiled:
     """Compile, returning a corresponding ``Compiled`` instance."""
-    from jax.interpreters import pxla
-
-    if (jax.config.jax_array and
-        isinstance(self._lowering, pxla.MeshComputation) and
-        all(pxla._is_unspecified(o) for o in self._lowering.compile_args['out_shardings'])):
-      kw = dict(_allow_propagation_to_outputs=True)
-    else:
-      kw = {}
-
+    kw: dict[str, Any] = {"compiler_options": compiler_options}
     return Compiled(
-        self._lowering.compile(**kw),
+        self._lowering.compile(**kw),  # pytype: disable=wrong-keyword-args
         self.args_info,
         self.out_tree,
-        no_kwargs=self._no_kwargs)
+        no_kwargs=self._no_kwargs,
+    )
 
   def as_text(self, dialect: Optional[str] = None) -> str:
     """A human-readable text representation of this lowering.
@@ -613,6 +632,24 @@ class Lowered(Stage):
     """
     try:
       return self._lowering.compiler_ir(dialect)
+    except NotImplementedError:
+      return None
+
+  def cost_analysis(self) -> Optional[Any]:
+    """A summary of execution cost estimates.
+
+    Intended for visualization and debugging purposes. The object output by
+    this is some simple data structure that can easily be printed or serialized
+    (e.g. nested dicts, lists, and tuples with numeric leaves). However, its
+    structure can be arbitrary: it may be inconsistent across versions of JAX
+    and jaxlib, or even across invocations.
+
+    Returns ``None`` if unavailable, e.g. based on backend, compiler, or
+    runtime.
+    """
+    # TODO(frostig): improve annotation (basic pytree of arbitrary structure)
+    try:
+      return self._lowering.cost_analysis()
     except NotImplementedError:
       return None
 

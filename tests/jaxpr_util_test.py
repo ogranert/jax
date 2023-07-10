@@ -22,7 +22,7 @@ import jax
 from jax import jaxpr_util, jit, make_jaxpr, numpy as jnp
 from jax._src.lib import xla_client
 from jax._src import test_util as jtu
-from jax.config import config
+from jax import config
 
 
 config.parse_flags_with_absl()
@@ -38,10 +38,7 @@ class JaxprStatsTest(jtu.JaxTestCase):
     hist = jaxpr_util.primitives(make_jaxpr(f)(1., 1.).jaxpr)
 
     primitives = ['add', 'sin', 'cos']
-    if jax.config.jax_jit_pjit_api_merge:
-      primitives.append('pjit')
-    else:
-      primitives.append('xla_call')
+    primitives.append('pjit')
     for k in primitives:
       assert k in hist, k
     self.assertEqual(hist['sin'], 2)
@@ -77,10 +74,7 @@ class JaxprStatsTest(jtu.JaxTestCase):
         f'reduce_sum :: float{t}[]',
         f'concatenate :: float{t}[2]',
     ]
-    if jax.config.jax_jit_pjit_api_merge:
-      shapes.append(f'pjit :: float{t}[] *')
-    else:
-      shapes.append(f'xla_call :: float{t}[] *')
+    shapes.append(f'pjit :: float{t}[] *')
     for k in shapes:
       self.assertEqual(hist[k], 1)
 
@@ -99,7 +93,7 @@ class JaxprStatsTest(jtu.JaxTestCase):
       # comes from contextlib.
       return jax.named_call(jnp.cos, name='test')(x)
 
-    hist = jaxpr_util.source_locations(make_jaxpr(f)(1.).jaxpr)
+    hist = jaxpr_util.source_locations(make_jaxpr(f)(jnp.arange(8.)).jaxpr)
     for filename in hist.keys():
       self.assertIn(os.path.basename(__file__), filename)
 

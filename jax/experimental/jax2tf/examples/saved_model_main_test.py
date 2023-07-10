@@ -18,7 +18,7 @@ from absl import flags
 from absl.testing import absltest
 from absl.testing import parameterized
 from jax._src import test_util as jtu
-from jax.config import config
+from jax import config
 
 from jax.experimental.jax2tf.examples import saved_model_main
 from jax.experimental.jax2tf.tests import tf_test_util
@@ -48,7 +48,7 @@ class SavedModelMainTest(tf_test_util.JaxToTfTestCase):
                                model="mnist_flax",
                                serving_batch_size=-1):
     if (serving_batch_size == -1 and
-        config.jax2tf_default_experimental_native_lowering and
+        config.jax2tf_default_native_serialization and
         not config.jax_dynamic_shapes):
       self.skipTest("shape polymorphism but --jax_dynamic_shapes is not set.")
     FLAGS.model = model

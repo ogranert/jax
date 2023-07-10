@@ -19,14 +19,13 @@ import sys
 
 from setuptools import setup, find_packages
 
-_current_jaxlib_version = '0.4.2'
+_current_jaxlib_version = '0.4.13'
 # The following should be updated with each new jaxlib release.
-_latest_jaxlib_version_on_pypi = '0.4.1'
-_available_cuda_versions = ['11']
-_default_cuda_version = '11'
-_available_cudnn_versions = ['82', '86']
-_default_cudnn_version = '86'
-_libtpu_version = '0.1.dev20230124'
+_latest_jaxlib_version_on_pypi = '0.4.13'
+_available_cuda11_cudnn_versions = ['86']
+_default_cuda11_cudnn_version = '86'
+_default_cuda12_cudnn_version = '89'
+_libtpu_version = '0.1.dev20230622'
 
 _dct = {}
 with open('jax/version.py', encoding='utf-8') as f:
@@ -60,13 +59,18 @@ setup(
     long_description_content_type='text/markdown',
     author='JAX team',
     author_email='jax-dev@google.com',
-    packages=find_packages(exclude=["examples"]),
+    packages=find_packages(exclude=["examples", "jax/src/internal_test_util"]),
     package_data={'jax': ['py.typed', "*.pyi", "**/*.pyi"]},
-    python_requires='>=3.8',
+    python_requires='>=3.9',
     install_requires=[
-        'numpy>=1.20',
+        'ml_dtypes>=0.2.0',
+        'numpy>=1.22',
         'opt_einsum',
-        'scipy>=1.5',
+        'scipy>=1.7',
+        # Required by xla_bridge.discover_pjrt_plugins for forwards compat with
+        # Python versions < 3.10. Can be dropped when 3.10 is the minimum
+        # required Python version.
+        'importlib_metadata>=4.6;python_version<"3.10"',
     ],
     extras_require={
         # Minimum jaxlib version; used in testing.
@@ -82,28 +86,58 @@ setup(
         # Cloud TPU VM jaxlib can be installed via:
         # $ pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
         'tpu': [f'jaxlib=={_current_jaxlib_version}',
-                f'libtpu-nightly=={_libtpu_version}',
-                # Required by cloud_tpu_init.py
-                'requests'],
+                f'libtpu-nightly=={_libtpu_version}'],
 
         # $ pip install jax[australis]
         'australis': ['protobuf>=3.13,<4'],
 
-        # CUDA installations require adding jax releases URL; e.g.
+        # CUDA installations require adding the JAX CUDA releases URL, e.g.,
         # Cuda installation defaulting to a CUDA and Cudnn version defined above.
         # $ pip install jax[cuda] -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-        'cuda': [f"jaxlib=={_current_jaxlib_version}+cuda{_default_cuda_version}.cudnn{_default_cudnn_version}"],
+        'cuda': [f"jaxlib=={_current_jaxlib_version}+cuda11.cudnn{_default_cuda11_cudnn_version}"],
+
+        'cuda11_pip': [
+          f"jaxlib=={_current_jaxlib_version}+cuda11.cudnn{_default_cuda11_cudnn_version}",
+          "nvidia-cublas-cu11>=11.11",
+          "nvidia-cuda-cupti-cu11>=11.8",
+          "nvidia-cuda-nvcc-cu11>=11.8",
+          "nvidia-cuda-runtime-cu11>=11.8",
+          "nvidia-cudnn-cu11>=8.8",
+          "nvidia-cufft-cu11>=10.9",
+          "nvidia-cusolver-cu11>=11.4",
+          "nvidia-cusparse-cu11>=11.7",
+        ],
+
+        'cuda12_pip': [
+          f"jaxlib=={_current_jaxlib_version}+cuda12.cudnn{_default_cuda12_cudnn_version}",
+          "nvidia-cublas-cu12",
+          "nvidia-cuda-cupti-cu12",
+          "nvidia-cuda-nvcc-cu12",
+          "nvidia-cuda-runtime-cu12",
+          "nvidia-cudnn-cu12>=8.9",
+          "nvidia-cufft-cu12",
+          "nvidia-cusolver-cu12",
+          "nvidia-cusparse-cu12",
+        ],
+
+        # Target that does not depend on the CUDA pip wheels, for those who want
+        # to use a preinstalled CUDA.
+        'cuda11_local': [
+          f"jaxlib=={_current_jaxlib_version}+cuda11.cudnn{_default_cuda11_cudnn_version}",
+        ],
+        'cuda12_local': [
+          f"jaxlib=={_current_jaxlib_version}+cuda12.cudnn{_default_cuda12_cudnn_version}",
+        ],
 
         # CUDA installations require adding jax releases URL; e.g.
         # $ pip install jax[cuda11_cudnn82] -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
         # $ pip install jax[cuda11_cudnn86] -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-        **{f'cuda{cuda_version}_cudnn{cudnn_version}': f"jaxlib=={_current_jaxlib_version}+cuda{cuda_version}.cudnn{cudnn_version}"
-           for cuda_version in _available_cuda_versions for cudnn_version in _available_cudnn_versions}
+        **{f'cuda11_cudnn{cudnn_version}': f"jaxlib=={_current_jaxlib_version}+cuda11.cudnn{cudnn_version}"
+           for cudnn_version in _available_cuda11_cudnn_versions}
     },
     url='https://github.com/google/jax',
     license='Apache-2.0',
     classifiers=[
-        "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",

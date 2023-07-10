@@ -24,7 +24,7 @@ Table of contents:
     jax.debug.breakpoint()
     jax.debug.print("🤯 {y} 🤯", y=y)
     return y
-    
+
   f(2.)
 # Prints:
 # 🤯 2.0 🤯
@@ -82,7 +82,7 @@ Click [here](checkify_guide) to learn more!
 **TL;DR** Enable the `jax_debug_nans` flag to automatically detect when NaNs are produced in `jax.jit`-compiled code (but not in `jax.pmap` or `jax.pjit`-compiled code) and enable the `jax_disable_jit` flag to disable JIT-compilation, enabling use of traditional Python debugging tools like `print` and `pdb`.
 
 ```python
-from jax.config import config
+from jax import config
 config.update("jax_debug_nans", True)
 
 def f(x, y):

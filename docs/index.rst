@@ -10,30 +10,24 @@ JAX is Autograd_ and XLA_, brought together for high-performance numerical compu
 
    .. grid-item-card:: Familiar API
       :columns: 12 6 6 4
-      :class-card: key-ideas
+      :class-card: sd-border-0
       :shadow: None
 
-      JAX provides a familiar NumPy-style API for ease of adoption by researchers and engineers. 
+      JAX provides a familiar NumPy-style API for ease of adoption by researchers and engineers.
 
    .. grid-item-card:: Transformations
       :columns: 12 6 6 4
-      :class-card: key-ideas
+      :class-card: sd-border-0
       :shadow: None
 
       JAX includes composable function transformations for compilation, batching, automatic differentiation, and parallelization.
 
    .. grid-item-card:: Run Anywhere
       :columns: 12 6 6 4
-      :class-card: key-ideas
+      :class-card: sd-border-0
       :shadow: None
 
       The same code executes on multiple backends, including CPU, GPU, & TPU
-
-.. note::
-   JAX 0.4.1 introduces new parallelism APIs, including breaking changes to :func:`jax.experimental.pjit` and a new unified ``jax.Array`` type.
-   Please see `Distributed arrays and automatic parallelization <https://jax.readthedocs.io/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html>`_ tutorial and the :ref:`jax-array-migration`
-   guide for more information.
-
 
 .. grid:: 3
 
@@ -76,7 +70,7 @@ Installation
 
        .. code-block:: bash
 
-          pip install "jax[tpu]>=0.2.16" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+          pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 
 For more information about supported accelerators and platforms, and for other
 installation options, see the `Install Guide`_ in the project README.
@@ -107,6 +101,7 @@ installation options, see the `Install Guide`_ in the project README.
    user_guides
    advanced_guide
    contributor_guide
+   building_on_jax
    notes
    jax
 

@@ -372,10 +372,12 @@ device.
 Jitted functions behave like any other primitive operations—they will follow the
 data and will show errors if invoked on data committed on more than one device.
 
-``jax.device_put(jnp.zeros(...), jax.devices()[1])`` or similar will actually create the
-array of zeros on ``jax.devices()[1]``, instead of creating the array on the default
-device then moving it. This is thanks to some laziness in array creation, which holds
-for all the constant creation operations (``ones``, ``full``, ``eye``, etc).
+(Before `PR #6002 <https://github.com/google/jax/pull/6002>`_ in March 2021
+there was some laziness in creation of array constants, so that
+``jax.device_put(jnp.zeros(...), jax.devices()[1])`` or similar would actually
+create the array of zeros on ``jax.devices()[1]``, instead of creating the
+array on the default device then moving it. But this optimization was removed
+so as to simplify the implementation.)
 
 (As of April 2020, :func:`jax.jit` has a `device` parameter that affects the device
 placement. That parameter is experimental, is likely to be removed or changed,
@@ -398,7 +400,7 @@ speed of code using JAX:
 
 1. **JAX code is Just-In-Time (JIT) compiled.** Most code written in JAX can be
    written in such a way that it supports JIT compilation, which can make it run
-   *much faster* (see `To JIT or not to JIT`_). To get maximium performance from
+   *much faster* (see `To JIT or not to JIT`_). To get maximum performance from
    JAX, you should apply :func:`jax.jit` on your outer-most function calls.
 
    Keep in mind that the first time you run JAX code, it will be slower because
@@ -545,22 +547,22 @@ of how often it arises in control flow.
 
 Here is how the transformations introduce abstract or concrete tracers:
 
-  * :func:`jax.jit`: introduces **abstract tracers** for all positional arguments
-    except those denoted by ``static_argnums``, which remain regular
-    values.
-  * :func:`jax.pmap`: introduces **abstract tracers** for all positional arguments
-    except those denoted by ``static_broadcasted_argnums``.
-  * :func:`jax.vmap`, :func:`jax.make_jaxpr`, :func:`xla_computation`:
-    introduce **abstract tracers** for all positional arguments.
-  * :func:`jax.jvp` and :func:`jax.grad` introduce **concrete tracers**
-    for all positional arguments. An exception is when these transformations
-    are within an outer transformation and the actual arguments are
-    themselves abstract tracers; in that case, the tracers introduced
-    by the autodiff transformations are also abstract tracers.
-  * All higher-order control-flow primitives (:func:`lax.cond`, :func:`lax.while_loop`,
-    :func:`lax.fori_loop`, :func:`lax.scan`) when they process the functionals
-    introduce **abstract tracers**, whether or not there is a JAX transformation
-    in progress.
+* :func:`jax.jit`: introduces **abstract tracers** for all positional arguments
+  except those denoted by ``static_argnums``, which remain regular
+  values.
+* :func:`jax.pmap`: introduces **abstract tracers** for all positional arguments
+  except those denoted by ``static_broadcasted_argnums``.
+* :func:`jax.vmap`, :func:`jax.make_jaxpr`, :func:`xla_computation`:
+  introduce **abstract tracers** for all positional arguments.
+* :func:`jax.jvp` and :func:`jax.grad` introduce **concrete tracers**
+  for all positional arguments. An exception is when these transformations
+  are within an outer transformation and the actual arguments are
+  themselves abstract tracers; in that case, the tracers introduced
+  by the autodiff transformations are also abstract tracers.
+* All higher-order control-flow primitives (:func:`lax.cond`, :func:`lax.while_loop`,
+  :func:`lax.fori_loop`, :func:`lax.scan`) when they process the functionals
+  introduce **abstract tracers**, whether or not there is a JAX transformation
+  in progress.
 
 All of this is relevant when you have code that can operate
 only on regular Python values, such as code that has conditional
@@ -804,6 +806,10 @@ computation at runtime. For example:
 - If you wish to call non-JAX code within a transformed JAX function, you might
   consider using :func:`jax.pure_callback`, an example of which is available at
   `Pure callback example`_.
+- If you wish to input or output array buffers at runtime (for example, load data
+  from file, or log the contents of the array to disk), you might consider using
+  :func:`jax.experimental.io_callback`, an example of which can be found at
+  `IO callback example`_.
 
 For more information on runtime callbacks and examples of their use,
 see `External callbacks in JAX`_.
@@ -812,6 +818,7 @@ see `External callbacks in JAX`_.
 .. _JIT mechanics: https://jax.readthedocs.io/en/latest/notebooks/thinking_in_jax.html#jit-mechanics-tracing-and-static-variables
 .. _External callbacks in JAX: https://jax.readthedocs.io/en/latest/notebooks/external_callbacks.html
 .. _Pure callback example: https://jax.readthedocs.io/en/latest/notebooks/external_callbacks.html#example-pure-callback-with-custom-jvp
+.. _IO callback example: https://jax.readthedocs.io/en/latest/notebooks/external_callbacks.html#exploring-jax-experimental-io-callback
 .. _Heaviside Step Function: https://en.wikipedia.org/wiki/Heaviside_step_function
 .. _Sigmoid Function: https://en.wikipedia.org/wiki/Sigmoid_function
 .. _algebraic_simplifier.cc: https://github.com/tensorflow/tensorflow/blob/v2.10.0/tensorflow/compiler/xla/service/algebraic_simplifier.cc#L3266

@@ -4,15 +4,42 @@ JAX ships with a large number of built-in operations, but users occasionally run
 
 To accommodate such scenarios, JAX allows users to define custom operations and this tutorial is to explain how we can define one for GPUs and use it in single-GPU and multi-GPU environments.
 
-This tutorial contains information from [Extending JAX with custom C++ and CUDA code](https://github.com/dfm/extending-jax).
+This tutorial contains information from [Extending JAX with custom C++ and CUDA code](https://github.com/dfm/extending-jax) and
+supposes that you are familiar with [JAX primitive](https://jax.readthedocs.io/en/latest/notebooks/How_JAX_primitives_work.html).
 
 ## RMS normalization
 
 For this tutorial, we are going to add the RMS normalization as a custom operation in JAX.
 Note that the RMS normalization can be expressed with [`jax.numpy`](https://jax.readthedocs.io/en/latest/jax.numpy.html) directly. However, we are using it as an example to show the process of creating a custom operation for GPUs.
 The CUDA code in `gpu_ops/rms_norm_kernels.cu` for this operation has been borrowed from [Apex](https://github.com/NVIDIA/apex/blob/master/csrc/layer_norm_cuda_kernel.cu) and adapted to eliminate any dependency on PyTorch.
-See [`gpu_ops` code listing](#gpu_ops-code-listing) for complete code listing of C++ and CUDA files.
 
+
+## High-level steps
+
+This tutorial shows how to write both a custom operation and its gradient.
+
+In C:
+You need to follow these steps in C for each new JAX primitive:
+* Have CUDA kernel(s).
+* Create a C function that dispatches the CUDA kernel that will be called by XLA.
+* Create a descriptor to convey information needed for the computation.
+  * The types, the shapes and other attributes.
+* Bind C functions to Python
+  * To create the descriptor and to call the primitive during execution.
+
+In Python:
+You need to follow these steps in Python:
+* Define a new JAX primitive (instruction/operation)
+* Write Python functions to build the graph nodes with the primitive.
+* Define its abstract evaluation.
+* Define its lowering to MLIR.
+* [Optional] Define the gradient.
+* [Optional] Use [xmap](https://jax.readthedocs.io/en/latest/notebooks/xmap_tutorial.html) (or one of the experimental [custom_partitioning](https://jax.readthedocs.io/en/latest/jax.experimental.custom_partitioning.html) or [shard_map](https://jax.readthedocs.io/en/latest/jep/14273-shard-map.html) functions) for fast multi-GPU.
+
+
+## C code
+
+See [`gpu_ops` code listing](#gpu_ops-code-listing) for a complete code listing of C++ and CUDA files.
 `gpu_ops/rms_norm_kernels.cu` defines the following functions, which are declared with the XLA custom function signature.
 These functions are responsible for launching RMS normalization kernels with the given `buffers` on the specified `stream`.
 
@@ -85,6 +112,7 @@ PYBIND11_MODULE(gpu_ops, m) {
 ## Build `gpu_ops` extension module
 
 We build the `gpu_ops` Python extension module with the aforementioned code.
+(See [`gpu_ops` code listing](#gpu_ops-code-listing) for a complete code listing of C++ and CUDA files.)
 
 ```shell
 python -m pip install pybind11==2.10.1
@@ -162,7 +190,7 @@ from functools import reduce
 
 from jax.interpreters import mlir
 from jax.interpreters.mlir import ir
-from jaxlib.mhlo_helpers import custom_call
+from jaxlib.hlo_helpers import custom_call
 
 
 # Register functions defined in gpu_ops as custom call target for GPUs
@@ -479,8 +507,8 @@ We are using `jax.experimental.pjit.pjit` for parallel execution on multiple dev
 Let's first test the forward operation on multiple devices.  We are creating a simple 1D mesh and sharding `x` on all devices.
 
 ```python
-from jax.experimental.maps import Mesh
-from jax.experimental.pjit import PartitionSpec, pjit
+from jax.sharding import Mesh, PartitionSpec
+from jax.experimental.pjit import pjit
 
 
 mesh = Mesh(jax.local_devices(), ("x",))
@@ -488,9 +516,9 @@ ref = rms_norm(x, weight)
 pjitted = pjit(
     rms_norm,
     # Shard x by batch dimension and replicate weight on all devices.
-    in_axis_resources=(PartitionSpec("x", None, None), PartitionSpec(None, None)),
+    in_shardings=(PartitionSpec("x", None, None), PartitionSpec(None, None)),
     # Shard the output by batch dimension.
-    out_axis_resources=PartitionSpec("x", None, None),
+    out_shardings=PartitionSpec("x", None, None),
 )
 
 with mesh:
@@ -567,12 +595,12 @@ with mesh:
     pjitted = pjit(
         partial(xmap_rms_norm, device_count=jax.local_device_count()),
         # Shard x by batch dimension and replicate weight on all devices.
-        in_axis_resources=(
+        in_shardings=(
             PartitionSpec("x", None, None),
             PartitionSpec(None, None),
         ),
         # Shard the output by batch dimension.
-        out_axis_resources=PartitionSpec("x", None, None),
+        out_shardings=PartitionSpec("x", None, None),
     )
     print(pjitted.lower(x, weight).compile().runtime_executable().hlo_modules()[0].to_string())
     out = pjitted(x, weight)
@@ -623,12 +651,12 @@ with mesh:
     pjitted = pjit(
         jax.grad(partial(loss, device_count=jax.local_device_count()), argnums=(0, 1)),
         # Shard x by batch dimension and replicate weight on all devices.
-        in_axis_resources=(
+        in_shardings=(
             PartitionSpec("x", None, None),
             PartitionSpec(None, None),
         ),
         # Shard the output by batch dimension and replicate weight grad on all devices.
-        out_axis_resources=(
+        out_shardings=(
             PartitionSpec("x", None, None),
             PartitionSpec(None, None),
         ),
@@ -655,7 +683,7 @@ with mesh:
     c:bf16[32,512,512] d:bf16[512,512] = pjit[
       donated_invars=(False, False)
       in_positional_semantics=(<_PositionalSemantics.GLOBAL: 1>, <_PositionalSemantics.GLOBAL: 1>)
-      in_shardings=(OpShardingSharding({devices=[8,1,1]0,1,2,3,4,5,6,7}), OpShardingSharding({replicated}))
+      in_shardings=(GSPMDSharding({devices=[8,1,1]0,1,2,3,4,5,6,7}), GSPMDSharding({replicated}))
       jaxpr={ lambda ; e:bf16[32,512,512] f:bf16[512,512]. let
           g:bf16[8,4,512,512] = reshape[
             dimensions=None
@@ -734,7 +762,7 @@ with mesh:
         in (bn, bf) }
       name=<unnamed function>
       out_positional_semantics=_PositionalSemantics.GLOBAL
-      out_shardings=(OpShardingSharding({devices=[8,1,1]0,1,2,3,4,5,6,7}), OpShardingSharding({replicated}))
+      out_shardings=(GSPMDSharding({devices=[8,1,1]0,1,2,3,4,5,6,7}), GSPMDSharding({replicated}))
       resource_env=ResourceEnv(Mesh(device_ids=array([0, 1, 2, 3, 4, 5, 6, 7]), axis_names=('x',)), ())
     ] a b
   in (c, d) }
@@ -777,12 +805,13 @@ import jax.numpy as jnp
 from build import gpu_ops
 from jax import core, dtypes
 from jax.abstract_arrays import ShapedArray
-from jax.experimental.maps import Mesh, xmap
-from jax.experimental.pjit import PartitionSpec, pjit
+from jax.experimental.maps import xmap
+from jax.experimental.pjit import pjit
 from jax.interpreters import mlir, xla
 from jax.interpreters.mlir import ir
 from jax.lib import xla_client
-from jaxlib.mhlo_helpers import custom_call
+from jax.sharding import Mesh, PartitionSpec
+from jaxlib.hlo_helpers import custom_call
 
 
 # Create _rms_norm_fwd_p for forward operation.
@@ -1046,12 +1075,12 @@ with Mesh(jax.local_devices(), ("x",)):
     pjitted = pjit(
         jax.grad(partial(loss, device_count=jax.local_device_count()), argnums=(0, 1)),
         # Shard x by batch dimension and replicate weight on all devices.
-        in_axis_resources=(
+        in_shardings=(
             PartitionSpec("x", None, None),
             PartitionSpec(None, None),
         ),
         # Shard the output by batch dimension and replicate weight grad on all devices.
-        out_axis_resources=(
+        out_shardings=(
             PartitionSpec("x", None, None),
             PartitionSpec(None, None),
         ),

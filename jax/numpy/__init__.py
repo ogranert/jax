@@ -18,8 +18,7 @@
 from jax.numpy import fft as fft
 from jax.numpy import linalg as linalg
 
-from jax._src.device_array import DeviceArray as DeviceArray
-from jax._src.lib import xla_extension_version
+from jax._src.basearray import Array as ndarray
 
 from jax._src.numpy.lax_numpy import (
     ComplexWarning as ComplexWarning,
@@ -108,6 +107,9 @@ from jax._src.numpy.lax_numpy import (
     float16 as float16,
     float32 as float32,
     float64 as float64,
+    float8_e4m3b11fnuz as float8_e4m3b11fnuz,
+    float8_e4m3fn as float8_e4m3fn,
+    float8_e5m2 as float8_e5m2,
     float_ as float_,
     floating as floating,
     fmax as fmax,
@@ -141,10 +143,11 @@ from jax._src.numpy.lax_numpy import (
     inf as inf,
     inner as inner,
     insert as insert,
+    int4 as int4,
+    int8 as int8,
     int16 as int16,
     int32 as int32,
     int64 as int64,
-    int8 as int8,
     int_ as int_,
     integer as integer,
     interp as interp,
@@ -167,18 +170,14 @@ from jax._src.numpy.lax_numpy import (
     logspace as logspace,
     mask_indices as mask_indices,
     matmul as matmul,
-    median as median,
+    matrix_transpose as matrix_transpose,
     meshgrid as meshgrid,
     moveaxis as moveaxis,
-    msort as msort,
     nan as nan,
     nan_to_num as nan_to_num,
     nanargmax as nanargmax,
     nanargmin as nanargmin,
-    nanmedian as nanmedian,
-    nanpercentile as nanpercentile,
-    nanquantile as nanquantile,
-    ndarray as ndarray,
+    argpartition as argpartition,
     ndim as ndim,
     newaxis as newaxis,
     nonzero as nonzero,
@@ -189,14 +188,13 @@ from jax._src.numpy.lax_numpy import (
     outer as outer,
     packbits as packbits,
     pad as pad,
-    percentile as percentile,
+    partition as partition,
     pi as pi,
     piecewise as piecewise,
     place as place,
     printoptions as printoptions,
     promote_types as promote_types,
     put as put,
-    quantile as quantile,
     ravel as ravel,
     ravel_multi_index as ravel_multi_index,
     repeat as repeat,
@@ -241,10 +239,11 @@ from jax._src.numpy.lax_numpy import (
     triu_indices_from as triu_indices_from,
     trunc as trunc,
     uint as uint,
+    uint4 as uint4,
+    uint8 as uint8,
     uint16 as uint16,
     uint32 as uint32,
     uint64 as uint64,
-    uint8 as uint8,
     unpackbits as unpackbits,
     unravel_index as unravel_index,
     unsignedinteger as unsignedinteger,
@@ -256,14 +255,7 @@ from jax._src.numpy.lax_numpy import (
     where as where,
     zeros as zeros,
     zeros_like as zeros_like,
-    _NOT_IMPLEMENTED,
 )
-
-if xla_extension_version >= 117:
-  from jax._src.numpy.lax_numpy import (
-    float8_e4m3fn,
-    float8_e5m2,
-  )
 
 from jax._src.numpy.index_tricks import (
   c_ as c_,
@@ -288,7 +280,6 @@ from jax._src.numpy.polynomial import (
 )
 
 from jax._src.numpy.reductions import (
-    alltrue as alltrue,
     amin as amin,
     amax as amax,
     any as any,
@@ -297,23 +288,26 @@ from jax._src.numpy.reductions import (
     count_nonzero as count_nonzero,
     cumsum as cumsum,
     cumprod as cumprod,
-    cumproduct as cumproduct,
     max as max,
     mean as mean,
+    median as median,
     min as min,
     nancumsum as nancumsum,
     nancumprod as nancumprod,
     nanmax as nanmax,
     nanmean as nanmean,
+    nanmedian as nanmedian,
     nanmin as nanmin,
+    nanpercentile as nanpercentile,
     nanprod as nanprod,
+    nanquantile as nanquantile,
     nanstd as nanstd,
     nansum as nansum,
     nanvar as nanvar,
+    percentile as percentile,
     prod as prod,
-    product as product,
     ptp as ptp,
-    sometrue as sometrue,
+    quantile as quantile,
     std as std,
     sum as sum,
     var as var,
@@ -422,18 +416,48 @@ from jax._src.numpy.ufuncs import (
 
 from jax._src.numpy.vectorize import vectorize as vectorize
 
-# Module initialization is encapsulated in a function to avoid accidental
-# namespace pollution.
-def _init():
-  import numpy as np
-  from jax._src.numpy import lax_numpy
-  from jax._src import util
-  # Builds a set of all unimplemented NumPy functions.
-  for name, func in util.get_module_functions(np).items():
-    if name not in globals():
-      _NOT_IMPLEMENTED.append(name)
-      globals()[name] = lax_numpy._not_implemented(func, module='numpy')
+# Dynamically register numpy-style methods on JAX arrays.
+from jax._src.numpy.array_methods import register_jax_array_methods
+register_jax_array_methods()
+del register_jax_array_methods
 
-_init()
-del _init
-del xla_extension_version
+
+# Deprecations
+
+_deprecations = {
+    # Added March 14, 2023:
+    "DeviceArray": (
+        "jax.numpy.DeviceArray is deprecated. Use jax.Array.",
+        ndarray,
+    ),
+    # Added June 2, 2023:
+    "alltrue": (
+        "jax.numpy.alltrue is deprecated. Use jax.numpy.all",
+        all,
+    ),
+    "cumproduct": (
+        "jax.numpy.cumproduct is deprecated. Use jax.numpy.cumprod",
+        cumprod,
+    ),
+    "product": (
+        "jax.numpy.product is deprecated. Use jax.numpy.prod",
+        prod,
+    ),
+    "sometrue": (
+        "jax.numpy.sometrue is deprecated. Use jax.numpy.any",
+        any,
+    ),
+}
+
+import typing
+if typing.TYPE_CHECKING:
+  from jax._src.basearray import Array as DeviceArray
+  alltrue = all
+  cumproduct = cumprod
+  product = prod
+  sometrue = any
+else:
+  from jax._src.deprecations import deprecation_getattr as _deprecation_getattr
+  __getattr__ = _deprecation_getattr(__name__, _deprecations)
+  del _deprecation_getattr
+del typing

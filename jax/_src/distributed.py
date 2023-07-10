@@ -18,7 +18,7 @@ import os
 
 from typing import Any, Optional, Union, Sequence
 
-from jax._src.clusters import ClusterEnv
+from jax._src import clusters
 from jax._src.config import config
 from jax._src.lib import xla_extension
 
@@ -27,9 +27,11 @@ logger = logging.getLogger(__name__)
 
 class State:
   process_id: int = 0
+  num_processes: int = 1
   service: Optional[Any] = None
   client: Optional[Any] = None
   preemption_sync_manager: Optional[Any] = None
+  coordinator_address: Optional[str] = None
 
   def initialize(self,
                  coordinator_address: Optional[str] = None,
@@ -41,11 +43,11 @@ class State:
     if isinstance(local_device_ids, int):
       local_device_ids = [local_device_ids]
 
-    (coordinator_address,
-     num_processes,
-     process_id,
-     local_device_ids) = ClusterEnv.auto_detect_unset_distributed_params(
-      coordinator_address, num_processes, process_id, local_device_ids)
+    (coordinator_address, num_processes, process_id, local_device_ids) = (
+        clusters.ClusterEnv.auto_detect_unset_distributed_params(
+            coordinator_address, num_processes, process_id, local_device_ids
+        )
+    )
 
     if coordinator_address is None:
       raise ValueError('coordinator_address should be defined.')
@@ -53,6 +55,8 @@ class State:
       raise ValueError('Number of processes must be defined.')
     if process_id is None:
       raise ValueError('The process id of the current process must be defined.')
+
+    self.coordinator_address = coordinator_address
 
     if local_device_ids:
       visible_devices = ','.join(str(x) for x in local_device_ids) # type: ignore[union-attr]
@@ -68,6 +72,8 @@ class State:
       logger.info('Starting JAX distributed service on %s', coordinator_address)
       self.service = xla_extension.get_distributed_runtime_service(
           coordinator_address, num_processes, config.jax_coordination_service)
+
+    self.num_processes = num_processes
 
     if self.client is not None:
       raise RuntimeError('distributed.initialize should only be called once.')

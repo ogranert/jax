@@ -28,7 +28,7 @@ limitations under the License.
 #include "jaxlib/gpu/vendor.h"
 #include "jaxlib/handle_pool.h"
 #include "jaxlib/kernel_helpers.h"
-#include "tensorflow/compiler/xla/service/custom_call_status.h"
+#include "xla/service/custom_call_status.h"
 
 namespace jax {
 
@@ -550,7 +550,7 @@ void CooMatmat(gpuStream_t stream, void** buffers, const char* opaque,
 template <typename T, typename F>
 static absl::Status gtsv2(F computeGtsv2, gpuStream_t stream, void** buffers,
                           const char* opaque, std::size_t opaque_len) {
-  auto h = SparseHandlePool::Borrow();
+  auto h = SparseHandlePool::Borrow(stream);
   JAX_RETURN_IF_ERROR(h.status());
   auto& handle = *h;
 

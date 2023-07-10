@@ -19,16 +19,15 @@ import unittest
 from absl.testing import absltest
 import jax
 from jax import lax
-from jax.config import config
+from jax import config
 from jax.experimental import maps
 from jax.experimental import pjit
 from jax.interpreters import pxla
-from jax._src import sharding
 from jax._src import ad_checkpoint
 from jax._src import debugging
 from jax._src import dispatch
 from jax._src import test_util as jtu
-from jax._src.lib import xla_bridge
+from jax._src import xla_bridge
 import jax.numpy as jnp
 import numpy as np
 
@@ -60,7 +59,6 @@ class DummyDevice:
     self.platform = platform
     self.id = id
 
-@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # host callback
 class DebugPrintTest(jtu.JaxTestCase):
 
   def tearDown(self):
@@ -222,9 +220,6 @@ class DebugPrintTest(jtu.JaxTestCase):
     """))
 
 
-
-
-@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # host callback
 class DebugPrintTransformationTest(jtu.JaxTestCase):
 
   def test_debug_print_batching(self):
@@ -502,7 +497,6 @@ class DebugPrintTransformationTest(jtu.JaxTestCase):
       jax.effects_barrier()
     self.assertEqual(output(), "hello bwd: 2.0 3.0\n")
 
-@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # host callback
 class DebugPrintControlFlowTest(jtu.JaxTestCase):
 
   def _assertLinesEqual(self, text1, text2):
@@ -739,7 +733,6 @@ class DebugPrintControlFlowTest(jtu.JaxTestCase):
       b3: 2
       """))
 
-@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # host callback
 class DebugPrintParallelTest(jtu.JaxTestCase):
 
   def _assertLinesEqual(self, text1, text2):
@@ -790,14 +783,10 @@ class DebugPrintParallelTest(jtu.JaxTestCase):
     def f(x):
       debug_print("{}", x, ordered=False)
       return x
-    mesh = maps.Mesh(np.array(jax.devices()), ['dev'])
-    if config.jax_array:
-      spec = sharding.NamedSharding(mesh, pjit.PartitionSpec('dev'))
-      out_spec = sharding.NamedSharding(mesh, pjit.PartitionSpec())
-    else:
-      spec = pjit.PartitionSpec('dev')
-      out_spec = pjit.PartitionSpec()
-    f = pjit.pjit(f, in_axis_resources=spec, out_axis_resources=out_spec)
+    mesh = jax.sharding.Mesh(np.array(jax.devices()), ['dev'])
+    spec = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('dev'))
+    out_spec = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    f = pjit.pjit(f, in_shardings=spec, out_shardings=out_spec)
     with mesh:
       with jtu.capture_stdout() as output:
         f(np.arange(8, dtype=jnp.int32))
@@ -808,8 +797,8 @@ class DebugPrintParallelTest(jtu.JaxTestCase):
       y = x.dot(x)
       debug_print("{}", y, ordered=False)
       return y
-    f2 = pjit.pjit(f2, in_axis_resources=spec, out_axis_resources=out_spec)
-    with maps.Mesh(np.array(jax.devices()), ['dev']):
+    f2 = pjit.pjit(f2, in_shardings=spec, out_shardings=out_spec)
+    with jax.sharding.Mesh(np.array(jax.devices()), ['dev']):
       with jtu.capture_stdout() as output:
         f2(np.arange(8, dtype=jnp.int32))
         jax.effects_barrier()
@@ -819,9 +808,6 @@ class DebugPrintParallelTest(jtu.JaxTestCase):
     if xla_bridge.get_backend().runtime_type == 'stream_executor':
       raise self.skipTest(
           'Host callback not supported for runtime type: stream_executor.')
-
-    if not jax.config.jax_array:
-      self.skipTest("This test only works with jax.Array.")
 
     def f(x):
       debug_print("{}", x)
@@ -847,12 +833,9 @@ class DebugPrintParallelTest(jtu.JaxTestCase):
         return (i + 1, x)
       return lax.while_loop(cond, body, (0, x))[1]
 
-    mesh = maps.Mesh(np.array(jax.devices()), ['dev'])
-    if config.jax_array:
-      spec = sharding.NamedSharding(mesh, pjit.PartitionSpec('dev'))
-    else:
-      spec = pjit.PartitionSpec('dev')
-    f = pjit.pjit(f, in_axis_resources=spec, out_axis_resources=spec)
+    mesh = jax.sharding.Mesh(np.array(jax.devices()), ['dev'])
+    spec = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('dev'))
+    f = pjit.pjit(f, in_shardings=spec, out_shardings=spec)
     with mesh:
       with jtu.capture_stdout() as output:
         f(np.arange(8, dtype=jnp.int32))
@@ -876,14 +859,10 @@ class DebugPrintParallelTest(jtu.JaxTestCase):
       out = maps.xmap(foo, in_axes=['foo'], out_axes=[...])(x)
       debug_print("Out: {}", out)
       return out
-    mesh = maps.Mesh(np.array(jax.devices()), ['dev'])
-    if config.jax_array:
-      in_spec = sharding.NamedSharding(mesh, pjit.PartitionSpec('dev'))
-      out_spec = sharding.NamedSharding(mesh, pjit.PartitionSpec())
-    else:
-      in_spec = pjit.PartitionSpec('dev')
-      out_spec = pjit.PartitionSpec()
-    f = pjit.pjit(f, in_axis_resources=in_spec, out_axis_resources=out_spec)
+    mesh = jax.sharding.Mesh(np.array(jax.devices()), ['dev'])
+    in_spec = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('dev'))
+    out_spec = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    f = pjit.pjit(f, in_shardings=in_spec, out_shardings=out_spec)
     with mesh:
       with jtu.capture_stdout() as output:
         f(jnp.arange(8, dtype=jnp.int32) * 2)
@@ -900,7 +879,7 @@ class DebugPrintParallelTest(jtu.JaxTestCase):
       debug_print("{}", x, ordered=False)
     f = maps.xmap(f, in_axes=['a'], out_axes=None, backend='cpu',
                   axis_resources={'a': 'dev'})
-    with maps.Mesh(np.array(jax.devices()), ['dev']):
+    with jax.sharding.Mesh(np.array(jax.devices()), ['dev']):
       with jtu.capture_stdout() as output:
         f(np.arange(40))
         jax.effects_barrier()
@@ -982,7 +961,6 @@ class DebugPrintParallelTest(jtu.JaxTestCase):
       f(jnp.arange(2))
       jax.effects_barrier()
 
-@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # host callback
 class VisualizeShardingTest(jtu.JaxTestCase):
 
   def _create_devices(self, shape):
@@ -991,9 +969,9 @@ class VisualizeShardingTest(jtu.JaxTestCase):
     return np.array(devices).reshape(shape)
 
   def test_trivial_sharding(self):
-    mesh = maps.Mesh(self._create_devices(1), ['x'])
-    pspec = pjit.PartitionSpec('x')
-    sd = sharding.NamedSharding(mesh, pspec)
+    mesh = jax.sharding.Mesh(self._create_devices(1), ['x'])
+    pspec = jax.sharding.PartitionSpec('x')
+    sd = jax.sharding.NamedSharding(mesh, pspec)
     shape = (5,)
     with jtu.capture_stdout() as output:
       debugging.visualize_sharding(shape, sd)
@@ -1004,9 +982,9 @@ class VisualizeShardingTest(jtu.JaxTestCase):
     """))
 
   def test_trivial_sharding_with_scale(self):
-    mesh = maps.Mesh(self._create_devices(1), ['x'])
-    pspec = pjit.PartitionSpec('x')
-    sd = sharding.NamedSharding(mesh, pspec)
+    mesh = jax.sharding.Mesh(self._create_devices(1), ['x'])
+    pspec = jax.sharding.PartitionSpec('x')
+    sd = jax.sharding.NamedSharding(mesh, pspec)
     shape = (5,)
     with jtu.capture_stdout() as output:
       debugging.visualize_sharding(shape, sd, scale=8.)
@@ -1017,9 +995,9 @@ class VisualizeShardingTest(jtu.JaxTestCase):
     """))
 
   def test_full_sharding(self):
-    mesh = maps.Mesh(self._create_devices((8, 4)), ['x', 'y'])
-    pspec = pjit.PartitionSpec('x', 'y')
-    sd = sharding.NamedSharding(mesh, pspec)
+    mesh = jax.sharding.Mesh(self._create_devices((8, 4)), ['x', 'y'])
+    pspec = jax.sharding.PartitionSpec('x', 'y')
+    sd = jax.sharding.NamedSharding(mesh, pspec)
     shape = (8, 8)
     with jtu.capture_stdout() as output:
       debugging.visualize_sharding(shape, sd)
@@ -1046,10 +1024,10 @@ class VisualizeShardingTest(jtu.JaxTestCase):
 
   def test_sharding_with_replication(self):
     shape = (8, 8)
-    mesh = maps.Mesh(self._create_devices((8, 4)), ['x', 'y'])
+    mesh = jax.sharding.Mesh(self._create_devices((8, 4)), ['x', 'y'])
 
-    pspec = pjit.PartitionSpec('x', None)
-    sd = sharding.NamedSharding(mesh, pspec)
+    pspec = jax.sharding.PartitionSpec('x', None)
+    sd = jax.sharding.NamedSharding(mesh, pspec)
     with jtu.capture_stdout() as output:
       debugging.visualize_sharding(shape, sd)
     expected = _format_multiline("""
@@ -1073,9 +1051,9 @@ class VisualizeShardingTest(jtu.JaxTestCase):
     """)
     self.assertEqual(output(), expected)
 
-    mesh = maps.Mesh(self._create_devices((4, 2)), ['x', 'y'])
-    pspec = pjit.PartitionSpec(None, 'y')
-    sd = sharding.NamedSharding(mesh, pspec)
+    mesh = jax.sharding.Mesh(self._create_devices((4, 2)), ['x', 'y'])
+    pspec = jax.sharding.PartitionSpec(None, 'y')
+    sd = jax.sharding.NamedSharding(mesh, pspec)
     with jtu.capture_stdout() as output:
       debugging.visualize_sharding(shape, sd)
     expected = _format_multiline("""
@@ -1095,10 +1073,10 @@ class VisualizeShardingTest(jtu.JaxTestCase):
 
   def test_visualize_wide_array(self):
     shape = (128, 10000)
-    mesh = maps.Mesh(self._create_devices((8, 4)), ['x', 'y'])
+    mesh = jax.sharding.Mesh(self._create_devices((8, 4)), ['x', 'y'])
 
-    pspec = pjit.PartitionSpec('x', None)
-    sd = sharding.NamedSharding(mesh, pspec)
+    pspec = jax.sharding.PartitionSpec('x', None)
+    sd = jax.sharding.NamedSharding(mesh, pspec)
     with jtu.capture_stdout() as output:
       debugging.visualize_sharding(shape, sd)
     expected = _format_multiline("""
@@ -1126,7 +1104,7 @@ class VisualizeShardingTest(jtu.JaxTestCase):
     ss = pxla.ShardingSpec(
         sharding=(pxla.Unstacked(8),),
         mesh_mapping=(pxla.ShardedAxis(0),))
-    sd = sharding.PmapSharding(self._create_devices(8), ss)
+    sd = jax.sharding.PmapSharding(self._create_devices(8), ss)
     shape = (8,)
     with jtu.capture_stdout() as output:
       debugging.visualize_sharding(shape, sd)
@@ -1140,7 +1118,7 @@ class VisualizeShardingTest(jtu.JaxTestCase):
     ss = pxla.ShardingSpec(
         sharding=(pxla.Unstacked(8), pxla.NoSharding()),
         mesh_mapping=(pxla.ShardedAxis(0),))
-    sd = sharding.PmapSharding(self._create_devices(8), ss)
+    sd = jax.sharding.PmapSharding(self._create_devices(8), ss)
     shape = (8, 2)
     with jtu.capture_stdout() as output:
       debugging.visualize_sharding(shape, sd)
@@ -1165,7 +1143,6 @@ class VisualizeShardingTest(jtu.JaxTestCase):
     """)
     self.assertEqual(output(), expected)
 
-@jtu.pytest_mark_if_available('pjrt_c_api_unimplemented')  # host callback
 class InspectShardingTest(jtu.JaxTestCase):
 
   def test_inspect_sharding_is_called_in_pjit(self):
@@ -1177,43 +1154,42 @@ class InspectShardingTest(jtu.JaxTestCase):
     def _cb(sd):
       nonlocal is_called
       is_called = True
-      self.assertIsInstance(sd, sharding.Sharding)
+      self.assertIsInstance(sd, jax.sharding.Sharding)
       self.assertLen(sd.device_set, len(jax.devices()))
 
     def f(x):
       debugging.inspect_array_sharding(x, callback=_cb)
       return jnp.square(x)
 
-    mesh = maps.Mesh(np.array(jax.devices()), ['dev'])
-    if config.jax_array:
-      spec = sharding.NamedSharding(mesh, pjit.PartitionSpec('dev'))
-      out_spec = sharding.NamedSharding(mesh, pjit.PartitionSpec())
-    else:
-      spec = pjit.PartitionSpec('dev')
-      out_spec = pjit.PartitionSpec()
-    f = pjit.pjit(f, in_axis_resources=spec, out_axis_resources=out_spec)
+    mesh = jax.sharding.Mesh(np.array(jax.devices()), ['dev'])
+    spec = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('dev'))
+    out_spec = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    f = pjit.pjit(f, in_shardings=spec, out_shardings=out_spec)
     with mesh:
       f(np.arange(8, dtype=jnp.int32))
     self.assertTrue(is_called)
 
   def test_inspect_sharding_is_called_in_jit(self):
 
-    if not config.jax_array:
-      raise unittest.SkipTest("jax_array to work inside of `jit`.")
-
     is_called = False
     def _cb(sd):
       nonlocal is_called
       is_called = True
-      self.assertIsInstance(sd, sharding.Sharding)
+      self.assertIsInstance(sd, jax.sharding.Sharding)
       self.assertLen(sd.device_set, 1)
 
-    def f(x):
+    def f_(x):
       debugging.inspect_array_sharding(x, callback=_cb)
       return jnp.square(x)
 
-    f = jax.jit(f)
+    f = jax.jit(f_)
     f(np.arange(8, dtype=jnp.int32))
+    self.assertTrue(is_called)
+
+    # Test in grad
+    is_called = False
+    f = jax.jit(jax.grad(lambda x: f_(x).sum()))
+    f(np.arange(8, dtype=jnp.float32))
     self.assertTrue(is_called)
 
 

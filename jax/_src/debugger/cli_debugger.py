@@ -18,7 +18,7 @@ import pprint
 import sys
 import traceback
 
-from typing import Any, IO, List, Optional
+from typing import Any, IO, Optional
 
 from jax._src.debugger import core as debugger_core
 
@@ -27,12 +27,12 @@ DebuggerFrame = debugger_core.DebuggerFrame
 class CliDebugger(cmd.Cmd):
   """A text-based debugger."""
   prompt = '(jdb) '
-  use_rawinput: bool = False
 
-  def __init__(self, frames: List[DebuggerFrame], thread_id,
+  def __init__(self, frames: list[DebuggerFrame], thread_id,
       stdin: Optional[IO[str]] = None, stdout: Optional[IO[str]] = None,
       completekey: str = "tab"):
     super().__init__(stdin=stdin, stdout=stdout, completekey=completekey)
+    self.use_rawinput = stdin is None
     self.frames = frames
     self.frame_index = 0
     self.thread_id = thread_id
@@ -163,7 +163,7 @@ class CliDebugger(cmd.Cmd):
       except KeyboardInterrupt:
         print('--KeyboardInterrupt--', file=sys.stdout)
 
-def run_debugger(frames: List[DebuggerFrame], thread_id: Optional[int],
+def run_debugger(frames: list[DebuggerFrame], thread_id: Optional[int],
                  **kwargs: Any):
   CliDebugger(frames, thread_id, **kwargs).run()
 debugger_core.register_debugger("cli", run_debugger, -1)

@@ -19,14 +19,11 @@ import numpy as np
 
 import jax
 from jax import lax
-from jax._src import api
-from jax._src import dispatch
 from jax._src import test_util as jtu
 from jax._src.typing import DTypeLike
 from jax import tree_util
 from jax.util import safe_zip, split_list
 from jax.experimental import sparse
-from jax.experimental.sparse import bcoo as sparse_bcoo
 import jax.numpy as jnp
 
 
@@ -136,18 +133,23 @@ def _rand_sparse(shape: Sequence[int], dtype: DTypeLike, *,
   if 0 <= nse < 1:
     nse = int(np.ceil(nse * np.prod(sparse_shape)))
   data_rng = rand_method(rng)
-  index_shape = (*batch_shape, nse, n_sparse)
   data_shape = (*batch_shape, nse, *dense_shape)
-  bcoo_indices = jnp.array(
-      rng.randint(0, sparse_shape, size=index_shape, dtype=np.int32))  # type: ignore[arg-type]
   data = jnp.array(data_rng(data_shape, dtype))
 
   if sparse_format == 'bcoo':
-    return sparse.BCOO((data, bcoo_indices), shape=shape)
-
-  bcsr_indices, bcsr_indptr = sparse_bcoo._bcoo_to_bcsr(
-      bcoo_indices, shape=shape)
-  return sparse.BCSR((data, bcsr_indices, bcsr_indptr), shape=shape)
+    index_shape = (*batch_shape, nse, n_sparse)
+    indices = jnp.array(
+      rng.randint(0, sparse_shape, size=index_shape, dtype=np.int32))  # type: ignore[arg-type]
+    return sparse.BCOO((data, indices), shape=shape)
+  else:
+    index_shape = (*batch_shape, nse)
+    indptr_shape = (*batch_shape, sparse_shape[0] + 1)
+    indices = jnp.array(
+      rng.randint(0, sparse_shape[1], size=index_shape, dtype=np.int32))  # type: ignore[arg-type]
+    indptr = jnp.sort(
+      rng.randint(0, nse + 1, size=indptr_shape, dtype=np.int32), axis=-1)  # type: ignore[call-overload]
+    indptr = indptr.at[..., 0].set(0)
+    return sparse.BCSR((data, indices, indptr), shape=shape)
 
 def rand_bcoo(rng: np.random.RandomState,
               rand_method: Callable[..., Any]=jtu.rand_default,

@@ -19,7 +19,10 @@ load(
 
 licenses(["notice"])
 
-package(default_visibility = ["//visibility:public"])
+package(
+    default_applicable_licenses = [],
+    default_visibility = ["//visibility:public"],
+)
 
 py_library(
     name = "jax_to_ir",
@@ -39,5 +42,5 @@ py_library(
     deps = [
         "//jax",
         "//jax/experimental/jax2tf",
-    ] + py_deps("tensorflow"),
+    ] + py_deps("tensorflow_core"),
 )

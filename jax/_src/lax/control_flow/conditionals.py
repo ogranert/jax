@@ -19,28 +19,29 @@ import inspect
 import itertools
 import operator
 
-from typing import Callable, Sequence, List, Tuple
+from typing import Callable, Sequence
 
-from jax import core
-from jax._src import linear_util as lu
-from jax.config import config
-from jax.core import ConcreteArray, raise_to_shaped
-from jax.interpreters import ad
-from jax.interpreters import batching
-from jax.interpreters import mlir
-from jax.interpreters import partial_eval as pe
-from jax.interpreters import xla
+from jax import config
 from jax.tree_util import tree_flatten, tree_unflatten
 from jax._src import ad_util
-from jax._src.core import replace_jaxpr_effects
+from jax._src import core
+from jax._src import dispatch
 from jax._src import dtypes
+from jax._src import effects
+from jax._src import linear_util as lu
 from jax._src import source_info_util
 from jax._src import util
-from jax._src import state
+from jax._src.state.discharge import register_discharge_rule, discharge_state
+from jax._src.state.types import AbstractRef, RefEffect
+from jax._src.core import ConcreteArray, raise_to_shaped, replace_jaxpr_effects
+from jax._src.interpreters import ad
+from jax._src.interpreters import batching
+from jax._src.interpreters import mlir
+from jax._src.interpreters import partial_eval as pe
+from jax._src.interpreters import xla
 from jax._src.lax import lax
 from jax._src.traceback_util import api_boundary
-from jax._src.util import (safe_map, extend_name_stack, split_list,
-                           partition_list)
+from jax._src.util import (safe_map, split_list, partition_list)
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import hlo
 import numpy as np
@@ -76,6 +77,11 @@ def switch(index, branches: Sequence[Callable], *operands,
     def switch(index, branches, *operands):
       index = clamp(0, index, len(branches) - 1)
       return branches[index](*operands)
+
+  Internally this wraps XLA's `Conditional
+  <https://www.tensorflow.org/xla/operation_semantics#conditional>`_
+  operator. However, when transformed with :func:`~jax.vmap` to operate over a
+  batch of predicates, ``cond`` is converted to :func:`~jax.lax.select`.
 
   Args:
     index: Integer scalar type, indicating which branch function to apply.
@@ -137,7 +143,7 @@ def switch(index, branches: Sequence[Callable], *operands,
                           out_trees[0], jaxprs[0].out_avals,
                           out_tree, jaxpr.out_avals)
   joined_effects = core.join_effects(*(jaxpr.effects for jaxpr in jaxprs))
-  disallowed_effects = joined_effects - allowed_effects
+  disallowed_effects = allowed_effects.filter_not_in(joined_effects)
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `switch`: {disallowed_effects}')
@@ -237,7 +243,7 @@ def _cond(pred, true_fun: Callable, false_fun: Callable, *operands,
 
   jaxprs, consts, out_trees = _initial_style_jaxprs_with_common_consts(
       (true_fun, false_fun), ops_tree, ops_avals, 'cond')
-  if any(isinstance(op_aval, state.ShapedArrayRef) for op_aval in ops_avals):
+  if any(isinstance(op_aval, AbstractRef) for op_aval in ops_avals):
     raise ValueError("Cannot pass `Ref`s into `cond`.")
   true_jaxpr, false_jaxpr = jaxprs
   out_tree, false_out_tree = out_trees
@@ -246,7 +252,7 @@ def _cond(pred, true_fun: Callable, false_fun: Callable, *operands,
                         out_tree, true_jaxpr.out_avals,
                         false_out_tree, false_jaxpr.out_avals)
   joined_effects = core.join_effects(true_jaxpr.effects, false_jaxpr.effects)
-  disallowed_effects = joined_effects - allowed_effects
+  disallowed_effects = allowed_effects.filter_not_in(joined_effects)
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `cond`: {disallowed_effects}')
@@ -275,8 +281,11 @@ def cond(*args, **kwargs):
     pass
   else:
     assert not ba.kwargs  # no catch-all **kwargs in _cond_with_per_branch
-    _, _, maybe_true_fun, _, maybe_false_fun = ba.args
-    if callable(maybe_true_fun) and callable(maybe_false_fun):
+    _, true_operand, true_fun, false_operand, false_fun = ba.args
+    if callable(true_operand) and callable(true_fun):
+      # treat this as modern cond (with two operands)
+      return _cond(*args, **kwargs)
+    if callable(true_fun) and callable(false_fun):
       return _cond_with_per_branch_args(*ba.args)
 
   return _cond(*args, **kwargs)
@@ -303,23 +312,23 @@ def _cond_with_per_branch_args(pred,
                lambda op: false_fun(op[1]),
                (true_operand, false_operand))
 
+def _join_cond_effects(branches: Sequence[core.Jaxpr]) -> effects.Effects:
+  joined_effects = set()
+  for b in branches:
+    for eff in b.effects:
+      if isinstance(eff, effects.JaxprInputEffect):
+        # Offset index to handle predicate
+        eff = eff.replace(input_index=eff.input_index + 1)
+      joined_effects.add(eff)
+  return joined_effects
+
 def _cond_abstract_eval(*avals, branches, **_):
-  joined_effects = core.join_effects(*(b.effects for b in branches))
-  disallowed_effects = joined_effects - allowed_effects
+  joined_effects = _join_cond_effects(branches)
+  disallowed_effects = allowed_effects.filter_not_in(joined_effects)
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `cond`: {disallowed_effects}')
-  joined_effects = core.join_effects(*(b.effects for b in branches))
-  state_effects = {eff for eff in joined_effects if isinstance(eff,
-    state.RefEffect)}
-  jaxpr_aval_effects = state.get_ref_state_effects(
-      [v.aval for v in branches[0].jaxpr.invars], joined_effects)
-  aval_effects = [set(eff.replace(ref_aval=aval) for eff in effs) for aval, effs
-      in zip(avals[1:], jaxpr_aval_effects)
-      if isinstance(aval, state.ShapedArrayRef)]
-  nonlocal_state_effects = core.join_effects(*aval_effects)
-  all_effects = (joined_effects - state_effects) | nonlocal_state_effects
-  return map(raise_to_shaped, branches[0].out_avals), all_effects
+  return map(raise_to_shaped, branches[0].out_avals), joined_effects
 
 def _bcast_select(pred, on_true, on_false):
   if np.ndim(pred) != np.ndim(on_true):
@@ -333,11 +342,12 @@ def _bcast_select_n(pred, *cases):
     pred = lax.broadcast_in_dim(pred, np.shape(cases[0]), idx)
   return lax.select_n(pred, *cases)
 
-def _cond_batching_rule(axis_size, axis_name, main_type, args, dims, branches, linear):
+def _cond_batching_rule(spmd_axis_name, axis_size, axis_name, main_type, args,
+                        dims, branches, linear):
   index, *ops = args
   index_dim, *op_dims = dims
   # TODO(sharadmv): clean this up by adding a specific blocklist
-  if any(isinstance(eff, state.RefEffect) for branch in branches for eff in
+  if any(isinstance(eff, RefEffect) for branch in branches for eff in
       branch.jaxpr.effects):
     raise NotImplementedError(
         "State effect not supported in vmap-of-cond.")
@@ -362,7 +372,8 @@ def _cond_batching_rule(axis_size, axis_name, main_type, args, dims, branches, l
 
     branches_batched = [
         batching.batch_jaxpr(
-            jaxpr, axis_size, in_batched, out_batched, axis_name, main_type)[0]
+            jaxpr, axis_size, in_batched, out_batched, axis_name, spmd_axis_name,
+            main_type)[0]
         for jaxpr in branches]
 
     branch_outs = []
@@ -380,11 +391,13 @@ def _cond_batching_rule(axis_size, axis_name, main_type, args, dims, branches, l
            for b, x, d in zip(ops_bat, ops, op_dims)]
 
     branches_out_bat = [
-        batching.batch_jaxpr(jaxpr, axis_size, ops_bat, False, axis_name, main_type)[1]
+        batching.batch_jaxpr(jaxpr, axis_size, ops_bat, False, axis_name,
+                             spmd_axis_name, main_type)[1]
         for jaxpr in branches]
     out_bat = [any(bat) for bat in zip(*branches_out_bat)]
     branches_batched = tuple(
-        batching.batch_jaxpr(jaxpr, axis_size, ops_bat, out_bat, axis_name, main_type)[0]
+        batching.batch_jaxpr(jaxpr, axis_size, ops_bat, out_bat, axis_name,
+                             spmd_axis_name, main_type)[0]
         for jaxpr in branches)
 
     out_dims = [0 if b else batching.not_mapped for b in out_bat]
@@ -422,7 +435,7 @@ def _cond_jvp(primals, tangents, branches, linear):
 def _cond_partial_eval(trace, *tracers, branches, linear):
   in_unknowns = [t.pval[0] is not None for t in tracers]
   index_uk, *ops_uk = in_unknowns
-  if any(isinstance(eff, state.RefEffect) for branch in branches for eff in
+  if any(isinstance(eff, RefEffect) for branch in branches for eff in
       branch.jaxpr.effects):
     raise NotImplementedError(
         "State effect not supported in cond partial-eval.")
@@ -501,7 +514,7 @@ def _cond_partial_eval_custom(saveable, unks_in, inst_in, eqn):
 
   # First, compute output unknowns (unks_out), where an output of the cond is
   # unknown if it would be unknown on any of the branches.
-  unks_out: List[bool] = [False] * len(eqn.outvars)
+  unks_out: list[bool] = [False] * len(eqn.outvars)
   for jaxpr in branches:
     _, _, unks_out_, _, _ = pe.partial_eval_jaxpr_custom(
         jaxpr.jaxpr, in_unknowns=ops_uk, in_inst=True,
@@ -510,9 +523,9 @@ def _cond_partial_eval_custom(saveable, unks_in, inst_in, eqn):
 
   # Next, use the computed output unknowns to build a known jaxpr and a staged
   # jaxpr for each branch.
-  branches_known_ : List[core.ClosedJaxpr] = []
-  branches_staged_: List[core.ClosedJaxpr] = []
-  branch_res_avals: List[core.AbstractValue] = []
+  branches_known_ : list[core.ClosedJaxpr] = []
+  branches_staged_: list[core.ClosedJaxpr] = []
+  branch_res_avals: list[core.AbstractValue] = []
   for jaxpr in branches:
     jaxpr_known, jaxpr_staged, _, inst_out, num_res = \
         pe.partial_eval_jaxpr_custom(
@@ -544,7 +557,7 @@ def _cond_partial_eval_custom(saveable, unks_in, inst_in, eqn):
   out_binders_known, _ = partition_list(unks_out, eqn.outvars)
   linear_known = [l for l, uk in zip(eqn.params['linear'], ops_uk) if not uk]
   params_known = dict(branches=branches_known, linear=tuple(linear_known))
-  effects_known = core.join_effects(*(b.effects for b in branches_known))
+  effects_known = _join_cond_effects(branches_known)
   eqn_known = pe.new_jaxpr_eqn(
       ins_known, [*out_binders_known, *res_binders], cond_p, params_known,
       effects_known, eqn.source_info)
@@ -553,7 +566,7 @@ def _cond_partial_eval_custom(saveable, unks_in, inst_in, eqn):
   _, out_binders_staged = partition_list(inst_out, eqn.outvars)
   linear_staged = [False] * len(res_binders) + list(eqn.params['linear'])
   params_staged = dict(branches=branches_staged, linear=tuple(linear_staged))
-  effects_staged = core.join_effects(*(b.effects for b in branches_staged))
+  effects_staged = _join_cond_effects(branches_staged)
   eqn_staged = pe.new_jaxpr_eqn(
       [eqn.invars[0], *res_binders, *eqn.invars[1:]], out_binders_staged,
       cond_p, params_staged, effects_staged, eqn.source_info)
@@ -643,13 +656,13 @@ def _ordered_unique(xs):
   d = collections.OrderedDict((x, None) for x in xs)
   return list(d.keys())
 
-def _cond_dce_rule(used_outputs: List[bool], eqn: core.JaxprEqn,
-                   ) -> Tuple[List[bool], core.JaxprEqn]:
+def _cond_dce_rule(used_outputs: list[bool], eqn: core.JaxprEqn,
+                   ) -> tuple[list[bool], core.JaxprEqn]:
   closed_branches = eqn.params['branches']
   branches = [closed_jaxpr.jaxpr for closed_jaxpr in closed_branches]
 
   # First, compute which inputs are used in any branch (not including `pred`).
-  used_inputs: List[bool] = [False] * (len(eqn.invars) - 1)  # -1 for pred
+  used_inputs: list[bool] = [False] * (len(eqn.invars) - 1)  # -1 for pred
   for jaxpr in branches:
     _, used_inputs_ = pe.dce_jaxpr(jaxpr, used_outputs, instantiate=False)
     used_inputs = map(operator.or_, used_inputs, used_inputs_)
@@ -665,6 +678,7 @@ def _cond_dce_rule(used_outputs: List[bool], eqn: core.JaxprEqn,
   new_params = dict(eqn.params, branches=tuple(dce_branches),
                     linear=tuple(dce_linear))
   new_effects = core.join_effects(*(b.effects for b in dce_branches))
+  new_effects = _join_cond_effects(dce_branches_)
   new_eqn = pe.new_jaxpr_eqn(
       [v for v, used in zip(eqn.invars, [True, *used_inputs]) if used],
       [v for v, used in zip(eqn.outvars, used_outputs) if used],
@@ -698,7 +712,7 @@ def _cond_transpose(reduce_axes, cts, *args, branches, linear):
   linear = [type(x) is ad.UndefinedPrimal for x in ops]
   in_avals = map(raise_to_shaped, branches[0].in_avals)
   num_res = len(ops) - sum(linear)
-  if any(isinstance(eff, state.RefEffect) for branch in branches for eff in
+  if any(isinstance(eff, RefEffect) for branch in branches for eff in
       branch.jaxpr.effects):
     raise NotImplementedError("State effect not supported in cond transpose.")
 
@@ -729,7 +743,9 @@ def _cond_axis_substitution(params, subst, traverse):
   branches = tuple(core.subst_axis_names_jaxpr(jaxpr, subst) for jaxpr in params['branches'])
   return dict(params, branches=branches)
 
-def _cond_typecheck(*in_atoms, branches, linear):
+def _cond_typecheck(bind_time, *in_atoms, branches, linear):
+  if not bind_time:
+    _, *in_atoms = in_atoms
   avals = [x.aval for x in in_atoms]
   tc = partial(_typecheck_param, 'cond')
   tc(branches, 'branches', 'tuple of ClosedJaxpr',
@@ -747,8 +763,8 @@ def _cond_typecheck(*in_atoms, branches, linear):
   jaxpr0 = branches[0]
   jaxpr0_in_avals_str = _avals_short(jaxpr0.in_avals)
   jaxpr0_out_avals_str = _avals_short(jaxpr0.out_avals)
-  joined_effects = core.join_effects(*(b.effects for b in branches))
-  disallowed_effects = joined_effects - allowed_effects
+  joined_effects = _join_cond_effects(branches)
+  disallowed_effects = allowed_effects.filter_not_in(joined_effects)
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `cond`: {disallowed_effects}')
@@ -784,29 +800,29 @@ def _cond_typecheck(*in_atoms, branches, linear):
     raise core.JaxprTypeError(
       f'cond branches take input types {jaxpr0_in_avals_str}, '
       f'called with operands of type {_avals_short(op_avals)}')
-  joined_effects = core.join_effects(*(b.effects for b in branches))
   return jaxpr0.out_avals, joined_effects
 
 def cond_bind(*args, branches, linear):
   if config.jax_enable_checks:
     avals = map(core.get_aval, args)
     in_atoms = [core.Var(0, '', a) for a in avals]  # dummies
-    _cond_typecheck(*in_atoms, branches=branches, linear=linear)
+    _cond_typecheck(True, *in_atoms, branches=branches, linear=linear)
     for jaxpr in branches:
       core.check_jaxpr(jaxpr.jaxpr)
   return core.AxisPrimitive.bind(cond_p, *args, branches=branches, linear=linear)
 
 cond_p = core.AxisPrimitive('cond')
 cond_p.multiple_results = True
-cond_p.def_impl(partial(xla.apply_primitive, cond_p))
+cond_p.def_impl(partial(dispatch.apply_primitive, cond_p))
 cond_p.def_effectful_abstract_eval(_cond_abstract_eval)
 cond_p.def_custom_bind(cond_bind)
 ad.primitive_jvps[cond_p] = _cond_jvp
 ad.reducing_transposes[cond_p] = _cond_transpose
 pe.custom_partial_eval_rules[cond_p] = _cond_partial_eval
-batching.axis_primitive_batchers[cond_p] = _cond_batching_rule
+batching.spmd_axis_primitive_batchers[cond_p] = _cond_batching_rule
+batching.axis_primitive_batchers[cond_p] = partial(_cond_batching_rule, None)
 xla.register_initial_style_primitive(cond_p)
-core.custom_typechecks[cond_p] = _cond_typecheck
+core.custom_typechecks[cond_p] = partial(_cond_typecheck, False)
 core.axis_substitution_rules[cond_p] = _cond_axis_substitution
 pe.partial_eval_jaxpr_custom_rules[cond_p] = _cond_partial_eval_custom
 pe.dce_rules[cond_p] = _cond_dce_rule
@@ -814,8 +830,7 @@ pe.dce_rules[cond_p] = _cond_dce_rule
 def _cond_lowering(ctx, index, *args, branches, linear):
   del linear  # Unused.
   joined_effects = core.join_effects(*(branch.effects for branch in branches))
-  ordered_effects = [eff for eff in joined_effects
-                     if eff in core.ordered_effects]
+  ordered_effects = list(effects.ordered_effects.filter_in(joined_effects))
   num_tokens = len(ordered_effects)
   tokens_in = ctx.tokens_in.subset(ordered_effects)
   output_token_types = [mlir.token_type() for _ in ordered_effects]
@@ -828,12 +843,12 @@ def _cond_lowering(ctx, index, *args, branches, linear):
   # captures.
   case_op = hlo.CaseOp(flat_output_types, index=index,
                        num_branches=len(branches))
-  name_stack = extend_name_stack(ctx.module_context.name_stack, 'cond')
+  name_stack = ctx.module_context.name_stack.extend('cond')
   for i, jaxpr in enumerate(branches):
     branch = case_op.regions[i].blocks.append()
     with ir.InsertionPoint(branch):
       sub_ctx = ctx.module_context.replace(
-          name_stack=xla.extend_name_stack(name_stack, f'branch_{i}_fun'))
+          name_stack=name_stack.extend(f'branch_{i}_fun'))
       out_vals, tokens_out = mlir.jaxpr_subcomp(
           sub_ctx, jaxpr.jaxpr, tokens_in,
           map(mlir.ir_constants, jaxpr.consts),
@@ -850,17 +865,17 @@ def _cond_lowering(ctx, index, *args, branches, linear):
 
 mlir.register_lowering(cond_p, _cond_lowering)
 
-@state.register_discharge_rule(cond_p)
+@register_discharge_rule(cond_p)
 def _cond_state_discharge_rule(in_avals, out_avals, *args, branches, linear):
   discharged_branches = tuple(
-      core.ClosedJaxpr(state.discharge_state(branch.jaxpr, ())[0], ())
+      core.ClosedJaxpr(discharge_state(branch.jaxpr, ())[0], ())
       for branch in branches)
   out_vals = cond_p.bind(*args, branches=discharged_branches, linear=linear)
-  out_ref_vals, out_vals = util.split_list(
-      out_vals, [len(out_vals) - len(out_avals)])
+  out_vals, out_ref_vals = util.split_list(
+      out_vals, [len(out_avals)])
   ref_val_iter = iter(out_ref_vals)
   new_invals = []
   for aval in in_avals:
     new_invals.append(
-        next(ref_val_iter) if isinstance(aval, state.ShapedArrayRef) else None)
+        next(ref_val_iter) if isinstance(aval, AbstractRef) else None)
   return new_invals, out_vals

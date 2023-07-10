@@ -48,6 +48,10 @@ parser.add_argument(
   default=None,
   required=True,
   help="Target CPU architecture. Required.")
+parser.add_argument(
+  "--editable",
+  action="store_true",
+  help="Create an 'editable' jaxlib build instead of a wheel.")
 args = parser.parse_args()
 
 r = runfiles.Create()
@@ -103,32 +107,19 @@ def patch_copy_xla_extension_stubs(dst_dir):
   os.makedirs(xla_extension_dir)
   for stub_name in _XLA_EXTENSION_STUBS:
     stub_path = r.Rlocation(
-        "org_tensorflow/tensorflow/compiler/xla/python/xla_extension/" + stub_name)
+        "xla/xla/python/xla_extension/" + stub_name)
     stub_path = str(stub_path)  # Make pytype accept os.path.exists(stub_path).
     if stub_name in _OPTIONAL_XLA_EXTENSION_STUBS and not os.path.exists(stub_path):
       continue
     with open(stub_path) as f:
       src = f.read()
     src = src.replace(
-        "from tensorflow.compiler.xla.python import xla_extension",
+        "from xla.python import xla_extension",
         "from .. import xla_extension"
     )
     with open(os.path.join(xla_extension_dir, stub_name), "w") as f:
       f.write(src)
 
-
-def patch_copy_tpu_client_py(dst_dir):
-  with open(r.Rlocation("org_tensorflow/tensorflow/compiler/xla/python/tpu_driver/client/tpu_client.py")) as f:
-    src = f.read()
-    src = src.replace("from tensorflow.compiler.xla.python import xla_extension as _xla",
-                      "from . import xla_extension as _xla")
-    src = src.replace("from tensorflow.compiler.xla.python import xla_client",
-                      "from . import xla_client")
-    src = src.replace(
-        "from tensorflow.compiler.xla.python.tpu_driver.client import tpu_client_extension as _tpu_client",
-        "from . import tpu_client_extension as _tpu_client")
-    with open(os.path.join(dst_dir, "tpu_client.py"), "w") as f:
-      f.write(src)
 
 def verify_mac_libraries_dont_reference_chkstack():
   """Verifies that xla_extension.so doesn't depend on ____chkstk_darwin.
@@ -143,7 +134,7 @@ def verify_mac_libraries_dont_reference_chkstack():
     return
   nm = subprocess.run(
     ["nm", "-g",
-     r.Rlocation("org_tensorflow/tensorflow/compiler/xla/python/xla_extension.so")
+     r.Rlocation("xla/xla/python/xla_extension.so")
     ],
     capture_output=True, text=True,
     check=False)
@@ -168,12 +159,14 @@ def prepare_wheel(sources_path):
   copy_file("__main__/jaxlib/setup.cfg", dst_dir=sources_path)
   copy_to_jaxlib("__main__/jaxlib/init.py", dst_filename="__init__.py")
   copy_to_jaxlib(f"__main__/jaxlib/cpu_feature_guard.{pyext}")
+  copy_to_jaxlib(f"__main__/jaxlib/utils.{pyext}")
   copy_to_jaxlib("__main__/jaxlib/lapack.py")
   copy_to_jaxlib("__main__/jaxlib/hlo_helpers.py")
   copy_to_jaxlib("__main__/jaxlib/ducc_fft.py")
   copy_to_jaxlib("__main__/jaxlib/gpu_prng.py")
   copy_to_jaxlib("__main__/jaxlib/gpu_linalg.py")
   copy_to_jaxlib("__main__/jaxlib/gpu_rnn.py")
+  copy_to_jaxlib("__main__/jaxlib/gpu_triton.py")
   copy_to_jaxlib("__main__/jaxlib/gpu_solver.py")
   copy_to_jaxlib("__main__/jaxlib/gpu_sparse.py")
   copy_to_jaxlib("__main__/jaxlib/version.py")
@@ -194,6 +187,7 @@ def prepare_wheel(sources_path):
     copy_file(f"__main__/jaxlib/cuda/_linalg.{pyext}", dst_dir=cuda_dir)
     copy_file(f"__main__/jaxlib/cuda/_prng.{pyext}", dst_dir=cuda_dir)
     copy_file(f"__main__/jaxlib/cuda/_rnn.{pyext}", dst_dir=cuda_dir)
+    copy_file(f"__main__/jaxlib/cuda/_triton.{pyext}", dst_dir=cuda_dir)
   rocm_dir = os.path.join(jaxlib_dir, "rocm")
   if exists(f"__main__/jaxlib/rocm/_solver.{pyext}"):
     os.makedirs(rocm_dir)
@@ -214,6 +208,7 @@ def prepare_wheel(sources_path):
   os.makedirs(mlir_dialects_dir)
   os.makedirs(mlir_libs_dir)
   copy_file("__main__/jaxlib/mlir/ir.py", dst_dir=mlir_dir)
+  copy_file("__main__/jaxlib/mlir/jax.py", dst_dir=mlir_dir)
   copy_file("__main__/jaxlib/mlir/passmanager.py", dst_dir=mlir_dir)
   copy_file("__main__/jaxlib/mlir/dialects/_builtin_ops_ext.py", dst_dir=mlir_dialects_dir)
   copy_file("__main__/jaxlib/mlir/dialects/_builtin_ops_gen.py", dst_dir=mlir_dialects_dir)
@@ -241,6 +236,7 @@ def prepare_wheel(sources_path):
   copy_file(f"__main__/jaxlib/mlir/_mlir_libs/_mlirDialectsSparseTensor.{pyext}", dst_dir=mlir_libs_dir)
   copy_file(f"__main__/jaxlib/mlir/_mlir_libs/_mlirSparseTensorPasses.{pyext}", dst_dir=mlir_libs_dir)
   copy_file(f"__main__/jaxlib/mlir/_mlir_libs/_stablehlo.{pyext}", dst_dir=mlir_libs_dir)
+  copy_file(f"__main__/jaxlib/mlir/_mlir_libs/_jax_passes.{pyext}", dst_dir=mlir_libs_dir)
   copy_file(f"__main__/jaxlib/mlir/_mlir_libs/_site_initialize_0.{pyext}", dst_dir=mlir_libs_dir)
   if _is_windows():
     copy_file("__main__/jaxlib/mlir/_mlir_libs/jaxlib_mlir_capi.dll", dst_dir=mlir_libs_dir)
@@ -249,10 +245,6 @@ def prepare_wheel(sources_path):
   else:
     copy_file("__main__/jaxlib/mlir/_mlir_libs/libjaxlib_mlir_capi.so", dst_dir=mlir_libs_dir)
   patch_copy_xla_extension_stubs(jaxlib_dir)
-
-  if exists("org_tensorflow/tensorflow/compiler/xla/python/tpu_driver/client/tpu_client_extension.so"):
-    copy_to_jaxlib("org_tensorflow/tensorflow/compiler/xla/python/tpu_driver/client/tpu_client_extension.so")
-    patch_copy_tpu_client_py(jaxlib_dir)
 
 
 def edit_jaxlib_version(sources_path):
@@ -295,8 +287,17 @@ def build_wheel(sources_path, output_path, cpu):
     output_file = os.path.join(output_path, os.path.basename(wheel))
     sys.stderr.write(f"Output wheel: {output_file}\n\n")
     sys.stderr.write("To install the newly-built jaxlib wheel, run:\n")
-    sys.stderr.write(f"  pip install {output_file}\n\n")
+    sys.stderr.write(f"  pip install {output_file} --force-reinstall\n\n")
     shutil.copy(wheel, output_path)
+
+
+def build_editable(sources_path, output_path):
+  sys.stderr.write(
+    "To install the editable jaxlib build, run:\n\n"
+    f"  pip install -e {output_path}\n\n"
+  )
+  shutil.rmtree(output_path, ignore_errors=True)
+  shutil.copytree(sources_path, output_path)
 
 
 tmpdir = None
@@ -308,7 +309,10 @@ if sources_path is None:
 try:
   os.makedirs(args.output_path, exist_ok=True)
   prepare_wheel(sources_path)
-  build_wheel(sources_path, args.output_path, args.cpu)
+  if args.editable:
+    build_editable(sources_path, args.output_path)
+  else:
+    build_wheel(sources_path, args.output_path, args.cpu)
 finally:
   if tmpdir:
     tmpdir.cleanup()

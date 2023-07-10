@@ -15,19 +15,16 @@
 from functools import partial
 import re
 import textwrap
-from typing import (
-    Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Type, TypeVar
-)
+from typing import Any, Callable, NamedTuple, Optional, Sequence, TypeVar
+
 import warnings
 
-from jax._src.config import config
 from jax._src import dtypes
-from jax._src.lax import lax as lax_internal
-from jax._src.numpy.ndarray import ndarray
-from jax._src.util import safe_zip, safe_map
 from jax._src import api
-from jax import core
+from jax._src import core
+from jax._src.config import config
 from jax._src.lax import lax
+from jax._src.util import safe_zip, safe_map
 from jax._src.typing import Array, ArrayLike, DType, DTypeLike, Shape
 
 import numpy as np
@@ -55,7 +52,7 @@ class ParsedDoc(NamedTuple):
   signature: str = ""
   summary: str = ""
   front_matter: str = ""
-  sections: Dict[str, str] = {}
+  sections: dict[str, str] = {}
 
 
 def _parse_numpydoc(docstr: Optional[str]) -> ParsedDoc:
@@ -103,7 +100,7 @@ def _parse_numpydoc(docstr: Optional[str]) -> ParsedDoc:
                    front_matter=front_matter, sections=sections)
 
 
-def _parse_parameters(body: str) -> Dict[str, str]:
+def _parse_parameters(body: str) -> dict[str, str]:
   """Parse the Parameters section of a docstring."""
   title, underline, content = body.split('\n', 2)
   assert title == 'Parameters'
@@ -112,7 +109,7 @@ def _parse_parameters(body: str) -> Dict[str, str]:
   return {p.partition(' : ')[0].partition(', ')[0]: p for p in parameters}
 
 
-def _parse_extra_params(extra_params: str) -> Dict[str, str]:
+def _parse_extra_params(extra_params: str) -> dict[str, str]:
   """Parse the extra parameters passed to _wraps()"""
   parameters = _parameter_break.split(extra_params.strip('\n'))
   return {p.partition(' : ')[0].partition(', ')[0]: p for p in parameters}
@@ -225,19 +222,10 @@ def _wraps(
 
 _dtype = partial(dtypes.dtype, canonicalize=True)
 
-def _asarray(arr: ArrayLike) -> Array:
-  """
-  Pared-down utility to convert object to a DeviceArray.
-  Note this will not correctly handle lists or tuples.
-  """
-  _check_arraylike("_asarray", arr)
-  dtype, weak_type = dtypes._lattice_result_type(arr)
-  return lax_internal._convert_element_type(arr, dtype, weak_type)
-
-def _promote_shapes(fun_name: str, *args: ArrayLike) -> List[Array]:
+def promote_shapes(fun_name: str, *args: ArrayLike) -> list[Array]:
   """Apply NumPy-style broadcasting, making args shape-compatible for lax.py."""
   if len(args) < 2:
-    return [_asarray(arg) for arg in args]
+    return [lax.asarray(arg) for arg in args]
   else:
     shapes = [np.shape(arg) for arg in args]
     if config.jax_dynamic_shapes:
@@ -248,10 +236,10 @@ def _promote_shapes(fun_name: str, *args: ArrayLike) -> List[Array]:
       return [_broadcast_to(arg, res_shape) for arg, shp in zip(args, shapes)]
     else:
       if all(len(shapes[0]) == len(s) for s in shapes[1:]):
-        return [_asarray(arg) for arg in args]  # no need for rank promotion, so rely on lax promotion
+        return [lax.asarray(arg) for arg in args]  # no need for rank promotion, so rely on lax promotion
       nonscalar_ranks = {len(shp) for shp in shapes if shp}
       if len(nonscalar_ranks) < 2:
-        return [_asarray(arg) for arg in args]  # rely on lax scalar promotion
+        return [lax.asarray(arg) for arg in args]  # rely on lax scalar promotion
       else:
         if config.jax_numpy_rank_promotion != "allow":
           _rank_promotion_warning_or_error(fun_name, shapes)
@@ -275,47 +263,47 @@ def _rank_promotion_warning_or_error(fun_name: str, shapes: Sequence[Shape]):
     raise ValueError(msg.format(fun_name, ' '.join(map(str, shapes))))
 
 
-def _promote_dtypes(*args: ArrayLike) -> List[Array]:
+def promote_dtypes(*args: ArrayLike) -> list[Array]:
   """Convenience function to apply Numpy argument dtype promotion."""
   # TODO(dougalm,mattjj): This is a performance bottleneck. Consider memoizing.
   if len(args) < 2:
-    return [_asarray(arg) for arg in args]
+    return [lax.asarray(arg) for arg in args]
   else:
     to_dtype, weak_type = dtypes._lattice_result_type(*args)
-    to_dtype = dtypes.canonicalize_dtype(to_dtype)
-    return [lax_internal._convert_element_type(x, to_dtype, weak_type) for x in args]
+    to_dtype = dtypes.canonicalize_dtype(to_dtype, allow_opaque_dtype=True)
+    return [lax._convert_element_type(x, to_dtype, weak_type) for x in args]
 
 
-def _promote_dtypes_inexact(*args: ArrayLike) -> List[Array]:
+def promote_dtypes_inexact(*args: ArrayLike) -> list[Array]:
   """Convenience function to apply Numpy argument dtype promotion.
 
   Promotes arguments to an inexact type."""
   to_dtype, weak_type = dtypes._lattice_result_type(*args)
-  to_dtype = dtypes.canonicalize_dtype(to_dtype)
+  to_dtype = dtypes.canonicalize_dtype(to_dtype, allow_opaque_dtype=True)
   to_dtype_inexact = dtypes.to_inexact_dtype(to_dtype)
-  return [lax_internal._convert_element_type(x, to_dtype_inexact, weak_type)
+  return [lax._convert_element_type(x, to_dtype_inexact, weak_type)
           for x in args]
 
 
-def _promote_dtypes_numeric(*args: ArrayLike) -> List[Array]:
+def promote_dtypes_numeric(*args: ArrayLike) -> list[Array]:
   """Convenience function to apply Numpy argument dtype promotion.
 
   Promotes arguments to a numeric (non-bool) type."""
   to_dtype, weak_type = dtypes._lattice_result_type(*args)
   to_dtype = dtypes.canonicalize_dtype(to_dtype)
   to_dtype_numeric = dtypes.to_numeric_dtype(to_dtype)
-  return [lax_internal._convert_element_type(x, to_dtype_numeric, weak_type)
+  return [lax._convert_element_type(x, to_dtype_numeric, weak_type)
           for x in args]
 
 
-def _promote_dtypes_complex(*args: ArrayLike) -> List[Array]:
+def promote_dtypes_complex(*args: ArrayLike) -> list[Array]:
   """Convenience function to apply Numpy argument dtype promotion.
 
   Promotes arguments to a complex type."""
   to_dtype, weak_type = dtypes._lattice_result_type(*args)
   to_dtype = dtypes.canonicalize_dtype(to_dtype)
   to_dtype_complex = dtypes.to_complex_dtype(to_dtype)
-  return [lax_internal._convert_element_type(x, to_dtype_complex, weak_type)
+  return [lax._convert_element_type(x, to_dtype_complex, weak_type)
           for x in args]
 
 
@@ -325,23 +313,26 @@ def _complex_elem_type(dtype: DTypeLike) -> DType:
 
 
 def _arraylike(x: ArrayLike) -> bool:
-  return (isinstance(x, np.ndarray) or isinstance(x, ndarray) or
+  return (isinstance(x, np.ndarray) or isinstance(x, Array) or
           hasattr(x, '__jax_array__') or np.isscalar(x))
 
 
-def _stackable(*args: Any) -> bool:
-  return all(type(arg) in stackables for arg in args)
-stackables: Set[Type] = set()
-_register_stackable: Callable[[Type], None] = stackables.add
-
-
-def _check_arraylike(fun_name: str, *args: Any):
+def check_arraylike(fun_name: str, *args: Any):
   """Check if all args fit JAX's definition of arraylike."""
   assert isinstance(fun_name, str), f"fun_name must be a string. Got {fun_name}"
   if any(not _arraylike(arg) for arg in args):
     pos, arg = next((i, arg) for i, arg in enumerate(args)
                     if not _arraylike(arg))
     msg = "{} requires ndarray or scalar arguments, got {} at position {}."
+    raise TypeError(msg.format(fun_name, type(arg), pos))
+
+
+def check_arraylike_or_none(fun_name: str, *args: Any):
+  assert isinstance(fun_name, str), f"fun_name must be a string. Got {fun_name}"
+  if any(not (_arraylike(arg) or arg is None) for arg in args):
+    pos, arg = next((i, arg) for i, arg in enumerate(args)
+                    if not (_arraylike(arg) or arg is None))
+    msg = "{} requires ndarray, scalar, or None arguments, got {} at position {}."
     raise TypeError(msg.format(fun_name, type(arg), pos))
 
 
@@ -358,58 +349,56 @@ def _check_no_float0s(fun_name: str, *args: Any):
         "taken a gradient with respect to an integer argument.")
 
 
-def _promote_args(fun_name: str, *args: ArrayLike) -> List[Array]:
+def promote_args(fun_name: str, *args: ArrayLike) -> list[Array]:
   """Convenience function to apply Numpy argument shape and dtype promotion."""
-  _check_arraylike(fun_name, *args)
+  check_arraylike(fun_name, *args)
   _check_no_float0s(fun_name, *args)
-  return _promote_shapes(fun_name, *_promote_dtypes(*args))
+  return promote_shapes(fun_name, *promote_dtypes(*args))
 
 
-def _promote_args_numeric(fun_name: str, *args: ArrayLike) -> List[Array]:
-  _check_arraylike(fun_name, *args)
+def promote_args_numeric(fun_name: str, *args: ArrayLike) -> list[Array]:
+  check_arraylike(fun_name, *args)
   _check_no_float0s(fun_name, *args)
-  return _promote_shapes(fun_name, *_promote_dtypes_numeric(*args))
+  return promote_shapes(fun_name, *promote_dtypes_numeric(*args))
 
 
-def _promote_args_inexact(fun_name: str, *args: ArrayLike) -> List[Array]:
+def promote_args_inexact(fun_name: str, *args: ArrayLike) -> list[Array]:
   """Convenience function to apply Numpy argument shape and dtype promotion.
 
   Promotes non-inexact types to an inexact type."""
-  _check_arraylike(fun_name, *args)
+  check_arraylike(fun_name, *args)
   _check_no_float0s(fun_name, *args)
-  return _promote_shapes(fun_name, *_promote_dtypes_inexact(*args))
+  return promote_shapes(fun_name, *promote_dtypes_inexact(*args))
 
 
 @partial(api.jit, inline=True)
-def _broadcast_arrays(*args: ArrayLike) -> List[Array]:
+def _broadcast_arrays(*args: ArrayLike) -> list[Array]:
   """Like Numpy's broadcast_arrays but doesn't return views."""
   shapes = [np.shape(arg) for arg in args]
-  if not shapes or all(core.symbolic_equal_shape(shapes[0], s) for s in shapes):
-    return [_asarray(arg) for arg in args]
+  if not shapes or all(core.definitely_equal_shape(shapes[0], s) for s in shapes):
+    return [lax.asarray(arg) for arg in args]
   result_shape = lax.broadcast_shapes(*shapes)
   return [_broadcast_to(arg, result_shape) for arg in args]
 
 
 def _broadcast_to(arr: ArrayLike, shape: Shape) -> Array:
-  if hasattr(arr, "broadcast_to"):
-    return arr.broadcast_to(shape)  # type: ignore[union-attr]
-  _check_arraylike("broadcast_to", arr)
-  arr = arr if isinstance(arr, ndarray) else _asarray(arr)
+  check_arraylike("broadcast_to", arr)
+  arr = arr if isinstance(arr, Array) else lax.asarray(arr)
   if not isinstance(shape, tuple) and np.ndim(shape) == 0:
     shape = (shape,)
   shape = core.canonicalize_shape(shape)  # check that shape is concrete
   arr_shape = np.shape(arr)
-  if core.symbolic_equal_shape(arr_shape, shape):
+  if core.definitely_equal_shape(arr_shape, shape):
     return arr
   else:
     nlead = len(shape) - len(arr_shape)
     shape_tail = shape[nlead:]
-    compatible = all(core.symbolic_equal_one_of_dim(arr_d, [1, shape_d])
+    compatible = all(core.definitely_equal_one_of_dim(arr_d, [1, shape_d])
                      for arr_d, shape_d in safe_zip(arr_shape, shape_tail))
     if nlead < 0 or not compatible:
       msg = "Incompatible shapes for broadcasting: {} and requested shape {}"
       raise ValueError(msg.format(arr_shape, shape))
-    diff, = np.where(tuple(not core.symbolic_equal_dim(arr_d, shape_d)
+    diff, = np.where(tuple(not core.definitely_equal(arr_d, shape_d)
                            for arr_d, shape_d in safe_zip(arr_shape, shape_tail)))
     new_dims = tuple(range(nlead)) + tuple(nlead + diff)
     kept_dims = tuple(np.delete(np.arange(len(shape)), new_dims))
@@ -426,8 +415,8 @@ def _where(condition: ArrayLike, x: ArrayLike, y: ArrayLike) -> Array:
                      "be provided to jax.numpy.where, got {} and {}."
                      .format(x, y))
   if not np.issubdtype(_dtype(condition), np.bool_):
-    condition = lax.ne(condition, lax_internal._zero(condition))
-  x, y = _promote_dtypes(x, y)
+    condition = lax.ne(condition, lax._zero(condition))
+  x, y = promote_dtypes(x, y)
   condition_arr, x_arr, y_arr = _broadcast_arrays(condition, x, y)
   try:
     is_always_empty = core.is_empty_shape(x_arr.shape)

@@ -84,6 +84,7 @@ intersphinx_mapping = {
 suppress_warnings = [
     'ref.citation',  # Many duplicated citations in numpy/scipy docstrings.
     'ref.footnote',  # Many unreferenced footnotes in numpy/scipy docstrings
+    'myst.header',
 ]
 
 # Add any paths that contain templates here, relative to this directory.
@@ -119,18 +120,8 @@ exclude_patterns = [
     # These are kept in sync using the jupytext pre-commit hook.
     'notebooks/*.md',
     'jep/9407-type-promotion.md',
-    # TODO: revert to jax-101/*.md once 08-pjit has a notebook
-    'jax-101/01-jax-basics.md',
-    'jax-101/02-jitting.md',
-    'jax-101/03-vectorization.md',
-    'jax-101/04-advanced-autodiff.md',
-    'jax-101/05-random-numbers.md',
-    'jax-101/05.1-pytrees.md',
-    'jax-101/06-parallelism.md',
-    'jax-101/07-state.md',
+    'jax-101/*.md',
     'autodidax.md',
-    # Attempt to fix RTD build failure
-    'transformations.md',
 ]
 
 # The name of the Pygments (syntax highlighting) style to use.
@@ -158,7 +149,6 @@ html_theme = 'sphinx_book_theme'
 # further.  For a list of options available for each theme, see the
 # documentation.
 html_theme_options = {
-    'logo_only': True,
     'show_toc_level': 2,
     'repository_url': 'https://github.com/google/jax',
     'use_repository_button': True,     # add a "link to repository" button
@@ -216,6 +206,7 @@ nb_execution_excludepatterns = [
     'jax-101/*',
     'notebooks/xmap_tutorial.*',
     'notebooks/Distributed_arrays_and_automatic_parallelization.*',
+    'notebooks/autodiff_remat.*',
 ]
 
 # -- Options for HTMLHelp output ---------------------------------------------

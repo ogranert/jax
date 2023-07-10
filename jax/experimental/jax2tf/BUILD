@@ -21,6 +21,7 @@ load(
 licenses(["notice"])
 
 package(
+    default_applicable_licenses = [],
     default_visibility = ["//visibility:private"],
 )
 
@@ -33,17 +34,32 @@ py_library(
 )
 
 py_library(
-    name = "jax2tf_internal",
+    name = "jax_export",
     srcs = [
-        "call_tf.py",
-        "impl_no_xla.py",
-        "jax2tf.py",
+        "jax_export.py",
         "shape_poly.py",
     ],
     srcs_version = "PY3",
     # TODO: b/255503696: enable pytype
     tags = ["pytype_unchecked_annotations"],
+    visibility = ["//third_party/py/jax/experimental/jax2tf:__subpackages__"],
     deps = [
         "//jax",
-    ] + py_deps("numpy") + py_deps("tensorflow") + jax2tf_deps,
+    ] + py_deps("numpy"),
+)
+
+py_library(
+    name = "jax2tf_internal",
+    srcs = [
+        "call_tf.py",
+        "impl_no_xla.py",
+        "jax2tf.py",
+    ],
+    srcs_version = "PY3",
+    # TODO: b/255503696: enable pytype
+    tags = ["pytype_unchecked_annotations"],
+    deps = [
+        ":jax_export",
+        "//jax",
+    ] + py_deps("numpy") + py_deps("tensorflow_core") + jax2tf_deps,
 )

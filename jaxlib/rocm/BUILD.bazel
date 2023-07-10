@@ -46,6 +46,7 @@ cc_library(
     features = ["-use_header_modules"],
     deps = [
         ":hip_vendor",
+        "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -75,7 +76,7 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@local_config_rocm//rocm:hipblas",
         "@local_config_rocm//rocm:rocm_headers",
-        "@org_tensorflow//tensorflow/compiler/xla/service:custom_call_status",
+        "@xla//xla/service:custom_call_status",
     ],
 )
 
@@ -114,7 +115,7 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@local_config_rocm//rocm:hipsolver",
         "@local_config_rocm//rocm:rocm_headers",
-        "@org_tensorflow//tensorflow/compiler/xla/service:custom_call_status",
+        "@xla//xla/service:custom_call_status",
     ],
 )
 
@@ -154,7 +155,7 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@local_config_rocm//rocm:hipsparse",
         "@local_config_rocm//rocm:rocm_headers",
-        "@org_tensorflow//tensorflow/compiler/xla/service:custom_call_status",
+        "@xla//xla/service:custom_call_status",
     ],
 )
 
@@ -197,7 +198,7 @@ cc_library(
         ":hip_vendor",
         "//jaxlib:kernel_helpers",
         "@local_config_rocm//rocm:rocm_headers",
-        "@org_tensorflow//tensorflow/compiler/xla/service:custom_call_status",
+        "@xla//xla/service:custom_call_status",
     ],
 )
 
@@ -210,7 +211,7 @@ rocm_library(
         ":hip_vendor",
         "//jaxlib:kernel_helpers",
         "@local_config_rocm//rocm:rocm_headers",
-        "@org_tensorflow//tensorflow/compiler/xla/service:custom_call_status",
+        "@xla//xla/service:custom_call_status",
     ],
 )
 
@@ -244,7 +245,7 @@ cc_library(
         ":hip_vendor",
         "//jaxlib:kernel_helpers",
         "@local_config_rocm//rocm:rocm_headers",
-        "@org_tensorflow//tensorflow/compiler/xla/service:custom_call_status",
+        "@xla//xla/service:custom_call_status",
     ],
 )
 
@@ -257,7 +258,7 @@ rocm_library(
         ":hip_vendor",
         "//jaxlib:kernel_helpers",
         "@local_config_rocm//rocm:rocm_headers",
-        "@org_tensorflow//tensorflow/compiler/xla/service:custom_call_status",
+        "@xla//xla/service:custom_call_status",
     ],
 )
 

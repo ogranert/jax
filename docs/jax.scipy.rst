@@ -11,6 +11,8 @@ jax.scipy.fft
 
    dct
    dctn
+   idct
+   idctn
 
 jax.scipy.linalg
 ----------------
@@ -36,7 +38,6 @@ jax.scipy.linalg
    lu_factor
    lu_solve
    polar
-   polar_unitary
    qr
    rsf2csf
    schur
@@ -78,6 +79,7 @@ jax.scipy.signal
 .. autosummary::
   :toctree: _autosummary
 
+   fftconvolve
    convolve
    convolve2d
    correlate
@@ -86,6 +88,17 @@ jax.scipy.signal
    istft
    stft
    welch
+
+jax.scipy.spatial.transform
+---------------------------
+
+.. automodule:: jax.scipy.spatial.transform
+
+.. autosummary::
+  :toctree: _autosummary
+
+   Rotation
+   Slerp
 
 jax.scipy.sparse.linalg
 -----------------------
@@ -118,6 +131,7 @@ jax.scipy.special
    expi
    expit
    expn
+   gamma
    gammainc
    gammaincc
    gammaln
@@ -134,6 +148,7 @@ jax.scipy.special
    ndtr
    ndtri
    polygamma
+   spence
    sph_harm
    xlog1py
    xlogy
@@ -149,6 +164,7 @@ jax.scipy.stats
   :toctree: _autosummary
 
    mode
+   rankdata
 
 jax.scipy.stats.bernoulli
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -171,6 +187,9 @@ jax.scipy.stats.beta
 
    logpdf
    pdf
+   cdf
+   logcdf
+   sf
 
 jax.scipy.stats.betabinom
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -191,6 +210,11 @@ jax.scipy.stats.cauchy
 
    logpdf
    pdf
+   cdf
+   logcdf
+   sf
+   isf
+   ppf
 
 jax.scipy.stats.chi2
 ~~~~~~~~~~~~~~~~~~~~
@@ -201,7 +225,9 @@ jax.scipy.stats.chi2
 
    logpdf
    pdf
-
+   cdf
+   logcdf
+   sf
 
 
 jax.scipy.stats.dirichlet
@@ -231,6 +257,9 @@ jax.scipy.stats.gamma
 
    logpdf
    pdf
+   cdf
+   logcdf
+   sf
 
 jax.scipy.stats.gennorm
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -295,6 +324,8 @@ jax.scipy.stats.norm
    logpdf
    pdf
    ppf
+   sf
+   isf
 
 jax.scipy.stats.pareto
 ~~~~~~~~~~~~~~~~~~~~~~

@@ -64,11 +64,12 @@ data must be immutable, because it will be stored in function memoization tables
 from __future__ import annotations
 
 from functools import partial
-from typing import Any, Tuple, Callable
+import operator
+from typing import Any, Callable, Optional, NamedTuple
 import weakref
 
-from jax.tree_util import tree_map
-from jax.config import config
+from jax._src.tree_util import tree_map
+from jax._src.config import config
 from jax._src import core
 from jax._src import traceback_util
 from jax._src.util import curry
@@ -109,6 +110,27 @@ class Store:
 
   __bool__ = __nonzero__
 
+class EqualStore:
+  __slots__ = ('_store',)
+
+  def __init__(self):
+    self._store = Store()
+
+  val = property(operator.attrgetter('_store.val'))
+
+  def store(self, val):
+    try:
+      self._store.store(val)
+    except StoreException as e:
+      try:
+        okay = bool(self._store._val == val)
+      except:
+        raise e from None
+      else:
+        if not okay:
+          raise StoreException("Store occupied with not-equal value") from None
+
+
 
 class WrappedFun:
   """Represents a function `f` to which `transforms` are to be applied.
@@ -124,14 +146,15 @@ class WrappedFun:
     params: extra parameters to pass as keyword arguments to `f`, along with the
       transformed keyword arguments.
   """
-  __slots__ = ("f", "transforms", "stores", "params", "in_type")
+  __slots__ = ("f", "transforms", "stores", "params", "in_type", "debug_info")
 
-  def __init__(self, f, transforms, stores, params, in_type):
+  def __init__(self, f, transforms, stores, params, in_type, debug_info):
     self.f = f
     self.transforms = transforms
     self.stores = stores
     self.params = params
     self.in_type = in_type
+    self.debug_info = debug_info
 
   @property
   def __name__(self):
@@ -140,7 +163,7 @@ class WrappedFun:
   def wrap(self, gen, gen_static_args, out_store) -> WrappedFun:
     """Add another transform and its store."""
     return WrappedFun(self.f, ((gen, gen_static_args),) + self.transforms,
-                      (out_store,) + self.stores, self.params, None)
+                      (out_store,) + self.stores, self.params, None, None)
 
   def populate_stores(self, stores):
     """Copy the values from the `stores` into `self.stores`."""
@@ -199,11 +222,13 @@ class WrappedFun:
     return "Wrapped function:\n" + '\n'.join(transformation_stack) + '\nCore: ' + fun_name(self.f) + '\n'
 
   def __hash__(self):
-    return hash((self.f, self.transforms, self.params, self.in_type))
+    return hash((self.f, self.transforms, self.params, self.in_type,
+                 self.debug_info))
 
   def __eq__(self, other):
     return (self.f == other.f and self.transforms == other.transforms and
-            self.params == other.params and self.in_type == other.in_type)
+            self.params == other.params and self.in_type == other.in_type and
+            self.debug_info == other.debug_info)
 
 @curry
 def transformation(gen, fun: WrappedFun, *gen_static_args) -> WrappedFun:
@@ -216,9 +241,10 @@ def transformation(gen, fun: WrappedFun, *gen_static_args) -> WrappedFun:
   return fun.wrap(gen, gen_static_args, None)
 
 @curry
-def transformation_with_aux(gen, fun: WrappedFun, *gen_static_args) -> Tuple[WrappedFun, Any]:
+def transformation_with_aux(gen, fun: WrappedFun, *gen_static_args,
+                            use_eq_store=False) -> tuple[WrappedFun, Any]:
   """Adds one more transformation with auxiliary output to a WrappedFun."""
-  out_store = Store()
+  out_store = Store() if not use_eq_store else EqualStore()
   out_thunk = lambda: out_store.val
   return fun.wrap(gen, gen_static_args, out_store), out_thunk
 
@@ -231,15 +257,15 @@ def fun_name(f):
 def wrap_init(f, params=None) -> WrappedFun:
   """Wraps function `f` as a `WrappedFun`, suitable for transformation."""
   params = () if params is None else tuple(sorted(params.items()))
-  return WrappedFun(f, (), (), params, None)
+  return WrappedFun(f, (), (), params, None, None)
 
 
-def annotate(f: WrappedFun, in_type: core.InputType) -> WrappedFun:
+def annotate(f: WrappedFun, in_type: Optional[core.InputType]) -> WrappedFun:
   assert f.in_type is None
   if in_type is None:
     return f
   _check_input_type(in_type)
-  return WrappedFun(f.f, f.transforms, f.stores, f.params, in_type)
+  return WrappedFun(f.f, f.transforms, f.stores, f.params, in_type, f.debug_info)
 
 def _check_input_type(in_type: core.InputType) -> None:
   # Check that in_type is syntactically well-formed
@@ -269,6 +295,24 @@ def _check_input_type(in_type: core.InputType) -> None:
         if isinstance(d, core.DBIdx):
           provided[d.val] = True
   assert all(provided)
+
+
+class TracingDebugInfo(NamedTuple):
+  # Packages up trace/staging-time debug info about a func and its parameters,
+  # formed just before staging to a jaxpr and read in trace-time error messages.
+  # TODO(mattjj): delete partial_eval.DebugInfo, replace all uses with this cls
+  traced_for: str             # e.g. 'jit', 'scan', etc
+  func_src_info: str          # e.g. f'{fun.__name__} at {filename}:{lineno}'
+  arg_names: tuple[str, ...]  # e.g. ('args[0]', ... )
+  result_paths: Optional[Callable[[], tuple[str, ...]]]
+
+def add_debug_info(f: WrappedFun, debug_info: Optional[TracingDebugInfo]
+                   ) -> WrappedFun:
+  """Produce a new WrappedFun with debug_info attached."""
+  assert f.debug_info is None
+  if debug_info is None:
+    return f
+  return WrappedFun(f.f, f.transforms, f.stores, f.params, f.in_type, debug_info)
 
 
 def cache(call: Callable):
@@ -309,7 +353,16 @@ def cache(call: Callable):
   memoized_fun.cache_clear = fun_caches.clear  # type: ignore
   memoized_fun.evict_function = _evict_function  # type: ignore
 
+  cache_clearing_funs.add(memoized_fun.cache_clear)
+
   return memoized_fun
+
+cache_clearing_funs = weakref.WeakSet()  # type: ignore
+
+def clear_all_caches():
+  global cache_clearing_funs
+  for clear in cache_clearing_funs:
+    clear()
 
 @partial(partial, tree_map)
 def _copy_main_traces(x):
@@ -320,9 +373,8 @@ def _copy_main_traces(x):
 
 
 @transformation
-def hashable_partial(x, *args):
-  ans = yield (x,) + args, {}
-  yield ans
+def hashable_partial(*args):
+  yield (yield args, {})
 
 
 def merge_linear_aux(aux1, aux2):

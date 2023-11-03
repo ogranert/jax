@@ -21,7 +21,6 @@ import operator
 import google_benchmark
 import jax
 from jax import lax
-from jax.experimental import sparse
 from jax._src.api_util import shaped_abstractify  # technically not an api fn
 from jax._src.ad_checkpoint import checkpoint  # new jax.remat implementation
 from jax._src.lib import xla_client as xc
@@ -419,119 +418,6 @@ def sda_index_8(state):
   _run_sda_index_bench(state, 8)
 
 
-def _sparse_bcoo_fromdense(state, jit: bool = False, compile: bool = False):
-  shape = (2000, 2000)
-  nse = 10000
-  size = math.prod(shape)
-  rng = np.random.RandomState(1701)
-  data = rng.randn(nse)
-  indices = np.unravel_index(
-      rng.choice(size, size=nse, replace=False), shape=shape)
-  mat = jnp.zeros(shape).at[indices].set(data)
-
-  f = sparse.BCOO.fromdense
-  if compile or jit:
-    # Note: nse must be specified for JIT.
-    f = jax.jit(partial(f, nse=nse))
-
-  if compile:
-    while state:
-      f.lower(mat).compile()
-  else:
-    f(mat).block_until_ready()
-    while state:
-      f(mat).block_until_ready()
-
-
-@google_benchmark.register
-def sparse_bcoo_fromdense(state):
-  return _sparse_bcoo_fromdense(state)
-
-
-@google_benchmark.register
-def sparse_bcoo_fromdense_jit(state):
-  return _sparse_bcoo_fromdense(state, jit=True)
-
-
-@google_benchmark.register
-def sparse_bcoo_fromdense_compile(state):
-  return _sparse_bcoo_fromdense(state, compile=True)
-
-
-def _sparse_bcoo_todense(state, jit: bool = False, compile: bool = False):
-  shape = (2000, 2000)
-  nse = 10000
-  size = math.prod(shape)
-  rng = np.random.RandomState(1701)
-  data = rng.randn(nse)
-  indices = np.unravel_index(
-      rng.choice(size, size=nse, replace=False), shape=shape)
-  mat = sparse.BCOO((jnp.array(data), jnp.column_stack(indices)), shape=shape)
-
-  f = lambda mat: mat.todense()
-  if jit or compile:
-    f = jax.jit(f)
-
-  if compile:
-    while state:
-      f.lower(mat).compile()
-  else:
-    f(mat).block_until_ready()
-    while state:
-      f(mat).block_until_ready()
-
-
-@google_benchmark.register
-def sparse_bcoo_todense(state):
-  return _sparse_bcoo_todense(state)
-
-
-@google_benchmark.register
-def sparse_bcoo_todense_jit(state):
-  return _sparse_bcoo_todense(state, jit=True)
-
-
-@google_benchmark.register
-def sparse_bcoo_todense_compile(state):
-  return _sparse_bcoo_todense(state, compile=True)
-
-
-def _sparse_bcoo_matvec(state, jit: bool = False, compile: bool = False):
-  shape = (2000, 2000)
-  nse = 10000
-  key = jax.random.PRNGKey(1701)
-  mat = sparse.random_bcoo(key, nse=nse, shape=shape, dtype=jnp.float32,
-                           indices_dtype=jnp.int32, sorted_indices=True)
-  vec = jax.random.uniform(key, shape=(shape[1],), dtype=jnp.float32)
-
-  f = lambda mat, vec: mat @ vec
-  if jit or compile:
-    f = jax.jit(f)
-
-  if compile:
-    while state:
-      f.lower(mat, vec).compile()
-  else:
-    f(mat, vec).block_until_ready()
-    while state:
-      f(mat, vec).block_until_ready()
-
-
-@google_benchmark.register
-def sparse_bcoo_matvec(state):
-  return _sparse_bcoo_matvec(state)
-
-
-@google_benchmark.register
-def sparse_bcoo_matvec_jit(state):
-  return _sparse_bcoo_matvec(state, jit=True)
-
-
-@google_benchmark.register
-def sparse_bcoo_matvec_compile(state):
-  return _sparse_bcoo_matvec(state, compile=True)
-
-
 @google_benchmark.register
 @google_benchmark.option.unit(google_benchmark.kMillisecond)
 def bench_shaped_abstractify(state):
@@ -899,9 +785,9 @@ def batch_inplace_while(inplace_op, state):
 
   size = 100_000
   args = jnp.array([0]), jnp.zeros((1, size))
-  f(*args)  # compile
+  jax.block_until_ready(f(*args))  # compile
   while state:
-    f(*args)
+    jax.block_until_ready(f(*args))
 
 
 google_benchmark.register(
@@ -909,6 +795,26 @@ google_benchmark.register(
 google_benchmark.register(
     partial(batch_inplace_while, 'dynamic_update_slice'),
     name='batch_inplace_while_dynamic_update_slice')
+
+
+@google_benchmark.register
+def serial_dot_products(state):
+  SIZE = 50
+
+  @jax.jit
+  @jax.vmap
+  @jax.grad
+  def f(x):
+    out = 0
+    for i in range(SIZE):
+      y = x @ jnp.array([i, i + 1], dtype=jnp.float32)
+      out = out + y * x[0]
+    return out
+
+  x = jax.random.normal(jax.random.PRNGKey(0), (2, 2))
+  f(x).block_until_ready()  # compile
+  while state:
+    f(x).block_until_ready()
 
 
 @google_benchmark.register
@@ -927,6 +833,18 @@ def safe_zip(state):
   args = tuple(list(range(state.range(0))) for _ in range(state.range(1)))
   while state:
     jax.util.safe_zip(*args)
+
+
+@google_benchmark.register
+def bench_make_array_from_callback_fully_replicated_sharding(state):
+  mesh = jax.sharding.Mesh(
+      np.array(jax.devices()[:8]).reshape((4, 2)), ('x', 'y'))
+  shape = (8, 2)
+  np_arr = np.arange(16).reshape(shape)
+  s = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+  while state:
+    jax.make_array_from_callback(shape, s, np_arr.__getitem__)
 
 
 if __name__ == "__main__":

@@ -37,22 +37,22 @@ The limitations are used to filter out from tests the harnesses that are known
 to fail. A Limitation is specific to a harness.
 """
 
+from collections.abc import Iterable, Sequence
 import operator
 import os
 from functools import partial
-from typing import (Any, Callable, Iterable, Optional, NamedTuple, Sequence,
-                    Union)
+from typing import Any, Callable, Optional, NamedTuple, Union
 
 from absl import testing
 import numpy as np
 
 import jax
-from jax import config
 from jax import dtypes
 from jax import lax
 from jax import numpy as jnp
 
 from jax._src import ad_util
+from jax._src import config
 from jax._src import dispatch
 from jax._src import prng
 from jax._src import test_util as jtu
@@ -61,7 +61,12 @@ from jax._src.lax import windowed_reductions as lax_windowed_reductions
 from jax._src.lib import xla_client
 from jax._src import random as jax_random
 
-FLAGS = config.FLAGS
+# The code in this file relies on the values of some flags that are defined by
+# jtu. Note that the following can not always be moved to a test file since
+# then the test file has to import jtu first (to define the flags) which is not
+# desired if the test file is outside of this project (we don't want a
+# dependency on jtu outside of jax repo).
+config.parse_flags_with_absl()
 
 Rng = Any  # A random number generator
 DType = Any
@@ -138,6 +143,7 @@ class Harness:
   # The group name most often is the primitive name.
   group_name: str
   # Descriptive name of the harness, used as a testcase_name. Unique in a group.
+  # Will be sanitized to work with -k test filtering.
   name: str
   # The function taking all arguments (static and dynamic).
   fun: Callable
@@ -162,8 +168,9 @@ class Harness:
                jax_unimplemented: Sequence["Limitation"] = (),
                **params):
     """See class docstring."""
-    self.group_name = group_name
-    self.name = name
+    self.group_name = jtu.sanitize_test_name(group_name)
+    self.name = jtu.sanitize_test_name(name)
+    self.fullname = self.name if self.group_name is None else f"{self.group_name}_{self.name}"
     self.fun = fun  # type: ignore[assignment]
     self.arg_descriptors = arg_descriptors
     self.rng_factory = rng_factory  # type: ignore[assignment]
@@ -174,9 +181,6 @@ class Harness:
   def __str__(self):
     return self.fullname
 
-  @property
-  def fullname(self):
-    return self.name if self.group_name is None else f"{self.group_name}_{self.name}"
 
   def _arg_maker(self, arg_descriptor, rng: Rng):
     if isinstance(arg_descriptor, StaticArg):
@@ -223,11 +227,11 @@ class Harness:
              include_jax_unimpl: bool = False,
              one_containing: Optional[str] = None) -> bool:
     if not include_jax_unimpl:
-      if any([
+      if any(
           device_under_test in l.devices
           for l in self.jax_unimplemented
           if l.filter(device=device_under_test, dtype=self.dtype)
-      ]):
+      ):
         return False
 
     if one_containing is not None and one_containing not in self.fullname:
@@ -242,32 +246,32 @@ def dtypes_to_str(dtype_list: Sequence[DType], empty_means_all=False) -> str:
 
   names = {np.dtype(dt).name for dt in dtype_list}
   signed = {"int8", "int16", "int32", "int64"}
-  if all([t in names for t in signed]):
+  if signed <= names:
     names = (names - signed) | {"signed"}
   integers = {"uint8", "uint16", "uint32", "uint64"}
-  if all([t in names for t in integers]):
+  if integers <= names:
     names = (names - integers) | {"unsigned"}
   integer = {"signed", "unsigned"}
-  if all([t in names for t in integer]):
+  if integer <= names:
     names = (names - integer) | {"integer"}
 
   floating = {"bfloat16", "float16", "float32", "float64"}
-  if all([t in names for t in floating]):
+  if floating <= names:
     names = (names - floating) | {"floating"}
 
   complex = {"complex64", "complex128"}
-  if all([t in names for t in complex]):
+  if complex <= names:
     names = (names - complex) | {"complex"}
 
   inexact = {"floating", "complex"}
-  if all([t in names for t in inexact]):
+  if inexact <= names:
     names = (names - inexact) | {"inexact"}
 
   all_types = {"integer", "inexact", "bool"}
-  if all([t in names for t in all_types]):
+  if all_types <= names:
     names = (names - all_types) | {"all"}
 
-  return ", ".join(sorted(list(names)))
+  return ", ".join(sorted(names))
 
 
 ##### All harnesses in this file.
@@ -812,7 +816,7 @@ def _make_argminmax_harness(prim,
   for enable_xla in [True, False]:
     define(
         prim,
-        f"{name}_shape={jtu.format_shape_dtype_string(shape, dtype)}_{axes=}_indexdtype={index_dtype}_enablexla={enable_xla}",
+        f"{name}_shape={jtu.format_shape_dtype_string(shape, dtype)}_{axes=}_indexdtype={index_dtype}_enable_xla={enable_xla}",
         lambda arg: prim.bind(arg, axes=axes, index_dtype=index_dtype), [arr],
         shape=shape,
         dtype=dtype,
@@ -2662,31 +2666,25 @@ for dtype in (np.float32, np.float64):
     define(
         "random_gamma",
         f"shape={jtu.format_shape_dtype_string(shape, dtype)}",
-        jax.jit(jax_random.gamma),
-        [np.array([42, 43], dtype=np.uint32),
-         RandArg(shape, dtype)],
+        jax.jit(lambda x: jax_random.gamma(jax.random.key(42), x)),
+        [RandArg(shape, dtype)],
         dtype=dtype)
 
-for key_i, key in enumerate([
-    np.array([0, 0], dtype=np.uint32),
-    np.array([42, 43], dtype=np.uint32),
-    np.array([0xFFFFFFFF, 0], dtype=np.uint32),
-    np.array([0, 0xFFFFFFFF], dtype=np.uint32),
-    np.array([0xFFFFFFFF, 0xFFFFFFFF], dtype=np.uint32)
-]):
-  if jax.config.jax_enable_custom_prng:
-    def wrap_and_split(key):
-      key = prng.random_wrap(key, impl=jax.random.default_prng_impl())
-      result = jax.random.split(key, 2)
-      return prng.random_unwrap(result)
-  else:
-    def wrap_and_split(key):
-      return jax.random.split(key, 2)
-  define(
-      "random_split",
-      f"i={key_i}",
-      jax.jit(wrap_and_split), [key],
-      dtype=key.dtype)
+
+
+def wrap_and_split():
+  key = jax.random.key(42)
+  if config.enable_custom_prng.value:
+    key = jax.random.wrap_key_data(key)
+  result = jax.random.split(key, 2)
+  return jax.random.key_data(result)
+
+define(
+    "random_split",
+    "",
+    jax.jit(wrap_and_split),
+    [],
+    dtype=np.uint32)
 
 # A few library functions from jax.random
 for dtype in jtu.dtypes.all_floating:
@@ -2695,8 +2693,9 @@ for dtype in jtu.dtypes.all_floating:
       define(
           "random_categorical",
           f"shape={jtu.format_shape_dtype_string(shape, dtype)}_{axis=}",
-          jax.random.categorical,
-          [np.array([42, 43], dtype=np.uint32), RandArg(shape, dtype),
+          lambda x, axis: jax.random.categorical(
+            jax.random.key(42), x, axis),
+          [RandArg(shape, dtype),
            StaticArg(axis)],
           dtype=dtype,
           axis=axis)
@@ -2706,9 +2705,9 @@ for dtype in jtu.dtypes.all_floating:
     define(
         "random_uniform",
         f"shape={jtu.format_shape_dtype_string(shape, dtype)}",
-        jax.random.uniform,
-        [np.array([42, 43], dtype=np.uint32),
-         StaticArg(shape), StaticArg(dtype)],
+        lambda shape, dtype: jax.random.uniform(
+          jax.random.key(42), shape, dtype),
+        [StaticArg(shape), StaticArg(dtype)],
         dtype=dtype)
 
 for dtype in jtu.dtypes.all_integer:
@@ -2719,9 +2718,9 @@ for dtype in jtu.dtypes.all_integer:
     define(
         "random_randint",
         f"shape={jtu.format_shape_dtype_string(shape, dtype)}",
-        jax.random.randint,
-        [np.array([42, 43], dtype=np.uint32),
-         StaticArg(shape),
+        lambda shape, minval, maxval, dtype: jax.random.randint(
+          jax.random.key(42), shape, minval, maxval, dtype),
+        [StaticArg(shape),
          StaticArg(-5),  # minval
          StaticArg(maxval),
          StaticArg(dtype)],
@@ -2781,10 +2780,12 @@ def _make_dot_general_harness(name,
                               *,
                               lhs_shape=(3, 4),
                               rhs_shape=(4, 2),
-                              dtype=np.float32,
+                              lhs_dtype=np.float32,
+                              rhs_dtype=np.float32,
                               precision=None,
                               dimension_numbers=(((1,), (0,)), ((), ())),
-                              preferred_element_type=None):
+                              preferred_element_type=None,
+                              enable_xla=True):
   suffix = ""
   if precision is not None:
     suffix += f"_{precision=}"
@@ -2793,29 +2794,39 @@ def _make_dot_general_harness(name,
 
   define(
       lax.dot_general_p,
-      f"{name}_lhs={jtu.format_shape_dtype_string(lhs_shape, dtype)}_rhs={jtu.format_shape_dtype_string(rhs_shape, dtype)}_dimensionnumbers={dimension_numbers}{suffix}"
+      f"{name}_lhs={jtu.format_shape_dtype_string(lhs_shape, lhs_dtype)}_rhs={jtu.format_shape_dtype_string(rhs_shape, rhs_dtype)}_dimensionnumbers={dimension_numbers}{suffix}_enable_xla={enable_xla}"
       .replace(" ", ""),
       lax.dot_general,
       [
-          RandArg(lhs_shape, dtype),
-          RandArg(rhs_shape, dtype),
+          RandArg(lhs_shape, lhs_dtype),
+          RandArg(rhs_shape, rhs_dtype),
           StaticArg(dimension_numbers),
           StaticArg(precision),
           StaticArg(preferred_element_type)
       ],
-      dtype=dtype,
+      dtype=lhs_dtype,
+      rhs_dtype=rhs_dtype,
       lhs_shape=lhs_shape,
       rhs_shape=rhs_shape,
       dimension_numbers=dimension_numbers,
       precision=precision,
       preferred_element_type=preferred_element_type,
+      enable_xla=enable_xla,
       jax_unimplemented=[
           Limitation("preferred_element_type must match dtype for floating point",
                      devices="gpu",
                      dtypes=[np.float16, dtypes.bfloat16, np.float32, np.float64, np.complex64, np.complex128],
-                     enabled=(preferred_element_type is not None and preferred_element_type != dtype))
-      ]
-  )
+                     enabled=(preferred_element_type is not None and preferred_element_type != lhs_dtype)),
+          Limitation("preferred_element_type must be floating for integer dtype",
+                     devices="gpu",
+                     dtypes=[np.int8, np.uint8, np.int16, np.uint16,
+                             np.int32, np.uint32, np.int64, np.uint64],
+                     enabled=(preferred_element_type is not None
+                              and preferred_element_type in [
+                                np.float16, dtypes.bfloat16, np.float32,
+                                np.float64, np.complex64, np.complex128]),
+                     skip_run=True),  # skip run because we get internal XLA error
+     ])
 
 
 # There are two execution paths in the conversion of dot_general. The main path
@@ -2843,7 +2854,8 @@ for dtype in jtu.dtypes.all:
           lhs_shape=lhs_shape,
           rhs_shape=rhs_shape,
           dimension_numbers=dimension_numbers,
-          dtype=dtype)
+          lhs_dtype=dtype,
+          rhs_dtype=dtype)
 
 # The other tests are only for float32.
 # Validate batch dimensions
@@ -2873,28 +2885,53 @@ for lhs_shape, rhs_shape, dimension_numbers in [
 
 # Validate preferred element type
 # From lax_test.py
-preferred_type_combinations = [(np.float16, np.float16), (np.float16,
-                                                          np.float32),
-                               (np.float16, np.float64),
-                               (dtypes.bfloat16, np.float32),
-                               (dtypes.bfloat16, np.float64),
-                               (np.float32, np.float32),
-                               (np.float32, np.float64), (np.int8, np.int16),
-                               (np.int8, np.int32), (np.int8, np.int64),
-                               (np.int16, np.int32), (np.int16, np.int64),
-                               (np.int32, np.int32), (np.int32, np.int64),
-                               (np.complex64, np.complex128)]
+preferred_type_combinations = [
+  (np.float16, np.float16), (np.float16, np.float32), (np.float16, np.float64),
+  (dtypes.bfloat16, dtypes.bfloat16), (dtypes.bfloat16, np.float32),
+  (dtypes.bfloat16, np.float64), (np.float32, np.float32),
+  (np.float32, np.float64),
+  (np.float64, np.float64), (np.int8, np.int8), (np.int8, np.int16),
+  (np.int8, np.int32),
+  (np.int8, np.int64), (np.int16, np.int16), (np.int16, np.int32),
+  (np.int16, np.int64),
+  (np.int32, np.int32), (np.int32, np.int64), (np.int64, np.int64),
+  (np.complex64, np.complex64), (np.complex64, np.complex128),
+  (np.complex128, np.complex128),
+  (np.int8, np.float16), (np.int8, dtypes.bfloat16), (np.int8, np.float32),
+  (np.int8, np.float64),
+  (np.int16, np.float16), (np.int16, dtypes.bfloat16), (np.int16, np.float32),
+  (np.int16, np.float64),
+  (np.int32, np.float32), (np.int32, np.float64), (np.int64, np.float64)]
 
-for lhs_shape in [(3,), (4, 3)]:
-  for rhs_shape in [(3,), (3, 6)]:
+for lhs_shape in [(4, 3)]:
+  for rhs_shape in [(3, 6)]:
     for dtype, preferred_element_type in preferred_type_combinations:
       _make_dot_general_harness(
           "preferred",
-          dtype=dtype,
+          lhs_dtype=dtype,
+          rhs_dtype=dtype,
           lhs_shape=lhs_shape,
           rhs_shape=rhs_shape,
           dimension_numbers=(((len(lhs_shape) - 1,), (0,)), ((), ())),
           preferred_element_type=preferred_element_type)
+
+    # Validate lhs_dtype different than rhs_dtype
+    all_types = (jtu.dtypes.all_integer + jtu.dtypes.all_unsigned + jtu.dtypes.all_inexact)
+    for i_lhs in range(len(all_types)):
+      for i_rhs in range(len(all_types)):
+        if i_rhs <= i_lhs: continue
+        lhs_dtype = all_types[i_lhs]
+        rhs_dtype = all_types[i_rhs]
+
+        for enable_xla in [True, False]:
+          _make_dot_general_harness(
+              "different_dtypes",
+              lhs_dtype=lhs_dtype,
+              rhs_dtype=rhs_dtype,
+              lhs_shape=lhs_shape,
+              rhs_shape=rhs_shape,
+              dimension_numbers=(((len(lhs_shape) - 1,), (0,)), ((), ())),
+              enable_xla=enable_xla)
 
 
 def _make_concatenate_harness(name,
@@ -2980,7 +3017,7 @@ def _make_conv_harness(name,
             Limitation(
                 "preferred_element_type not implemented for integers",
                 devices="gpu",
-                dtypes=(np.int8, np.int16, np.int32),
+                dtypes=(np.int8, np.int16, np.int32, np.int64),
                 enabled=(preferred_element_type in [np.int16, np.int32,
                                                     np.int64])),
         ],
@@ -3275,7 +3312,7 @@ for padding, lhs_dilation, rhs_dilation in [
         rhs_dilation=rhs_dilation)
 
 key_types = [((4,), np.uint32)]
-if config.jax_enable_x64:
+if config.enable_x64.value:
   key_types.append(((2,), np.uint64))
 
 for algorithm in [lax.RandomAlgorithm.RNG_THREE_FRY,

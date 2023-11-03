@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Sequence
 import dataclasses
 from functools import update_wrapper, reduce, partial
 import inspect
-from typing import Any, Callable, Generic, Optional, Sequence, TypeVar
+from typing import Any, Callable, Generic, Optional, TypeVar
 
+from jax._src import config
 from jax._src import core
 from jax._src import custom_api_util
 from jax._src.custom_transpose import custom_transpose
@@ -27,7 +29,6 @@ from jax._src import traceback_util
 from jax._src.ad_util import (
     stop_gradient_p, SymbolicZero, Zero, zeros_like_aval)
 from jax._src.api_util import argnums_partial, flatten_fun_nokwargs
-from jax._src.config import config
 from jax._src.core import raise_to_shaped
 from jax._src.errors import UnexpectedTracerError
 from jax._src.interpreters import ad
@@ -48,8 +49,6 @@ traceback_util.register_exclusion(__file__)
 map = safe_map
 zip = safe_zip
 
-allowed_effects: effects.EffectTypeSet = (
-    effects.custom_derivatives_allowed_effects)
 
 ### util
 
@@ -415,7 +414,7 @@ def process_env_traces(primitive, level: int, jvp_was_run: bool, *args):
   yield outs, tuple(todo)  # Ensure the aux output is immutable
 
 
-allowed_effects.add_type(lax.InOutFeedEffect)
+effects.custom_derivatives_allowed_effects.add_type(lax.InOutFeedEffect)
 
 custom_jvp_call_p = CustomJVPCallPrimitive('custom_jvp_call')
 
@@ -423,7 +422,7 @@ def _custom_jvp_call_typecheck(_, *in_avals, call_jaxpr, jvp_jaxpr_thunk,
                                num_consts, symbolic_zeros):
   # TODO(mattjj): could do more checking here...
   del in_avals, jvp_jaxpr_thunk, num_consts
-  disallowed_effects = allowed_effects.filter_not_in(call_jaxpr.effects)
+  disallowed_effects = effects.custom_derivatives_allowed_effects.filter_not_in(call_jaxpr.effects)
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `custom_jvp`: {disallowed_effects}')
@@ -530,13 +529,16 @@ class custom_vjp(Generic[ReturnValue]):
         derivative rules to detect when certain inputs, and when certain
         output cotangents, are not involved in differentiation. If ``True``:
 
-        * ``fwd`` must accept, in place of each leaf value ``x`` in the pytree
-          comprising an argument to the original function, an object with two
-          attributes instead: ``value`` and ``perturbed``. The ``value`` field
-          is the original primal argument, and ``perturbed`` is a boolean.
-          The ``perturbed`` bit indicates whether the argument is involved in
-          differentiation (i.e., if it is ``False``, then the corresponding
-          Jacobian "column" is zero).
+        * ``fwd`` must accept, in place of each leaf value ``x`` in
+          the pytree comprising an argument to the original function,
+          an object (of type
+          ``jax.custom_derivatives.CustomVJPPrimal``) with two
+          attributes instead: ``value`` and ``perturbed``. The
+          ``value`` field is the original primal argument, and
+          ``perturbed`` is a boolean.  The ``perturbed`` bit indicates
+          whether the argument is involved in differentiation (i.e.,
+          if it is ``False``, then the corresponding Jacobian "column"
+          is zero).
 
         * ``bwd`` will be passed objects representing static symbolic zeros in
           its cotangent argument in correspondence with unperturbed values;
@@ -588,7 +590,7 @@ class custom_vjp(Generic[ReturnValue]):
       raise AttributeError(msg)
     fwd_name = getattr(self.fwd, '__name__', str(self.fwd))
     args = _resolve_kwargs(self.fun, args, kwargs)
-    if config.jax_enable_custom_vjp_by_custom_transpose:
+    if config.enable_custom_vjp_by_custom_transpose.value:
       if self.nondiff_argnums:
         raise NotImplementedError(
             'nondiff_argnums not implemented for new custom_vjp')
@@ -621,6 +623,7 @@ class custom_vjp(Generic[ReturnValue]):
 
 @dataclasses.dataclass
 class CustomVJPPrimal:
+  """Primal to a ``custom_vjp``'s forward rule when ``symbolic_zeros`` is set"""
   value: Any
   perturbed: bool
 
@@ -812,7 +815,7 @@ def _custom_vjp_call_jaxpr_impl(*args, fun_jaxpr, **_):
   return core.jaxpr_as_fun(fun_jaxpr)(*args)
 
 def _custom_vjp_call_jaxpr_abstract_eval(*_, fun_jaxpr, **__):
-  disallowed_effects = allowed_effects.filter_not_in(fun_jaxpr.effects)
+  disallowed_effects = effects.custom_derivatives_allowed_effects.filter_not_in(fun_jaxpr.effects)
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `custom_vjp`: {disallowed_effects}')
@@ -826,7 +829,6 @@ CustomVJPCallPrimitive.initial_style = custom_vjp_call_jaxpr_p
 
 mlir.register_lowering(custom_vjp_call_jaxpr_p, mlir.lower_fun(
     _custom_vjp_call_jaxpr_impl, multiple_results=True))
-
 
 def _custom_vjp_call_jaxpr_jvp(
     primals, tangents, *, fun_jaxpr: core.ClosedJaxpr,
@@ -849,6 +851,7 @@ def _custom_vjp_call_jaxpr_jvp(
   tangents_out = ad.custom_lin_p.bind(
       *res, *args_dot, num_res=res_tree.num_leaves, bwd=bwd,
       out_avals=avals_out, symbolic_zeros=symbolic_zeros)
+  tangents_out = map(lax.tie_p.bind, primals_out, tangents_out)
   tangents_out = map(ad.recast_to_float0, primals_out, tangents_out)
   return primals_out, tangents_out
 ad.primitive_jvps[custom_vjp_call_jaxpr_p] = _custom_vjp_call_jaxpr_jvp
@@ -1069,7 +1072,7 @@ def closure_convert(fun: Callable, *example_args) -> tuple[Callable, list[Any]]:
   """
   flat_args, in_tree = tree_flatten(example_args)
   in_avals = tuple(map(abstractify, flat_args))
-  if config.jax_check_tracer_leaks:
+  if config.check_tracer_leaks.value:
     return _closure_convert_for_avals.__wrapped__(fun, in_tree, in_avals)
   else:
     return _closure_convert_for_avals(fun, in_tree, in_avals)
@@ -1195,7 +1198,7 @@ def linear_call(fun: Callable, fun_transpose: Callable, residual_args,
   Args:
     fun: a Python callable specifying a linear function. It should
       take two arguments: one of "residual" inputs (type ``r``),
-      i.e. inputs in which the function is not necessarly linear, and
+      i.e. inputs in which the function is not necessarily linear, and
       one of "linear" inputs (type ``a``).  It should return output
       whose components are linear in the linear input (type ``b``).
     fun_transpose: a Python callable specifying a structurally linear

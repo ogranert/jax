@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+from collections.abc import Sequence
 from functools import partial
 import math
-from typing import Sequence
 
 import jaxlib.mlir.ir as ir
 import jaxlib.mlir.dialects.stablehlo as hlo
 
 import numpy as np
+
+from .gpu_common_utils import GpuLibNotLinkedError
 
 from jaxlib import xla_client
 
@@ -73,6 +74,9 @@ def _getrf_hlo(platform, gpu_blas, gpu_solver, dtype, a):
   num_bd = len(batch_dims)
   batch = math.prod(batch_dims)
 
+  if not gpu_blas:
+    raise GpuLibNotLinkedError()
+
   if batch > 1 and m == n and m // batch <= 128:
     lwork, opaque = gpu_blas.build_getrf_batched_descriptor(
       np.dtype(dtype), batch, m)
@@ -88,13 +92,13 @@ def _getrf_hlo(platform, gpu_blas, gpu_solver, dtype, a):
   i32_type = ir.IntegerType.get_signless(32)
   out = custom_call(
       kernel,
-      [
+      result_types=[
         a.type,
         ir.RankedTensorType.get(batch_dims + (min(m, n),), i32_type),
         ir.RankedTensorType.get(batch_dims, i32_type),
         workspace,
       ],
-      [a],
+      operands=[a],
       backend_config=opaque,
       operand_layouts=[layout],
       result_layouts=[
@@ -103,7 +107,7 @@ def _getrf_hlo(platform, gpu_blas, gpu_solver, dtype, a):
         tuple(range(num_bd - 1, -1, -1)),
         [0],
       ],
-      operand_output_aliases={0: 0})
+      operand_output_aliases={0: 0}).results
   return out[:3]
 
 cuda_getrf = partial(_getrf_hlo, "cu", _cublas, _cusolver)
@@ -127,13 +131,13 @@ def _geqrf_hlo(platform, gpu_solver, dtype, a):
   i32_type = ir.IntegerType.get_signless(32)
   out = custom_call(
       f"{platform}solver_geqrf",
-      [
+      result_types=[
         a.type,
         ir.RankedTensorType.get(batch_dims + (min(m, n),), a_type.element_type),
         ir.RankedTensorType.get(batch_dims, i32_type),
         ir.RankedTensorType.get([lwork], a_type.element_type),
       ],
-      [a],
+      operands=[a],
       backend_config=opaque,
       operand_layouts=[layout],
       result_layouts=[
@@ -142,7 +146,7 @@ def _geqrf_hlo(platform, gpu_solver, dtype, a):
         tuple(range(num_bd - 1, -1, -1)),
         [0],
       ],
-      operand_output_aliases={0: 0})
+      operand_output_aliases={0: 0}).results
   return out[:3]
 
 cuda_geqrf = partial(_geqrf_hlo, "cu", _cusolver)
@@ -158,19 +162,22 @@ def _geqrf_batched_hlo(platform, gpu_blas, dtype, a):
   num_bd = len(batch_dims)
   batch = math.prod(batch_dims)
 
+  if not gpu_blas:
+    raise GpuLibNotLinkedError()
+
   lwork, opaque = gpu_blas.build_geqrf_batched_descriptor(
       np.dtype(dtype), batch, m, n)
 
   layout = (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))
   out = custom_call(
       f"{platform}blas_geqrf_batched",
-      [
+      result_types=[
         a.type,
         ir.RankedTensorType.get(batch_dims + (min(m, n),), a_type.element_type),
         ir.RankedTensorType.get([lwork], ir.IntegerType.get_signless(8)),
         ir.RankedTensorType.get([lwork], ir.IntegerType.get_signless(8)),
       ],
-      [a],
+      operands=[a],
       backend_config=opaque,
       operand_layouts=[layout],
       result_layouts=[
@@ -180,7 +187,7 @@ def _geqrf_batched_hlo(platform, gpu_blas, dtype, a):
         [0],
       ],
       operand_output_aliases={0: 0}
-  )
+  ).results
   return out[:2]
 
 cuda_geqrf_batched = partial(_geqrf_batched_hlo, "cu", _cublas)
@@ -201,13 +208,13 @@ def _csrlsvqr_hlo(platform, gpu_solver, dtype, data,
 
   out = custom_call(
       f"{platform}solver_csrlsvqr",  # call_target_name
-      [b.type],  # out_types
-      [data, indptr, indices, b],  # operands
+      result_types=[b.type],
+      operands=[data, indptr, indices, b],
       backend_config=opaque,  # backend_config
       operand_layouts=[(0,), (0,), (0,), (0,)],  # operand_layouts
       result_layouts=[(0,)]  # result_layouts
-  )
-  return [out]
+  ).results
+  return out
 
 cuda_csrlsvqr = partial(_csrlsvqr_hlo, "cu", _cusolver)
 
@@ -233,12 +240,12 @@ def _orgqr_hlo(platform, gpu_solver, dtype, a, tau):
   i32_type = ir.IntegerType.get_signless(32)
   out = custom_call(
       f"{platform}solver_orgqr",
-      [
+      result_types=[
         a.type,
         ir.RankedTensorType.get(batch_dims, i32_type),
         ir.RankedTensorType.get([lwork], a_type.element_type),
       ],
-      [a, tau],
+      operands=[a, tau],
       backend_config=opaque,
       operand_layouts=[
           layout,
@@ -249,7 +256,7 @@ def _orgqr_hlo(platform, gpu_solver, dtype, a, tau):
         tuple(range(num_bd - 1, -1, -1)),
         [0],
       ],
-      operand_output_aliases={0: 0})
+      operand_output_aliases={0: 0}).results
   return out[:2]
 
 cuda_orgqr = partial(_orgqr_hlo, "cu", _cusolver)
@@ -309,8 +316,8 @@ def _syevd_hlo(platform, gpu_solver, have_jacobi_solver, dtype, a, *,
   result_types, result_shapes = mk_result_types_and_shapes(shape_type_pairs)
   out = custom_call(
       kernel,
-      result_types,
-      operands,
+      result_types=result_types,
+      operands=operands,
       backend_config=opaque,
       operand_layouts=operand_layouts,
       result_layouts=[
@@ -320,7 +327,7 @@ def _syevd_hlo(platform, gpu_solver, have_jacobi_solver, dtype, a, *,
           [0],
       ],
       operand_output_aliases={0: 0},
-      result_shapes=result_shapes)
+      result_shapes=result_shapes).results
   return out[:3]
 
 cuda_syevd = partial(_syevd_hlo, "cu", _cusolver, True)
@@ -355,7 +362,7 @@ def _gesvd_hlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
     matrix_layout = (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))
     _, s, u, v, info, _ = custom_call(
         f"{platform}solver_gesvdj",
-        [
+        result_types=[
           a.type,
           ir.RankedTensorType.get(batch_dims + (min(m, n),), singular_vals_type),
           ir.RankedTensorType.get(batch_dims + (m, k if econ else m),
@@ -365,7 +372,7 @@ def _gesvd_hlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
           ir.RankedTensorType.get(batch_dims, i32_type),
           ir.RankedTensorType.get([lwork], a_type.element_type),
         ],
-        [a],
+        operands=[a],
         backend_config=opaque,
         operand_layouts=[matrix_layout],
         result_layouts=[
@@ -376,7 +383,7 @@ def _gesvd_hlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
             scalar_layout,
             [0],
         ],
-        operand_output_aliases={0: 0})
+        operand_output_aliases={0: 0}).results
     vt = hlo.TransposeOp(
         v,
         ir.DenseIntElementsAttr.get(np.array(tuple(range(num_bd)) + (num_bd + 1, num_bd)))).result
@@ -400,7 +407,7 @@ def _gesvd_hlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
     matrix_layout = (num_bd + 1, num_bd) + tuple(range(num_bd - 1, -1, -1))
     _, s, vt, u, info, _ = custom_call(
         f"{platform}solver_gesvd",
-        [
+        result_types=[
           a.type,
           ir.RankedTensorType.get(batch_dims + (min(m, n),), singular_vals_type),
           ir.RankedTensorType.get(batch_dims + (k, n), a_type.element_type),
@@ -408,7 +415,7 @@ def _gesvd_hlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
           ir.RankedTensorType.get(batch_dims, i32_type),
           ir.RankedTensorType.get([lwork], a_type.element_type),
         ],
-        [a],
+        operands=[a],
         backend_config=opaque,
         operand_layouts=[matrix_layout],
         result_layouts=[
@@ -419,7 +426,7 @@ def _gesvd_hlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
           scalar_layout,
           [0],
         ],
-        operand_output_aliases={0: 0})
+        operand_output_aliases={0: 0}).results
   else:
     lwork, opaque = gpu_solver.build_gesvd_descriptor(
         np.dtype(dtype), b, m, n, compute_uv, full_matrices)
@@ -427,7 +434,7 @@ def _gesvd_hlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
     matrix_layout = (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))
     _, s, u, vt, info, _ = custom_call(
         f"{platform}solver_gesvd",
-        [
+        result_types=[
           a.type,
           ir.RankedTensorType.get(batch_dims + (min(m, n),), singular_vals_type),
           ir.RankedTensorType.get(batch_dims + (m, k), a_type.element_type),
@@ -435,7 +442,7 @@ def _gesvd_hlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
           ir.RankedTensorType.get(batch_dims, i32_type),
           ir.RankedTensorType.get([lwork], a_type.element_type),
         ],
-        [a],
+        operands=[a],
         backend_config=opaque,
         operand_layouts=[matrix_layout],
         result_layouts=[
@@ -446,7 +453,7 @@ def _gesvd_hlo(platform, gpu_solver, have_jacobi_solver, dtype, a,
           scalar_layout,
           [0],
         ],
-        operand_output_aliases={0: 0})
+        operand_output_aliases={0: 0}).results
   return s, u, vt, info
 
 cuda_gesvd = partial(_gesvd_hlo, "cu", _cusolver, True)
@@ -480,7 +487,7 @@ def _sytrd_hlo(platform, gpu_solver, dtype, a, *, lower):
   i32_type = ir.IntegerType.get_signless(32)
   a, d, e, taus, info, _ = custom_call(
       f"{platform}solver_sytrd",
-      [
+      result_types=[
         a.type,
         ir.RankedTensorType.get(batch_dims + (n,), diag_type),
         ir.RankedTensorType.get(batch_dims + (n - 1,), diag_type),
@@ -488,7 +495,7 @@ def _sytrd_hlo(platform, gpu_solver, dtype, a, *, lower):
         ir.RankedTensorType.get(batch_dims, i32_type),
         ir.RankedTensorType.get([lwork], a_type.element_type),
       ],
-      [a],
+      operands=[a],
       backend_config=opaque,
       operand_layouts=[layout],
       result_layouts=[
@@ -500,7 +507,7 @@ def _sytrd_hlo(platform, gpu_solver, dtype, a, *, lower):
         [0],
       ],
       operand_output_aliases={0: 0},
-  )
+  ).results
   # Workaround for NVIDIA partners bug #3865118: sytrd returns an incorrect "1"
   # in the first element of the superdiagonal in the `a` matrix in the
   # lower=False case. The correct result is returned in the `e` vector so we can

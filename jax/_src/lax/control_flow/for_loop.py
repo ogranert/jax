@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Module for the `for_loop` primitive."""
+
+from collections.abc import Sequence
 import functools
 import operator
-
-from typing import Any, Callable, Generic, Optional, Sequence, TypeVar, Union
+from typing import Any, Callable, Generic, Optional, TypeVar, Union
 
 import jax.numpy as jnp
 from jax import lax
@@ -38,6 +39,7 @@ from jax._src.state import discharge as state_discharge
 from jax._src.state import primitives as state_primitives
 from jax._src.state import utils as state_utils
 from jax._src.state import types as state_types
+from jax._src.typing import Array
 from jax._src.util import (partition_list, merge_lists, safe_map, safe_zip,
                            split_list, split_dict)
 from jax._src.lax.control_flow import loops
@@ -52,7 +54,6 @@ zip, unsafe_zip = safe_zip, zip
 S = TypeVar('S')
 T = TypeVar('T')
 class Ref(Generic[T]): pass
-Array = Any
 
 ref_set = state_primitives.ref_set
 ref_get = state_primitives.ref_get
@@ -74,7 +75,7 @@ def _hoist_consts_to_refs(jaxpr: core.Jaxpr) -> core.Jaxpr:
   const_avals, const_ref_avals = partition_list(is_const_ref, all_const_avals)
   const_avals = map(AbstractRef, const_avals)
   merged_const_avals = merge_lists(is_const_ref, const_avals, const_ref_avals)
-  i_aval, *arg_avals = [var.aval for var in jaxpr.invars]
+  i_aval, *arg_avals = (var.aval for var in jaxpr.invars)
   in_avals = [i_aval, *merged_const_avals, *arg_avals]
   num_consts = len(merged_const_avals)
 
@@ -242,8 +243,8 @@ def _for_abstract_eval(*avals, jaxpr, **__):
   # Find out for each of the `Ref`s in our jaxpr what effects they have.
   jaxpr_aval_effects = state_types.get_ref_state_effects(
       [v.aval for v in jaxpr.invars], jaxpr.effects)[1:]
-  aval_effects = [set(eff.replace(input_index=eff.input_index - 1)
-                      for eff in effs) for aval, effs
+  aval_effects = [{eff.replace(input_index=eff.input_index - 1)
+                      for eff in effs} for aval, effs
                   in zip(avals, jaxpr_aval_effects)
                   if isinstance(aval, AbstractRef)]
   nonlocal_state_effects = core.join_effects(*aval_effects)
@@ -718,7 +719,7 @@ def transpose_jaxpr(jaxpr: core.Jaxpr, which_linear: list[bool]) -> core.Jaxpr:
 
 def _for_transpose(in_cts, *args, jaxpr, nsteps, reverse, which_linear, unroll):
   # if any in_ct is nonzero, we definitely want it in args_ (and the
-  # corresponding x in args could be an undefined primal, but doesnt have to be)
+  # corresponding x in args could be an undefined primal, but doesn't have to be)
   # for non-res stuff:
   #   getting and setting => (nonzero ct, UndefinedPrimal arg)
   #   just setting =>        (nonzero ct, not UndefinedPrimal, dummy value)

@@ -145,7 +145,7 @@ You can use the :func:`barrier_wait` function for that purpose::
      accumulator.append(arg)
 
 
-   def device_fun(c):
+   def device_fun(x):
      id_tap(host_log, x)
      id_tap(host_log, 2. * x)
 
@@ -495,18 +495,18 @@ Still to do:
 
 """
 import atexit
+from collections.abc import Sequence
 import functools
 import itertools
 import logging
 import math
 import threading
 import traceback
-from typing import Any, Callable, Optional, Sequence, cast
-import warnings
+from typing import Any, Callable, Optional, cast
 
 from jax._src import api
 from jax._src import core
-from jax import config
+from jax._src import config
 from jax import custom_derivatives
 from jax._src import dtypes
 from jax import lax
@@ -516,12 +516,13 @@ from jax._src.interpreters import mlir
 from jax._src.interpreters import partial_eval as pe
 from jax._src.interpreters import xla
 from jax._src import ad_checkpoint
+from jax._src import compiler
 from jax._src import dispatch
 from jax._src import pretty_printer as pp
 from jax._src import sharding_impls
 from jax._src import source_info_util
+from jax._src import tree_util
 from jax._src import util
-from jax._src.lib import pytree
 from jax._src import xla_bridge as xb
 from jax._src.lib import xla_client
 from jax._src.lib import xla_extension
@@ -530,17 +531,36 @@ from jax._src.lib.mlir.dialects import hlo
 import numpy as np
 
 
-FLAGS = config.FLAGS
+_HOST_CALLBACK_INLINE = config.DEFINE_bool(
+    'jax_host_callback_inline',
+    config.bool_env('JAX_HOST_CALLBACK_INLINE', False),
+    help='Inline the host_callback, if not in a staged context.'
+)
+_HOST_CALLBACK_MAX_QUEUE_BYTE_SIZE = config.DEFINE_integer(
+    'jax_host_callback_max_queue_byte_size',
+    config.int_env('JAX_HOST_CALLBACK_MAX_QUEUE_BYTE_SIZE', int(256 * 1e6)),
+    help=('The size in bytes of the buffer used to hold outfeeds from each '
+          'device. When this capacity is reached consuming outfeeds from the '
+          'device is paused, thus potentially pausing the device computation, '
+          'until the Python callback consume more outfeeds.'),
+    lower_bound=int(16 * 1e6)
+)
+_HOST_CALLBACK_OUTFEED = config.DEFINE_bool(
+    'jax_host_callback_outfeed',
+    config.bool_env('JAX_HOST_CALLBACK_OUTFEED', False),
+    help=(
+        'Use outfeed implementation for host_callback, even on CPU and GPU. '
+        'If false, use the CustomCall implementation. '
+        'Has no effect on TPU, since only the outfeed mechanism is implemented.'
+    )
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _inline_host_callback() -> bool:
-  return FLAGS.jax_host_callback_inline
-
-
 def _use_outfeed(platform: str) -> bool:
-  return (platform in ("tpu", "gpu", "cuda", "rocm") or FLAGS.jax_host_callback_outfeed)
+  return (platform in ("tpu", "gpu", "cuda", "rocm") or
+          _HOST_CALLBACK_OUTFEED.value)
 
 
 def _raise_if_using_outfeed_with_pjrt_c_api(backend: xb.XlaBackend):
@@ -553,7 +573,7 @@ def _raise_if_using_outfeed_with_pjrt_c_api(backend: xb.XlaBackend):
         "https://jax.readthedocs.io/en/latest/notebooks/external_callbacks.html"
         " for alternatives. Please file a feature request at "
         "https://github.com/google/jax/issues if none of the alternatives are "
-        "sufficent.")
+        "sufficient.")
 
 
 xops = xla_client._xla.ops
@@ -619,14 +639,9 @@ def id_tap(tap_func,
         "pre-apply keyword arguments, either by using a closure or by passing "
         "``functools.partial(tap_func, **kwargs)``.")
     raise TypeError(msg)
-  if FLAGS.jax_host_callback_ad_transforms:
-    warnings.warn('The flag jax_host_callback_ad_transforms is for temporary '
-                  'backwards compatibility mode. This flag, and the behavior '
-                  'it enabled will be removed soon.',
-                  FutureWarning)
 
   if result is not None:
-    flat_results, result_treedef = pytree.flatten(result)
+    flat_results, _ = tree_util.tree_flatten(result)
     for r in flat_results:
       dispatch.check_arg(r)
 
@@ -639,18 +654,7 @@ def id_tap(tap_func,
       device_index=device_index)
 
   if result is not None:
-    # Return the results, but add a dependency on the call, to ensure it
-    # is kept in the graph.
-    if FLAGS.jax_host_callback_ad_transforms:
-      call_flat_results, _ = pytree.flatten(call_res)
-      if call_flat_results:
-        call_flat_results = [id_tap_dep_p.bind(r, call_flat_results[0])
-                             for r in flat_results]
-      else:
-        call_flat_results = flat_results
-      return result_treedef.unflatten(call_flat_results)
-    else:
-      return result
+    return result
   else:
     return call_res
 
@@ -781,9 +785,9 @@ def _call(callback_func: Callable,
           identity=False):
   # Lazy initialization
   _initialize_outfeed_receiver(
-      max_callback_queue_size_bytes=FLAGS.jax_host_callback_max_queue_byte_size)
+      max_callback_queue_size_bytes=_HOST_CALLBACK_MAX_QUEUE_BYTE_SIZE.value)
   api.check_callable(callback_func)
-  flat_args, arg_treedef = pytree.flatten(arg)
+  flat_args, arg_treedef = tree_util.tree_flatten(arg)
   for arg in flat_args:
     dispatch.check_arg(arg)
   # See definition of outside_call_p for what parameters it takes
@@ -797,7 +801,7 @@ def _call(callback_func: Callable,
 
   if not identity:
     # Turn abstract values into ShapesDtypeStruct
-    flat_results_shape, result_treedef = pytree.flatten(result_shape)
+    flat_results_shape, result_treedef = tree_util.tree_flatten(result_shape)
     try:
       flat_results_aval = [core.ShapedArray(np.shape(r), dtypes.dtype(r, canonicalize=True))
                            for r in flat_results_shape]
@@ -887,60 +891,6 @@ def _print_tap_func(
 def _values_to_avals(vals) -> Sequence[core.ShapedArray]:
   return tuple(core.raise_to_shaped(core.get_aval(v)) for v in vals)
 
-### The id_tap_dep primitive
-# The id_tap_dep_p primitive is used to create a dependency of the result of
-# id_tap on the actual tap operation. This is only needed when the
-# id_tap function is used with the `result` parameter. This primitive acts
-# as the identity operator on the first argument.
-#
-# For example, given `id_tap(f, (a, b), result=(r, s)`, we convert this to
-#
-#    a1, b1 = outside_call_p(f, a, b)
-#    r1 = id_tap_dep_p(r, a1)
-#    s1 = id_tap_dep_p(s, a1)
-#
-# There are always two arguments and the result is equal to the first.
-id_tap_dep_p = core.Primitive("id_tap_dep")
-id_tap_dep_p.multiple_results = False
-id_tap_dep_p.def_impl(lambda r, _: r)
-xla.register_translation(id_tap_dep_p,
-                         lambda ctx, avals_in, avals_out, a_res, a_tap: [a_res])
-id_tap_dep_p.def_abstract_eval(lambda r_a, _: r_a)
-
-def _id_tap_dep_jvp_rule(primals, tangents):
-  if FLAGS.jax_host_callback_ad_transforms:
-    assert False
-  tangents_instantiated = tuple(map(_instantiate_zeros, tangents, primals))
-  return (id_tap_dep_p.bind(primals[0], primals[1]),
-          id_tap_dep_p.bind(tangents_instantiated[0], tangents_instantiated[1]))
-
-ad.primitive_jvps[id_tap_dep_p] = _id_tap_dep_jvp_rule
-
-def _id_tap_dep_transpose_rule(cts, arg_res, arg_tap):
-  if FLAGS.jax_host_callback_ad_transforms:
-    assert False
-  if ad.is_undefined_primal(arg_res):
-    ct_res = _instantiate_zeros(cts, arg_res)
-  else:
-    ct_res = None
-  if ad.is_undefined_primal(arg_tap):
-    ct_tap = ad.Zero(arg_tap.aval)
-  else:
-    ct_tap = None
-  return (ct_res, ct_tap)
-
-ad.primitive_transposes[id_tap_dep_p] = _id_tap_dep_transpose_rule
-
-
-def _id_tap_dep_batching_rule(batched_args, batch_dims):
-  if FLAGS.jax_host_callback_ad_transforms:
-    assert False
-  arg_res, arg_tap = batched_args
-  return id_tap_dep_p.bind(arg_res, arg_tap), batch_dims[0]
-
-
-batching.primitive_batchers[id_tap_dep_p] = _id_tap_dep_batching_rule
-
 ### The outside_call primitive
 """
 This primitive is used to implement the `call` and `id_tap` functions.
@@ -1012,7 +962,7 @@ outside_call_p.def_abstract_eval(_outside_call_abstract_eval)
 
 def _outside_call_impl(*args, **params):
   assert "has_token" not in params
-  if _inline_host_callback():
+  if _HOST_CALLBACK_INLINE.value:
     device_index = params["device_index"]
     device = xb.devices()[device_index]
     results = _outside_call_run_callback(args, device, send_infeed=False, **params)
@@ -1031,6 +981,15 @@ def _outside_call_impl(*args, **params):
 outside_call_p.def_impl(_outside_call_impl)
 
 
+def _with_sharding_proto(builder, sharding_proto, op_fn, *args, **kwargs):
+  """Builds op_fn(*args, **kwargs) with sharding annotation."""
+  builder.set_sharding(sharding_proto)
+  try:
+    return op_fn(*args, **kwargs)
+  finally:
+    builder.clear_sharding()
+
+
 def _outside_call_translation_rule(ctx,
                                    avals_in,
                                    avals_out,
@@ -1042,6 +1001,8 @@ def _outside_call_translation_rule(ctx,
                                    **params):
   # We expect the current tokens at the end, inserted by _rewrite_jaxpr.
   assert has_token
+  use_outfeed = _use_outfeed(ctx.platform)
+  assert use_outfeed, 'Should be using MLIR path for `CustomCall` lowering'
   current_token = args_op[-2]
   current_itoken = args_op[-1]
   comp = ctx.builder
@@ -1055,124 +1016,71 @@ def _outside_call_translation_rule(ctx,
                                             flat_results_aval))
   need_callback_results_on_device = (not identity and
                                      len(non_empty_flat_results_aval) > 0)
-  use_outfeed = _use_outfeed(ctx.platform)
-  # TODO(sharadmv): Delete non-outfeed path when jaxlib minimum version is
-  # bumped past 0.3.8.
-  assert use_outfeed, 'Should be using MLIR path for `CustomCall` lowering'
   send_infeed = use_outfeed and need_callback_results_on_device
   generated_infeed = False  # Keep track if we emitted an infeed op
-  if use_outfeed:
-    _raise_if_using_outfeed_with_pjrt_c_api(xb.get_backend(ctx.platform))
-    callback_id = _register_callback(
-        functools.partial(
-            _outside_call_run_callback,
-            send_infeed=send_infeed,
-            identity=identity,
-            flat_results_aval=flat_results_aval,
-            **params))
-    next_token = _callback_handler_data.receiver.add_outfeed(
-        comp, current_token, callback_id, args_to_outfeed, device_index)
-    if identity:
-      results = list(args_to_outfeed)
-      next_itoken = current_itoken
-    else:
-      empty_results = [
-          xops.ConstantLiteral(comp, np.zeros(aval.shape, aval.dtype))
-          for aval in flat_results_aval
-          if _aval_is_empty(aval)
-      ]
-      if non_empty_flat_results_aval:
-        assert need_callback_results_on_device
-        after_outfeed_itoken = xops.AfterAll(comp, [current_itoken, next_token])
-        # We shard the infeed as AssignedDevice(device_index). This must match the
-        # outfeed (from outfeed_receiver.cc). Since `lax.infeed` does not support
-        # this kind of sharding, we use a custom translation for infeed.
-        array_sharding_proto = xla_client.OpSharding()
-        array_sharding_proto.type = xla_client.OpSharding.Type.MAXIMAL
-        array_sharding_proto.tile_assignment_dimensions = [1]
-        array_sharding_proto.tile_assignment_devices = [device_index]
 
-        token_sharding_proto = xla_client.OpSharding()
-        token_sharding_proto.type = xla_client.OpSharding.Type.REPLICATED
-        infeed_sharding_proto = xla.tuple_sharding_proto(
-            [array_sharding_proto] * len(non_empty_flat_results_aval) +
-            [token_sharding_proto])
-
-        shape = [
-            shape.with_major_to_minor_layout_if_absent()
-            for x in non_empty_flat_results_aval
-            for shape in xla.aval_to_xla_shapes(x)
-        ]
-
-        build_infeed = functools.partial(xops.InfeedWithToken,
-                                         after_outfeed_itoken,
-                                         xla_client.Shape.tuple_shape(shape))
-        outs_and_token = xla.with_sharding_proto(comp, infeed_sharding_proto,
-                                                 build_infeed)
-        outs = xops.GetTupleElement(outs_and_token, 0)
-        next_itoken = xops.GetTupleElement(outs_and_token, 1)
-        non_empty_results = [
-            xops.GetTupleElement(outs, i)
-            for i in range(len(non_empty_flat_results_aval))
-        ]
-        generated_infeed = True
-        results = [
-            empty_results.pop(0)
-            if _aval_is_empty(result_aval) else non_empty_results.pop(0)
-            for result_aval in flat_results_aval
-        ]
-      else:
-        results = empty_results
-        next_itoken = current_itoken
-
-  else:  # !use_outfeed : CustomCall implementation
-    if device_index != 0:
-      raise ValueError("The device_index feature works only when using outfeed.")
-
-    # TODO(necula): this is a weak attempt to get the device. This works
-    # inside pmap, but does not work when we just execute on a single device,
-    # because in such executions we always get replica_id == 0.
-    replica_id = xla_client.ops.ReplicaId(comp)
-    callback_operands = (current_token, replica_id) + args_to_outfeed
-    if identity:
-      callback_flat_results_aval = (core.abstract_token,)
-    else:
-      callback_flat_results_aval = (core.abstract_token,) + flat_results_aval
-
-    def wrapped_callback(*args):
-      token, replica_id, *arrays = args
-      result_arrays = _outside_call_run_callback(
-          arrays,
-          xb.local_devices()[replica_id],
-          send_infeed=False,
-          # The same parameters as outside_call_p
+  _raise_if_using_outfeed_with_pjrt_c_api(xb.get_backend(ctx.platform))
+  callback_id = _register_callback(
+      functools.partial(
+          _outside_call_run_callback,
+          send_infeed=send_infeed,
           identity=identity,
           flat_results_aval=flat_results_aval,
-          **params)
-      if identity:
-        # For identity, we do not pass the any results back to the device
-        result_arrays = ()
-      return (token,) + result_arrays
-
-    result_shapes = [
-        xla.aval_to_xla_shapes(res_aval)[0]
-        for res_aval in callback_flat_results_aval
-    ]
-    backend = ctx.module_context.backend
-    token_and_results_op, keep_alive = backend.emit_python_callback(
-        wrapped_callback,
-        comp,
-        callback_operands,
-        result_shapes,
-        operand_layouts=None,
-        has_side_effects=True)
-    _callback_handler_data.keep_alives.append(keep_alive)
-    next_token, *results = (xops.GetTupleElement(token_and_results_op, i)
-                            for i in range(len(callback_flat_results_aval)))
-    # We must put the two tokens at the end
-    if identity:
-      results = list(args_to_outfeed)
+          **params))
+  next_token = _callback_handler_data.receiver.add_outfeed(
+      comp, current_token, callback_id, args_to_outfeed, device_index)
+  if identity:
+    results = list(args_to_outfeed)
     next_itoken = current_itoken
+  else:
+    empty_results = [
+        xops.ConstantLiteral(comp, np.zeros(aval.shape, aval.dtype))
+        for aval in flat_results_aval
+        if _aval_is_empty(aval)
+    ]
+    if non_empty_flat_results_aval:
+      assert need_callback_results_on_device
+      after_outfeed_itoken = xops.AfterAll(comp, [current_itoken, next_token])
+      # We shard the infeed as AssignedDevice(device_index). This must match the
+      # outfeed (from outfeed_receiver.cc). Since `lax.infeed` does not support
+      # this kind of sharding, we use a custom translation for infeed.
+      array_sharding_proto = xla_client.OpSharding()
+      array_sharding_proto.type = xla_client.OpSharding.Type.MAXIMAL
+      array_sharding_proto.tile_assignment_dimensions = [1]
+      array_sharding_proto.tile_assignment_devices = [device_index]
+
+      token_sharding_proto = xla_client.OpSharding()
+      token_sharding_proto.type = xla_client.OpSharding.Type.REPLICATED
+      infeed_sharding_proto = xla.tuple_sharding_proto(
+          [array_sharding_proto] * len(non_empty_flat_results_aval) +
+          [token_sharding_proto])
+
+      shape = [
+          shape.with_major_to_minor_layout_if_absent()
+          for x in non_empty_flat_results_aval
+          for shape in xla.aval_to_xla_shapes(x)
+      ]
+
+      build_infeed = functools.partial(xops.InfeedWithToken,
+                                        after_outfeed_itoken,
+                                        xla_client.Shape.tuple_shape(shape))
+      outs_and_token = _with_sharding_proto(comp, infeed_sharding_proto,
+                                            build_infeed)
+      outs = xops.GetTupleElement(outs_and_token, 0)
+      next_itoken = xops.GetTupleElement(outs_and_token, 1)
+      non_empty_results = [
+          xops.GetTupleElement(outs, i)
+          for i in range(len(non_empty_flat_results_aval))
+      ]
+      generated_infeed = True
+      results = [
+          empty_results.pop(0)
+          if _aval_is_empty(result_aval) else non_empty_results.pop(0)
+          for result_aval in flat_results_aval
+      ]
+    else:
+      results = empty_results
+      next_itoken = current_itoken
 
   assert generated_infeed == send_infeed, (
       f"generated_infeed ({generated_infeed}) != send_infeed ({send_infeed})")
@@ -1193,7 +1101,9 @@ def _outside_call_lowering(ctx: mlir.LoweringRuleContext,
                            flat_results_aval=(),
                            **params):
   """MLIR Lowering for `CustomCall`-based HCB."""
-  platform = ctx.module_context.platform
+  if len(ctx.module_context.platforms) > 1:
+    raise NotImplementedError("multi-platform lowering for host_callback")
+  platform = ctx.module_context.platforms[0]
   use_outfeed = _use_outfeed(platform)
   if use_outfeed:
     # Fall back to XLA path if we are using the outfeed
@@ -1208,8 +1118,11 @@ def _outside_call_lowering(ctx: mlir.LoweringRuleContext,
         device_index=device_index,
         **params)
   else:
-    if device_index != 0:
-      raise ValueError("The device_index feature works only when using outfeed.")
+    # TODO(necula): It seems that on CPU, with custom call, the device_index
+    # does not work, and the callback is always run on device_index=0
+    if (device_index != 0 and "cpu" in ctx.module_context.platforms):
+      raise ValueError(
+          "The device_index feature on CPU works only when using outfeed.")
   # We expect the current tokens at the end, inserted by _rewrite_jaxpr.
   assert has_token
   current_token = args[-2]
@@ -1269,7 +1182,7 @@ def _outside_call_lowering(ctx: mlir.LoweringRuleContext,
   assert identity or len(results) == len(flat_results_aval), (
       f"got {len(results)} but expected {len(flat_results_aval)}. "
       f"identity = {identity}")
-  return results + [next_token, next_itoken]
+  return list(results) + [next_token, next_itoken]
 
 mlir.register_lowering(outside_call_p, _outside_call_lowering, platform="cpu")
 
@@ -1298,7 +1211,7 @@ def _outside_call_run_callback(
         return name, dict(logical_shapes=5)
       else:
         assert not params, f"{name}, {params}"
-        return name, dict()
+        return name, {}
 
     return tuple(_unpack_transform(*t) for t in transforms)
 
@@ -1316,7 +1229,7 @@ def _outside_call_run_callback(
     else:  # Check the type of the callback results
       assert result_treedef is not None
       assert flat_results_aval is not None
-      actual_flat_results, actual_result_treedef = pytree.flatten(res)
+      actual_flat_results, actual_result_treedef = tree_util.tree_flatten(res)
       if actual_result_treedef != result_treedef:
         msg = (f"Callback func {callback} should have returned a result "
                f"with pytree {result_treedef} but returned "
@@ -1399,81 +1312,11 @@ def _outside_call_jvp_rule(primals, tangents, **params):
   assert "has_token" not in params
   if not params["identity"]:
     raise NotImplementedError("JVP rule is implemented only for id_tap, not for call.")
-  if FLAGS.jax_host_callback_ad_transforms:
-    tangents_instantiated = tuple(map(_instantiate_zeros, tangents, primals))
-
-    arg_treedef = params["arg_treedef"]
-    # The argument to the jvp tap is a pair of the tapped primals and tangents
-    jvp_flat_args, jvp_arg_treedef = api.tree_flatten(
-        (arg_treedef.unflatten(primals),
-         arg_treedef.unflatten(tangents_instantiated)))
-    out_all = outside_call_p.bind(
-        *jvp_flat_args,
-        **dict(_add_transform(params, "jvp"),
-               arg_treedef=jvp_arg_treedef,
-               ))
-    out_primals_tapped, out_tangents_tapped = util.split_list(out_all, [len(primals)])
-    return tuple(out_primals_tapped), tuple(out_tangents_tapped)
-  else:
-    out_primals_tapped = outside_call_p.bind(*primals, **params)
-    return tuple(out_primals_tapped), tangents
+  out_primals_tapped = outside_call_p.bind(*primals, **params)
+  return tuple(out_primals_tapped), tangents
 
 
 ad.primitive_jvps[outside_call_p] = _outside_call_jvp_rule
-
-
-def _outside_call_partial_eval_rule(trace, *args, **params):
-  # partial eval is used after jvp and before transpose.
-  if not FLAGS.jax_host_callback_ad_transforms:
-    # TODO: just remote the partial eval rule
-    return trace.default_process_primitive(outside_call_p, args, params)
-  transforms = params.get("transforms", ())
-  if not transforms or transforms[-1] != ("jvp",):
-    # We are not in the process of computing VJP
-    return trace.default_process_primitive(outside_call_p, args, params)
-
-  # The args have been prepared by the id_tap_jvp_rule: primals, tangents. The
-  # result is a pair of the primal outputs and output tangents.
-  # One invariant that JAX requires is that if the primals arguments are known
-  # then the primal outputs must be known. So, if the primal arguments are known
-  # and some of the tangents are unknown, then we must split the tap into
-  # one for the primals (thus the output will be considered known), and a
-  # separate tap for the tangents.
-  assert "has_token" not in params
-  if not params["identity"]:
-    raise NotImplementedError("differentiation rules are implemented only for id_tap, not for call.")
-
-  assert len(args) % 2 == 0
-  nr_primals = len(args) // 2
-  primals, tangents = util.split_list(args, [nr_primals])
-  all_primals_known = all(p.is_known() for p in primals)
-  some_tangents_unknown = any(not t.is_known() for t in tangents)
-
-  if not (all_primals_known and some_tangents_unknown):
-    return trace.default_process_primitive(outside_call_p, args, params)
-
-  prims, _ = params["arg_treedef"].unflatten(args)
-  _, primals_treedef = api.tree_flatten(prims)
-
-  outs_known = trace.default_process_primitive(
-      outside_call_p, primals,
-      dict(params,
-           arg_treedef=primals_treedef,
-           transforms=transforms[:-1]))
-  # Now compute the unknowns using the whole tap, and merge them with the tapped ones
-  outs_all_unknown = trace.default_process_primitive(outside_call_p, args, params)
-  outs_primals_unknown, outs_tangents_unknown = util.split_list(
-      outs_all_unknown, [nr_primals])
-  outs_combined = (
-      [pe.JaxprTracer(trace, pe.PartialVal.known(primal_known),
-                      primal_unknown.recipe)
-       for primal_known, primal_unknown in util.safe_zip(outs_known, outs_primals_unknown)] +
-      outs_tangents_unknown)
-  return tuple(outs_combined)
-
-
-pe.custom_partial_eval_rules[outside_call_p] = _outside_call_partial_eval_rule
-
 
 def _outside_call_transpose_rule(cts, *args, **params):
   if not params["identity"]:
@@ -1491,21 +1334,7 @@ def _outside_call_transpose_rule(cts, *args, **params):
         *cts_instantiated,
         **_add_transform(params, "transpose"))
 
-  if not FLAGS.jax_host_callback_ad_transforms:
-    assert False
-
-  assert len(args) % 2 == 0
-  nr_primals = len(args) // 2
-
-  args_unflat, tan_unflat = params["arg_treedef"].unflatten(args)
-  _, vjp_arg_treedef = api.tree_flatten(args_unflat)
-  # We want to tap the cts_tapped_tangents
-  cts_primals, cts_tangents = util.split_list(cts_instantiated, [nr_primals])
-  cts_tangents_through_tap = outside_call_p.bind(
-      *cts_tangents,
-      **dict(_add_transform(params, "transpose"),
-             arg_treedef=vjp_arg_treedef))
-  return cts_primals + cts_tangents_through_tap
+  assert False
 
 
 ad.primitive_transposes[outside_call_p] = _outside_call_transpose_rule
@@ -1677,6 +1506,7 @@ def _rewrite_eqn(eqn: core.JaxprEqn, eqns: list[core.JaxprEqn],
 
     def unreachable_thunk():
       assert False, "Should not be reached"
+    unreachable_thunk.reset_stores = lambda: None
 
     eqns.append(
         eqn.replace(
@@ -1887,8 +1717,8 @@ class _CallbackHandlerData:
     # because we may have cached compilations that embed consumer ids, and we
     # do not want the id reused for other shapes.
     # Used only for the outfeed mechanism.
-    self.callback_registry = dict()
-    self.callback_registry_by_id = dict()
+    self.callback_registry = {}
+    self.callback_registry_by_id = {}
     # For now we keep here the keep_alives for the emit_python_callback. This is
     # a leak. We ought to attach these to the executable.
     self.keep_alives = []
@@ -1975,7 +1805,7 @@ def _initialize_outfeed_receiver(
       _callback_handler_data.receiver = outfeed_receiver_module.start(
           _callback_input_received, tuple(clients_with_outfeed),
           max_callback_queue_size_bytes,
-          xb.get_compile_options(1, 1).executable_build_options)  # type:ignore
+          compiler.get_compile_options(1, 1).executable_build_options)  # type:ignore
 
     def exit_handler():
       # Prevent logging usage during compilation, gives errors under pytest

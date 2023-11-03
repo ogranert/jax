@@ -12,17 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Module for the loop primitives."""
+
+from collections.abc import Sequence
 from functools import partial
 import inspect
 import itertools
 import operator
-from typing import Any, Callable, Optional, Sequence, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 
 import jax
 import weakref
+from jax._src import config
 from jax._src import core
 from jax._src import linear_util as lu
-from jax import config  # type: ignore[no-redef]
 from jax._src.core import ConcreteArray, ShapedArray, raise_to_shaped
 from jax.tree_util import (tree_flatten, tree_unflatten, treedef_is_leaf,
                            tree_map, tree_flatten_with_path, keystr)
@@ -50,19 +52,19 @@ from jax._src import state
 from jax._src.state import discharge as state_discharge
 from jax._src.numpy.ufuncs import logaddexp
 from jax._src.traceback_util import api_boundary
+from jax._src.typing import Array
 from jax._src.util import (partition_list, safe_map, safe_zip, split_list,
                            unzip2, weakref_lru_cache, merge_lists)
 import numpy as np
 
 from jax._src.lax.control_flow.common import (
     _abstractify, _avals_short, _check_tree_and_avals, _initial_style_jaxpr,
-    _make_closed_jaxpr, _prune_zeros, _typecheck_param, allowed_effects)
+    _make_closed_jaxpr, _prune_zeros, _typecheck_param)
 
 _map = safe_map
 zip = safe_zip
 
 T = TypeVar('T')
-Array = Any
 BooleanNumeric = Any  # A bool, or a Boolean array.
 
 ### Helper functions
@@ -112,9 +114,8 @@ def scan(f: Callable[[Carry, X], tuple[Carry, Y]],
 
     scan :: (c -> a -> (c, b)) -> c -> [a] -> (c, [b])
 
-  where we use [t] here to denote the type t with an additional leading axis.
-  That is, if t is an array type then [t] represents the type with an additional
-  leading axis, and if t is a pytree (container) type with array leaves then [t]
+  where for any array type specifier ``t``, ``[t]`` represents the type with an additional
+  leading axis, and if ``t`` is a pytree (container) type with array leaves then ``[t]``
   represents the type with the same pytree structure and corresponding leaves
   each with an additional leading axis.
 
@@ -213,7 +214,7 @@ def scan(f: Callable[[Carry, X], tuple[Carry, Y]],
     else:
       length, = unique_lengths
 
-  if config.jax_disable_jit:
+  if config.disable_jit.value:
     if length == 0:
       raise ValueError("zero-length scan is not supported in disable_jit() mode because the output type is unknown.")
     carry = init
@@ -257,7 +258,7 @@ def scan(f: Callable[[Carry, X], tuple[Carry, Y]],
   in_flat, jaxpr, consts, out_tree, out_tree_children = rest
 
   _check_scan_carry_type(f, init, out_tree_children[0], carry_avals_out)
-  disallowed_effects = allowed_effects.filter_not_in(jaxpr.effects)
+  disallowed_effects = effects.control_flow_allowed_effects.filter_not_in(jaxpr.effects)
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `scan`: {disallowed_effects}')
@@ -721,16 +722,18 @@ def _scan_transpose(reduce_axes, cts, *args, reverse, length, num_consts,
   assert not any(ad.is_undefined_primal(r) for r in eres)
 
   carry_avals, y_avals = split_list(jaxpr.out_avals, [num_carry])
-  ys_avals = _map(partial(_prepend_dim_to_aval, length), y_avals)
   ct_carry, ct_ys = split_list(cts, [num_carry])
   ct_carry = _map(ad.instantiate_zeros_aval, carry_avals, ct_carry)
-  ct_ys = _map(ad.instantiate_zeros_aval, ys_avals, ct_ys)
+  ct_ys_is_zeros = [type(ct_y) is ad.Zero for ct_y in ct_ys]
+  ct_ys = [x for x in ct_ys if type(x) is not ad.Zero]
+
   ct_consts = _map(ad_util.zeros_like_aval, jaxpr.in_avals[num_ires:num_consts])
 
   #       jaxpr :: [ires, T d] -> [T c] -> [T a, eres] -> ([T c], [T b])
   # jaxpr_trans :: [ires] -> [CT d, CT c] -> [CT b, eres] -> ([CT d, CT c], [CT a])
   jaxpr_trans = _transpose_scan_jaxpr(
-      num_ires, num_consts - num_ires, num_eres, jaxpr, reduce_axes)
+      num_ires, num_consts - num_ires, num_eres, jaxpr, reduce_axes,
+      ct_ys_is_zeros)
   linear_trans = ([False] * num_ires +
                   [True] * (len(ct_consts) + len(ct_carry) + len(ct_ys)) +
                   [False] * num_eres)
@@ -743,31 +746,46 @@ def _scan_transpose(reduce_axes, cts, *args, reverse, length, num_consts,
   ct_consts, ct_init, ct_xs = split_list(outs, [num_consts - num_ires, num_carry])
   return [None] * num_ires + ct_consts + ct_init + ct_xs + [None] * num_eres
 
+
 # transpose_scan_jaxpr :: ([res1, c, a, res2] -> b)
 #                         -> ([res1, CT c, CT b, res2] -> [CT c, CT a])
-def _transpose_scan_jaxpr(num_res1, num_c, num_res2, jaxpr, reduce_axes):
+def _transpose_scan_jaxpr(num_res1, num_c, num_res2, jaxpr, reduce_axes,
+    ct_ys_is_zeros):
   num_a = len(jaxpr.in_avals) - num_res1 - num_c - num_res2
   # TODO: allow input cotangent avals to be batched relative to jaxpr.in_avals
   # if an axis isn't reduced
   res1_avals, c_avals, a_avals, res2_avals = split_list(
       jaxpr.in_avals, [num_res1, num_c, num_a])
-  num_b = len(jaxpr.out_avals)
-  b_avals = list(jaxpr.out_avals)
+
+  num_ys = len(ct_ys_is_zeros)
+  num_b = len(jaxpr.out_avals) - num_ys
+  # TODO: Also propagate ad.Zero through b_carry_avals until fixed point.
+  b_carry_avals, b_ys_avals = split_list(list(jaxpr.out_avals), [num_b])
+  b_ys_avals_stripped = [
+      aval for aval, is_zero in zip(b_ys_avals, ct_ys_is_zeros) if not is_zero
+  ]
 
   @lu.wrap_init
   def transposed(*res1_cbar_bbar_res2):
-    res1, c_bar, b_bar, res2 = split_list(
-        res1_cbar_bbar_res2, [num_res1, num_c, num_b])
+    res1, c_bar, b_bar, ys_bar_stripped, res2 = split_list(
+        res1_cbar_bbar_res2,
+        [num_res1, num_c, num_b, len(b_ys_avals_stripped)])
+    ys_bar_stripped_iter = iter(ys_bar_stripped)
+    ys_bar = [
+        ad.Zero(aval) if is_zero else next(ys_bar_stripped_iter)
+        for aval, is_zero in zip(b_ys_avals, ct_ys_is_zeros)
+    ]
     primals = (res1 + [ad.UndefinedPrimal(aval) for aval in c_avals] +
                [ad.UndefinedPrimal(aval) for aval in a_avals] + res2)
-    cbar_abar = ad.backward_pass(jaxpr.jaxpr, reduce_axes, False, jaxpr.consts,
-                                 primals, b_bar)
+    cbar_abar = ad.backward_pass(
+        jaxpr.jaxpr, reduce_axes, False, jaxpr.consts, primals, b_bar + ys_bar)
     _, new_c_bar, a_bar, _ = split_list(cbar_abar, [num_res1, num_c, num_a])
     a_bar = _map(ad.instantiate_zeros_aval, a_avals, a_bar)
     c_bar = _map(ad.instantiate_zeros_aval, c_avals,
                 _map(ad.add_tangents, c_bar, new_c_bar))
     return c_bar + a_bar
-  return _make_closed_jaxpr(transposed, res1_avals + c_avals + b_avals + res2_avals)
+  return _make_closed_jaxpr(transposed,
+      res1_avals + c_avals + b_carry_avals + b_ys_avals_stripped + res2_avals)
 
 
 def _scan_batching_rule(spmd_axis_name, axis_size, axis_name, main_type, args,
@@ -841,7 +859,7 @@ def _scan_dce_rule(used_outputs: list[bool], eqn: core.JaxprEqn
       used_carry_out = _map(operator.or_, used_carry_out, used_carry_in)
   else:
     assert False, "Fixpoint not reached"
-  if config.jax_enable_checks: core.check_jaxpr(jaxpr.jaxpr)
+  if config.enable_checks.value: core.check_jaxpr(jaxpr.jaxpr)
 
   new_linear = [l for l, u in zip(eqn.params['linear'], used_inputs) if u]
   new_params = dict(eqn.params, num_consts=sum(used_consts),
@@ -984,7 +1002,7 @@ def _scan_typecheck(bind_time, *in_atoms, reverse, length, num_consts,
      type(linear) is tuple and all(type(x) is bool for x in linear))
   tc(unroll, 'unroll', 'positive int', type(unroll) is int and unroll > 0)
 
-  tc(length, 'length', 'non-negative int', core.greater_equal_dim(length, 0))
+  tc(length, 'length', 'non-negative int', length >= 0)
 
   if len(linear) != len(avals):
     raise core.JaxprTypeError(
@@ -1031,8 +1049,8 @@ def _scan_pp_rule(eqn, context, settings):
     del printed_params['reverse']
   return core._pp_eqn(eqn.replace(params=printed_params), context, settings)
 
-def _scan_discharge_rule(in_avals, out_avals, *args, jaxpr, num_consts,
-                         num_carry, linear, unroll, reverse, length):
+def _scan_state_discharge_rule(in_avals, out_avals, *args, jaxpr, num_consts,
+                               num_carry, linear, unroll, reverse, length):
   jaxpr, consts = jaxpr.jaxpr, jaxpr.consts
   if consts: raise NotImplementedError
   consts, carry, xs = split_list(args, [num_consts, num_carry])
@@ -1087,7 +1105,7 @@ def _scan_discharge_rule(in_avals, out_avals, *args, jaxpr, num_consts,
   return new_invals, [*carry_out, *ys_out]
 
 def scan_bind(*args, **params):
-  if config.jax_enable_checks:
+  if config.enable_checks.value:
     avals = _map(core.get_aval, args)
     in_atoms = [core.Var(0, '', a) for a in avals]  # dummies
     _scan_typecheck(True, *in_atoms, **params)
@@ -1111,7 +1129,7 @@ core.custom_typechecks[scan_p] = partial(_scan_typecheck, False)
 pe.partial_eval_jaxpr_custom_rules[scan_p] = _scan_partial_eval_custom
 pe.padding_rules[scan_p] = _scan_padding_rule
 pe.dce_rules[scan_p] = _scan_dce_rule
-state_discharge.register_discharge_rule(scan_p)(_scan_discharge_rule)
+state_discharge.register_discharge_rule(scan_p)(_scan_state_discharge_rule)
 # TODO(mattjj,frostig): un-comment this pp rule
 # core.pp_eqn_rules[scan_p] = _scan_pp_rule
 
@@ -1172,7 +1190,7 @@ def while_loop(cond_fun: Callable[[T], BooleanNumeric],
   """
   if not (callable(body_fun) and callable(cond_fun)):
     raise TypeError("lax.while_loop: body_fun and cond_fun arguments should be callable.")
-  if config.jax_disable_jit:
+  if config.disable_jit.value:
     try:
       val = init_val
       while cond_fun(val):
@@ -1217,8 +1235,8 @@ def while_loop(cond_fun: Callable[[T], BooleanNumeric],
   _check_tree_and_avals("body_fun output and input",
                         body_tree, body_jaxpr.out_avals,
                         in_tree_children[0], init_avals)
-  effects = core.join_effects(cond_jaxpr.effects, body_jaxpr.effects)
-  disallowed_effects = allowed_effects.filter_not_in(effects)
+  joined_effects = core.join_effects(cond_jaxpr.effects, body_jaxpr.effects)
+  disallowed_effects = effects.control_flow_allowed_effects.filter_not_in(joined_effects)
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `while`: {disallowed_effects}')
@@ -1250,7 +1268,7 @@ def _while_loop_abstract_eval(*avals, cond_jaxpr, body_jaxpr, body_nconsts,
   del avals
   joined_effects = _join_while_effects(body_jaxpr, cond_jaxpr, body_nconsts,
                                        cond_nconsts)
-  disallowed_effects = allowed_effects.filter_not_in(joined_effects)
+  disallowed_effects = effects.control_flow_allowed_effects.filter_not_in(joined_effects)
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `while`: {disallowed_effects}')
@@ -1433,7 +1451,7 @@ def _while_partial_eval(trace: pe.JaxprTrace, *tracers: pe.Tracer, cond_nconsts:
   cond_jaxpr_known, _, cond_uk, _ = pe.partial_eval_jaxpr_nounits(  # type: ignore
       cond_jaxpr, cond_consts_uk + carry_uk, instantiate=False)
 
-  if cond_uk[0] or all([not uk for uk in unknowns]) or all(unknowns):
+  if cond_uk[0] or all(not uk for uk in unknowns) or all(unknowns):
     # If conditional is unknown, or all inputs are known, or all are unknown,
     # just do the default processing.
     return trace.default_process_primitive(while_p, tracers, params)
@@ -1610,9 +1628,17 @@ def _while_lowering(ctx, *args, cond_jaxpr, body_jaxpr, cond_nconsts,
     cond_args = cond_args[num_tokens:]
     x, _, z = util.split_list(cond_args, [cond_nconsts, body_nconsts])
     cond_ctx = ctx.module_context.replace(name_stack=name_stack.extend('cond'))
-    ((pred,),), _ = mlir.jaxpr_subcomp(cond_ctx, cond_jaxpr.jaxpr, mlir.TokenSet(),
-                                       _map(mlir.ir_constants, cond_jaxpr.consts),
-                                       *(x + z), dim_var_values=ctx.dim_var_values)
+    cond_consts = [
+        mlir.ir_constants(xla.canonicalize_dtype(x)) for x in cond_jaxpr.consts
+    ]
+    ((pred,),), _ = mlir.jaxpr_subcomp(
+        cond_ctx,
+        cond_jaxpr.jaxpr,
+        mlir.TokenSet(),
+        cond_consts,
+        *(x + z),
+        dim_var_values=ctx.dim_var_values,
+    )
     if batched:
       pred_ctx = mlir.LoweringRuleContext(
           module_context=ctx.module_context,
@@ -1641,17 +1667,19 @@ def _while_lowering(ctx, *args, cond_jaxpr, body_jaxpr, cond_nconsts,
     tokens_in = mlir.TokenSet(zip(body_effects, token_args))
     x, y, z = util.split_list(body_args, [cond_nconsts, body_nconsts])
     body_ctx = ctx.module_context.replace(name_stack=name_stack.extend('body'))
+    body_consts = [mlir.ir_constants(xla.canonicalize_dtype(x))
+                   for x in body_jaxpr.consts]
     new_z, tokens_out = mlir.jaxpr_subcomp(body_ctx, body_jaxpr.jaxpr,
-        tokens_in, _map(mlir.ir_constants, body_jaxpr.consts),
-        *(y + z), dim_var_values=ctx.dim_var_values)
+        tokens_in, body_consts, *(y + z), dim_var_values=ctx.dim_var_values)
     out_tokens = [tokens_out.get(eff) for eff in body_effects]
     if batched:
       body_pred_ctx = ctx.module_context.replace(
           name_stack=name_stack.extend('body_pred'))
+      cond_consts = [mlir.ir_constants(xla.canonicalize_dtype(x))
+                     for x in cond_jaxpr.consts]
       ((body_pred,),), _ = mlir.jaxpr_subcomp(
           body_pred_ctx, cond_jaxpr.jaxpr, mlir.TokenSet(),
-          _map(mlir.ir_constants, cond_jaxpr.consts),
-          *(x + z), dim_var_values=ctx.dim_var_values)
+          cond_consts, *(x + z), dim_var_values=ctx.dim_var_values)
       new_z = _map(
           partial(_pred_bcast_select_hlo, ctx, pred_aval, body_pred), new_z, z,
           body_jaxpr.out_avals)
@@ -1670,7 +1698,7 @@ def _while_typecheck(_, *in_atoms, cond_jaxpr, body_jaxpr, cond_nconsts,
   # TODO(frostig,mattjj): check cond_jaxpr, body_jaxpr types
   joined_effects = _join_while_effects(body_jaxpr, cond_jaxpr, body_nconsts,
                                        cond_nconsts)
-  disallowed_effects = allowed_effects.filter_not_in(joined_effects)
+  disallowed_effects = effects.control_flow_allowed_effects.filter_not_in(joined_effects)
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `while`: {disallowed_effects}')
@@ -1903,7 +1931,7 @@ def fori_loop(lower, upper, body_fun, init_val):
     use_scan = False
 
   if use_scan:
-    if config.jax_disable_jit and upper_ == lower_:
+    if config.disable_jit.value and upper_ == lower_:
       # non-jit implementation of scan does not support length=0
       return init_val
 

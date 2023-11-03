@@ -24,7 +24,6 @@ __all__ = ['register_jax_array_methods']
 import abc
 from functools import partial, wraps
 from typing import Any, Optional, Union
-import warnings
 
 import numpy as np
 import jax
@@ -48,7 +47,7 @@ zip, unsafe_zip = safe_zip, zip
 
 ### add method and operator overloads to arraylike classes
 
-# We add operator overloads to DeviceArray and ShapedArray. These method and
+# We add operator overloads to Array and ShapedArray. These method and
 # operator overloads mainly just forward calls to the corresponding lax_numpy
 # functions, which can themselves handle instances from any of these classes.
 
@@ -56,7 +55,7 @@ zip, unsafe_zip = safe_zip, zip
 def _astype(arr: ArrayLike, dtype: DTypeLike) -> Array:
   """Copy the array and cast to a specified dtype.
 
-  This is implemeted via :func:`jax.lax.convert_element_type`, which may
+  This is implemented via :func:`jax.lax.convert_element_type`, which may
   have slightly different behavior than :meth:`numpy.ndarray.astype` in
   some cases. In particular, the details of float-to-int and int-to-float
   casts are implementation dependent.
@@ -151,7 +150,7 @@ def _reshape(a: Array, *args: Any, order: str = "C") -> Array:
     raise ValueError(f"Unexpected value for 'order' argument: {order}.")
 
 
-def _view(arr: Array, dtype: DTypeLike = None, type: None = None) -> Array:
+def _view(arr: Array, dtype: Optional[DTypeLike] = None, type: None = None) -> Array:
   """Return a bitwise copy of the array, viewed as a new dtype.
 
   This is fuller-featured wrapper around :func:`jax.lax.bitcast_convert_type`.
@@ -241,7 +240,7 @@ def _view(arr: Array, dtype: DTypeLike = None, type: None = None) -> Array:
 
 
 def _notimplemented_flat(self):
-  raise NotImplementedError("JAX DeviceArrays do not implement the arr.flat property: "
+  raise NotImplementedError("JAX Arrays do not implement the arr.flat property: "
                             "consider arr.flatten() instead.")
 
 _accepted_binop_types = (int, float, complex, np.generic, np.ndarray, Array)
@@ -255,7 +254,9 @@ def _defer_to_unrecognized_arg(opchar, binary_op, swap=False):
     args = (other, self) if swap else (self, other)
     if isinstance(other, _accepted_binop_types):
       return binary_op(*args)
-    if isinstance(other, _rejected_binop_types):
+    # Note: don't use isinstance here, because we don't want to raise for
+    # subclasses, e.g. NamedTuple objects that may override operators.
+    if type(other) in _rejected_binop_types:
       raise TypeError(f"unsupported operand type(s) for {opchar}: "
                       f"{type(args[0]).__name__!r} and {type(args[1]).__name__!r}")
     return NotImplemented
@@ -301,36 +302,6 @@ def _compress_method(a: ArrayLike, condition: ArrayLike,
   return lax_numpy.jaxcompress(condition, a, axis, out)
 
 
-@util._wraps(lax.broadcast, lax_description="""
-Deprecated. Use :func:`jax.lax.broadcast` instead.
-""")
-def _deprecated_broadcast(*args, **kwargs):
-  warnings.warn(
-    "The arr.broadcast() method is deprecated. Use jax.lax.broadcast instead.",
-    category=FutureWarning)
-  return lax.broadcast(*args, **kwargs)
-
-
-@util._wraps(lax.broadcast, lax_description="""
-Deprecated. Use :func:`jax.lax.broadcast_in_dim` instead.
-""")
-def _deprecated_broadcast_in_dim(*args, **kwargs):
-  warnings.warn(
-    "The arr.broadcast_in_dim() method is deprecated. Use jax.lax.broadcast_in_dim instead.",
-    category=FutureWarning)
-  return lax.broadcast_in_dim(*args, **kwargs)
-
-
-@util._wraps(lax.broadcast, lax_description="""
-Deprecated. Use :func:`jax.numpy.split` instead.
-""")
-def _deprecated_split(*args, **kwargs):
-  warnings.warn(
-    "The arr.split() method is deprecated. Use jax.numpy.split instead.",
-    category=FutureWarning)
-  return lax_numpy.split(*args, **kwargs)
-
-
 @core.stash_axis_env()
 @partial(jax.jit, static_argnums=(1,2,3))
 def _multi_slice(arr: ArrayLike,
@@ -339,8 +310,8 @@ def _multi_slice(arr: ArrayLike,
                  removed_dims: tuple[tuple[int, ...]]) -> list[Array]:
   """Extracts multiple slices from `arr`.
 
-  This is used to shard DeviceArray arguments to pmap. It's implemented as a
-  DeviceArray method here to avoid circular imports.
+  This is used to shard Array arguments to pmap. It's implemented as a
+  Array method here to avoid circular imports.
   """
   results: list[Array] = []
   for starts, limits, removed in zip(start_indices, limit_indices, removed_dims):
@@ -366,13 +337,16 @@ def _chunk_iter(x, size):
     if tail:
       yield lax.dynamic_slice_in_dim(x, num_chunks * size, tail)
 
+def _getitem(self, item):
+  return lax_numpy._rewriting_take(self, item)
+
 # Syntactic sugar for scatter operations.
 class _IndexUpdateHelper:
   # Note: this docstring will appear as the docstring for the `at` property.
   """Helper property for index update functionality.
 
   The ``at`` property provides a functionally pure equivalent of in-place
-  array modificatons.
+  array modifications.
 
   In particular:
 
@@ -461,7 +435,7 @@ class _IndexUpdateHelper:
     return _IndexUpdateRef(self.array, index)
 
   def __repr__(self):
-    return f"_IndexUpdateHelper({repr(self.array)})"
+    return f"_IndexUpdateHelper({self.array!r})"
 
 
 class _IndexUpdateRef:
@@ -478,7 +452,7 @@ class _IndexUpdateRef:
     self.index = index
 
   def __repr__(self):
-    return f"_IndexUpdateRef({repr(self.array)}, {repr(self.index)})"
+    return f"_IndexUpdateRef({self.array!r}, {self.index!r})"
 
   def get(self, *, indices_are_sorted=False, unique_indices=False,
           mode=None, fill_value=None):
@@ -625,7 +599,7 @@ class _IndexUpdateRef:
                                    unique_indices=unique_indices, mode=mode)
 
 _array_operators = {
-  "getitem": lax_numpy._rewriting_take,
+  "getitem": _getitem,
   "setitem": _unimplemented_setitem,
   "copy": _copy,
   "deepcopy": _deepcopy,
@@ -717,12 +691,6 @@ _array_methods = {
   # Methods exposed in order to avoid circular imports
   "_split": lax_numpy.split,  # used in jacfwd/jacrev
   "_multi_slice": _multi_slice,  # used in pxla for sharding
-
-  # Deprecated methods.
-  # TODO(jakevdp): remove these after June 2023
-  "broadcast": _deprecated_broadcast,
-  "broadcast_in_dim": _deprecated_broadcast_in_dim,
-  "split": _deprecated_split,
 }
 
 _impl_only_array_methods = {
@@ -783,7 +751,7 @@ def _set_tracer_aval_forwarding(tracer, exclude=()):
       setattr(tracer, prop_name, _forward_property_to_aval(prop_name))
 
 def _set_array_base_attributes(device_array, include=None, exclude=None):
-  # Forward operators, methods, and properties on DeviceArray to lax_numpy
+  # Forward operators, methods, and properties on Array to lax_numpy
   # functions (with no Tracers involved; this forwarding is direct)
   def maybe_setattr(attr_name, target):
     if exclude is not None and attr_name in exclude:

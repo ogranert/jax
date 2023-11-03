@@ -13,40 +13,49 @@
 # limitations under the License.
 
 from functools import partial
-import hashlib
 import math
 import os
-import random
-import sys
 import tempfile
-import unittest
-from unittest import mock, SkipTest
+from collections import Counter
+from unittest import mock
+from unittest import SkipTest
 import warnings
 
 from absl.testing import absltest
 from absl.testing import parameterized
-
 import jax
-from jax import jit, lax, pmap
+from jax import jit
+from jax import lax
+from jax import pmap
+from jax._src import compilation_cache as cc
+from jax._src import compiler
+from jax._src import config
+from jax._src import monitoring
+from jax._src import test_util as jtu
+from jax._src import xla_bridge
+from jax._src.lib import xla_client
 from jax.experimental.maps import xmap
 from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec as P
-from jax._src import compilation_cache as cc
-from jax._src import test_util as jtu
-from jax._src import xla_bridge
-from jax._src.config import (
-    compilation_cache_include_metadata_in_key,
-    persistent_cache_min_compile_time_secs,
-    raise_persistent_cache_errors,
-)
-from jax._src.lib import xla_client
-
 import numpy as np
 
-from jax import config
 
 config.parse_flags_with_absl()
-FLAGS = config.FLAGS
+
+FAKE_COMPILE_TIME = 10
+_counts = Counter()  # Map event name to count
+
+
+def setUpModule():
+  monitoring.register_event_listener(increment_event_count)
+
+
+def tearDownModule():
+  monitoring._unregister_event_listener_by_callback(increment_event_count)
+
+
+def increment_event_count(event):
+  _counts[event] += 1
 
 
 @jtu.with_config(
@@ -62,7 +71,7 @@ class CompilationCacheTest(jtu.JaxTestCase):
     if "--xla_cpu_use_xla_runtime=true" in os.environ.get("XLA_FLAGS", ""):
       supported_platforms.append("cpu")
 
-    if jtu.device_under_test() not in supported_platforms:
+    if not jtu.test_device_matches(supported_platforms):
       raise SkipTest(
           "serialize executable only works on " + ",".join(supported_platforms)
       )
@@ -76,226 +85,39 @@ class CompilationCacheTest(jtu.JaxTestCase):
       cc.reset_cache()
     super().tearDown()
 
-  def test_compile_options(self):
-    compile_options_not_filled = xla_bridge.get_compile_options(
-        num_replicas=1, num_partitions=1
-    )
-    compile_options_filled = self.filled_compile_options()
-    filled_hash1 = self.get_hashed_value(
-        cc._hash_compile_options, compile_options_filled
-    )
-    filled_hash2 = self.get_hashed_value(
-        cc._hash_compile_options, compile_options_filled
-    )
-    not_filled_hash3 = self.get_hashed_value(
-        cc._hash_compile_options, compile_options_not_filled
-    )
-    self.assertEqual(filled_hash1, filled_hash2)
-    self.assertNotEqual(filled_hash1, not_filled_hash3)
-
-  def test_executable_build_options(self):
-    compile_options_not_filled = xla_bridge.get_compile_options(
-        num_replicas=1, num_partitions=1
-    )
-    compile_options_filled = self.filled_compile_options()
-    filled_hash1 = self.get_hashed_value(
-        cc._hash_executable_build_options,
-        compile_options_filled.executable_build_options,
-    )
-    filled_hash2 = self.get_hashed_value(
-        cc._hash_executable_build_options,
-        compile_options_filled.executable_build_options,
-    )
-    not_filled_hash3 = self.get_hashed_value(
-        cc._hash_executable_build_options,
-        compile_options_not_filled.executable_build_options,
-    )
-    self.assertEqual(filled_hash1, filled_hash2)
-    self.assertNotEqual(filled_hash1, not_filled_hash3)
-
-  def test_debug_options(self):
-    compile_options = xla_bridge.get_compile_options(
-        num_replicas=1, num_partitions=1
-    )
-    hash1 = self.get_hashed_value(
-        cc._hash_debug_options,
-        compile_options.executable_build_options.debug_options,
-    )
-    hash2 = self.get_hashed_value(
-        cc._hash_debug_options,
-        compile_options.executable_build_options.debug_options,
-    )
-    self.assertEqual(hash1, hash2)
-    new_debug_options = self.create_new_debug_options(
-        compile_options.executable_build_options.debug_options
-    )
-    hash3 = self.get_hashed_value(cc._hash_debug_options, new_debug_options)
-    self.assertNotEqual(hash1, hash3)
-
-  def test_hash_platform(self):
-    hash1 = self.get_hashed_value(cc._hash_platform, xla_bridge.get_backend())
-    hash2 = self.get_hashed_value(cc._hash_platform, xla_bridge.get_backend())
-    self.assertEqual(hash1, hash2)
-    if xla_bridge.get_backend().platform != "cpu":
-      cpu_backend = xla_bridge.get_backend("cpu")
-      hash3 = self.get_hashed_value(cc._hash_platform, cpu_backend)
-      self.assertNotEqual(hash1, hash3)
-
-  def test_hash_int(self):
-    hash1 = self.get_hashed_value(cc._hash_int, 90)
-    hash2 = self.get_hashed_value(cc._hash_int, 8)
-    hash3 = self.get_hashed_value(cc._hash_int, 8)
-    self.assertEqual(hash2, hash3)
-    self.assertNotEqual(hash1, hash2)
-
-  def test_hash_bool(self):
-    hash1 = self.get_hashed_value(cc._hash_bool, False)
-    hash2 = self.get_hashed_value(cc._hash_bool, True)
-    hash3 = self.get_hashed_value(cc._hash_bool, True)
-    self.assertEqual(hash2, hash3)
-    self.assertNotEqual(hash1, hash2)
-
-  def test_hash_string(self):
-    hash1 = self.get_hashed_value(cc._hash_string, "foo")
-    hash2 = self.get_hashed_value(cc._hash_string, "bar")
-    hash3 = self.get_hashed_value(cc._hash_string, "bar")
-    self.assertEqual(hash2, hash3)
-    self.assertNotEqual(hash1, hash2)
-
-  def test_same_hash_key(self):
-    computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
-    devices = np.array([[jax.local_devices()[0]]])
-    compile_options = xla_bridge.get_compile_options(
-        num_replicas=1, num_partitions=1
-    )
-    backend = xla_bridge.get_backend()
-    self.assertEqual(
-        cc.get_cache_key(computation, devices, compile_options, backend),
-        cc.get_cache_key(computation, devices, compile_options, backend),
-    )
-
-  def test_different_hash_key(self):
-    computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
-    devices = np.array([[jax.local_devices()[0]]])
-    compile_options_not_filled = xla_bridge.get_compile_options(
-        num_replicas=1, num_partitions=1
-    )
-    compile_options_filled = self.filled_compile_options()
-    backend = xla_bridge.get_backend()
-    self.assertNotEqual(
-        cc.get_cache_key(computation, devices, compile_options_not_filled,
-                         backend),
-        cc.get_cache_key(computation, devices, compile_options_filled, backend),
-    )
-
-  def test_different_computations(self):
-    computation1 = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
-    computation2 = jax.jit(lambda x, y: x * y).lower(2, 2).compiler_ir()
-    devices = np.array([[jax.local_devices()[0]]])
-    compile_options = xla_bridge.get_compile_options(
-        num_replicas=1, num_partitions=1
-    )
-    backend = xla_bridge.get_backend()
-    self.assertNotEqual(
-        cc.get_cache_key(computation1, devices, compile_options, backend),
-        cc.get_cache_key(computation2, devices, compile_options, backend),
-    )
-
-  @unittest.skipIf(jax._src.lib.version < (0, 4, 9),
-                   "Test requires jaxlib 0.4.9")
-  @parameterized.parameters([False, True])
-  def test_identical_computations_different_metadata(self, include_metadata):
-    f = lambda x, y: lax.mul(lax.add(x, y), 2)
-    g = lambda x, y: lax.mul(lax.add(x, y), 2)
-    assert id(f) != id(g)
-    computation1 = jax.jit(f).lower(1, 1).compiler_ir()
-    computation2 = jax.jit(g).lower(2, 3).compiler_ir()
-    devices = np.array([[jax.local_devices()[0]]])
-    compile_options = xla_bridge.get_compile_options(
-        num_replicas=1, num_partitions=1
-    )
-    backend = xla_bridge.get_backend()
-    with compilation_cache_include_metadata_in_key(include_metadata):
-      key1 = cc.get_cache_key(computation1, devices, compile_options, backend)
-      key2 = cc.get_cache_key(computation2, devices, compile_options, backend)
-    self.assertEqual(include_metadata, key1 != key2)
-
-  def test_xla_flags(self):
-    if jtu.is_device_tpu_v4():
-      raise unittest.SkipTest("TODO(b/240151176)")
-
-    computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
-    devices = np.array([[jax.local_devices()[0]]])
-    compile_options = xla_bridge.get_compile_options(
-        num_replicas=1, num_partitions=1
-    )
-    backend = xla_bridge.get_backend()
-
-    orig_xla_flags = os.getenv("XLA_FLAGS")
-    orig_argv = sys.argv
-    try:
-      os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=0"
-      key1 = cc.get_cache_key(computation, devices, compile_options, backend)
-      os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=1"
-      key2 = cc.get_cache_key(computation, devices, compile_options, backend)
-      self.assertNotEqual(key1, key2)
-
-      os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=0"
-      key3 = cc.get_cache_key(computation, devices, compile_options, backend)
-      self.assertEqual(key1, key3)
-
-      # Test flag in _xla_flags_to_exclude_from_cache_key
-      os.environ["XLA_FLAGS"] = (
-          "--xla_gpu_autotune_level=0 --xla_force_host_platform_device_count=8"
-      )
-      key4 = cc.get_cache_key(computation, devices, compile_options, backend)
-      self.assertEqual(key1, key4)
-
-      # Test flags given on command line
-      del os.environ["XLA_FLAGS"]
-      sys.argv.append("--xla_gpu_autotune_level=0")
-      key5 = cc.get_cache_key(computation, devices, compile_options, backend)
-      self.assertEqual(key1, key5)
-      sys.argv.append("--xla_force_host_platform_device_count=8")
-      self.assertEqual(key1, key5)
-
-    finally:
-      if orig_xla_flags is not None:
-        os.environ["XLA_FLAGS"] = orig_xla_flags
-      elif os.getenv("XLA_FLAGS") is not None:
-        del os.environ["XLA_FLAGS"]
-      sys.argv = orig_argv
-
   def test_get_no_executable(self):
     with tempfile.TemporaryDirectory() as tmpdir:
       cc.initialize_cache(tmpdir)
       computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
       devices = np.array([[jax.local_devices()[0]]])
-      compile_options = xla_bridge.get_compile_options(
+      compile_options = compiler.get_compile_options(
           num_replicas=1, num_partitions=1
       )
       backend = xla_bridge.get_backend()
       key = cc.get_cache_key(computation, devices, compile_options, backend)
-      self.assertEqual(
-          cc.get_executable(key, compile_options, backend), None
-      )
+      executable, compile_time = cc.get_executable_and_time(
+          key, compile_options, backend)
+      self.assertIsNone(executable)
+      self.assertIsNone(compile_time)
 
   def test_diff_executables(self):
     with tempfile.TemporaryDirectory() as tmpdir:
       cc.initialize_cache(tmpdir)
       computation1 = str(jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir())
       computation2 = str(jax.jit(lambda x, y: x * y).lower(2, 2).compiler_ir())
-      compile_options = xla_bridge.get_compile_options(
+      compile_options = compiler.get_compile_options(
           num_replicas=1, num_partitions=1
       )
       backend = xla_bridge.get_backend()
       executable1 = backend.compile(computation1, compile_options)
       executable2 = backend.compile(computation2, compile_options)
-      cc.put_executable("key1", "computation1", executable1, backend)
-      cc.put_executable("key2", "computation2", executable2, backend)
+      cc.put_executable_and_time(
+          "key1", "computation1", executable1, backend, FAKE_COMPILE_TIME)
+      cc.put_executable_and_time(
+          "key2", "computation2", executable2, backend, FAKE_COMPILE_TIME)
       self.assertNotEqual(
-          cc.get_executable("key1", compile_options, backend),
-          cc.get_executable("key2", compile_options, backend),
+          cc.get_executable_and_time("key1", compile_options, backend)[0],
+          cc.get_executable_and_time("key2", compile_options, backend)[0]
       )
 
   def test_put_executable(self):
@@ -307,14 +129,16 @@ class CompilationCacheTest(jtu.JaxTestCase):
           .compiler_ir()
       )
       devices = np.array([[jax.local_devices()[0]]])
-      compile_options = xla_bridge.get_compile_options(
+      compile_options = compiler.get_compile_options(
           num_replicas=1, num_partitions=1
       )
       backend = xla_bridge.get_backend()
       executable = backend.compile(str(computation), compile_options)
       key = cc.get_cache_key(computation, devices, compile_options, backend)
-      cc.put_executable(key, "alambda", executable, backend)
-      deserialized_executable = cc.get_executable(key, compile_options, backend)
+      cc.put_executable_and_time(
+          key, "alambda", executable, backend, FAKE_COMPILE_TIME)
+      executable_retrieved, compile_time_retrieved = cc.get_executable_and_time(
+          key, compile_options, backend)
       inputs_to_executable = (
           np.array(1, dtype=np.int32),
           np.array(2, dtype=np.int32),
@@ -323,9 +147,10 @@ class CompilationCacheTest(jtu.JaxTestCase):
           executable, inputs_to_executable, backend
       )
       actual = xla_client.execute_with_python_values(
-          deserialized_executable, inputs_to_executable, backend
+          executable_retrieved, inputs_to_executable, backend
       )
       self.assertEqual(expected, actual)
+      self.assertEqual(FAKE_COMPILE_TIME, compile_time_retrieved)
 
   def test_pmap(self):
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -351,6 +176,24 @@ class CompilationCacheTest(jtu.JaxTestCase):
       f(1.0)
       files_in_directory = len(os.listdir(tmpdir))
       self.assertEqual(files_in_directory, 2)
+
+  def test_xla_autofdo_profile_version(self):
+    original_profile_version = config.jax_xla_profile_version.value
+    with (tempfile.TemporaryDirectory() as tmpdir,
+          config.jax_xla_profile_version(original_profile_version + 1)):
+      cc.initialize_cache(tmpdir)
+      f = jit(lambda x: x * x)
+      f(1)
+      files_in_cache_directory = os.listdir(tmpdir)
+      self.assertLen(files_in_cache_directory, 1)
+      # Clear the cache directory, then update the profile version and execute
+      # again. The in-memory caches should be invalidated and a new persistent
+      # cache entry created.
+      os.unlink(os.path.join(tmpdir, files_in_cache_directory[0]))
+      with config.jax_xla_profile_version(original_profile_version + 2):
+        f(1)
+        files_in_directory = len(os.listdir(tmpdir))
+        self.assertEqual(files_in_directory, 1)
 
   @jtu.with_mesh([("x", 2)])
   def test_pjit(self):
@@ -400,9 +243,11 @@ class CompilationCacheTest(jtu.JaxTestCase):
       cc.initialize_cache(tmpdir)
       f = jit(lambda x: x * x)
 
-      with raise_persistent_cache_errors(False), mock.patch.object(
-          cc._cache.__class__, "put"
-      ) as mock_put, warnings.catch_warnings(record=True) as w:
+      with (
+        config.raise_persistent_cache_errors(False),
+        mock.patch.object(cc._cache.__class__, "put") as mock_put,
+        warnings.catch_warnings(record=True) as w,
+      ):
         mock_put.side_effect = RuntimeError("test error")
         self.assertEqual(f(2), 4)
         self.assertLen(w, 1)
@@ -419,9 +264,11 @@ class CompilationCacheTest(jtu.JaxTestCase):
       cc.initialize_cache(tmpdir)
       f = jit(lambda x: x * x)
 
-      with raise_persistent_cache_errors(False), mock.patch.object(
-          cc._cache.__class__, "get"
-      ) as mock_get, warnings.catch_warnings(record=True) as w:
+      with (
+        config.raise_persistent_cache_errors(False),
+        mock.patch.object(cc._cache.__class__, "get") as mock_get,
+        warnings.catch_warnings(record=True) as w,
+      ):
         mock_get.side_effect = RuntimeError("test error")
         self.assertEqual(f(2), 4)
         if len(w) > 1:
@@ -436,8 +283,9 @@ class CompilationCacheTest(jtu.JaxTestCase):
         )
 
   def test_min_compile_time(self):
-    with tempfile.TemporaryDirectory() as tmpdir, persistent_cache_min_compile_time_secs(
-        2
+    with (
+      tempfile.TemporaryDirectory() as tmpdir,
+      config.persistent_cache_min_compile_time_secs(2),
     ):
       cc.initialize_cache(tmpdir)
 
@@ -453,42 +301,138 @@ class CompilationCacheTest(jtu.JaxTestCase):
         files_in_cache = len(os.listdir(tmpdir))
         self.assertEqual(files_in_cache, 1)
 
-  def create_new_debug_options(self, debug_options_obj):
-    debug_options_obj.xla_cpu_enable_fast_math = False
-    debug_options_obj.xla_cpu_fast_math_honor_infs = False
-    debug_options_obj.xla_cpu_fast_math_honor_nans = False
-    debug_options_obj.xla_cpu_fast_math_honor_division = False
-    debug_options_obj.xla_cpu_fast_math_honor_functions = False
-    debug_options_obj.xla_gpu_enable_fast_min_max = False
-    debug_options_obj.xla_backend_optimization_level = random.randint(0, 10)
-    debug_options_obj.xla_cpu_enable_xprof_traceme = False
-    debug_options_obj.xla_llvm_disable_expensive_passes = False
-    debug_options_obj.xla_test_all_input_layouts = False
-    return debug_options_obj
+  # TODO(b/293308239) Remove the parameters after the new compilation cache key
+  # implementation is enabled.
+  @parameterized.parameters(True, False)
+  def test_cache_saving_metric(self, use_original):
+    with (
+      tempfile.TemporaryDirectory() as tmpdir,
+      config.persistent_cache_min_compile_time_secs(2),
+      config.use_original_compilation_cache_key_generation(use_original),
+    ):
+      cc.initialize_cache(tmpdir)
 
-  def filled_compile_options(self):
-    compile_options = xla_client.CompileOptions()
-    compile_options.num_replicas = 1
-    compile_options.num_partitions = 1
-    shape = xla_client.Shape.array_shape(np.dtype(np.float32), [2])
-    shape_array = [shape, shape]
-    compile_options.argument_layouts = shape_array
-    compile_options.executable_build_options.result_layout = shape
+      durations = Counter()  # Map metric name to time duration.
+      def append_metric_duration(metric, duration):
+        durations[metric] += duration
 
-    device_assignment = xla_client.DeviceAssignment.create(
-        np.ndarray(shape=(2, 2))
-    )
-    compile_options.device_assignment = device_assignment
-    compile_options.executable_build_options.device_assignment = (
-        device_assignment
-    )
-    return compile_options
+      with jtu.register_event_duration_listener(append_metric_duration):
 
-  def get_hashed_value(self, hash_function, hash_function_input):
-    hash_obj = hashlib.sha256()
-    hash_function(hash_obj, hash_function_input)
-    return hash_obj.digest().hex()
+        # Mock time to create a short compilation time, no cache saved, no cache
+        # hit, no metric recorded.
+        with mock.patch("time.monotonic", side_effect=np.arange(0, 1, 0.1)):
+          jit(lambda x: x + 1)(1)
 
+        jit(lambda x: x + 1)(1)
+        self.assertNotIn(
+            "/jax/compilation_cache/cache_retrieval_time_sec", durations)
+        if use_original:
+          self.assertNotIn(
+              "/jax/compilation_cache/original_compile_time_saved_sec",
+              durations)
+        else:
+          # TODO(b/293308239) Remove this skipping when pjrt c api is supported.
+          if xla_bridge.using_pjrt_c_api():
+            raise SkipTest("PJRT C API not supported yet.")
+          self.assertNotIn(
+              "/jax/compilation_cache/compile_time_saved_sec", durations)
+
+        # Mock time to create a long compilation time, metrics incremented with
+        # a cache hit.
+        with mock.patch("time.monotonic", side_effect=np.arange(0, 100, 10)):
+          jit(lambda x: x + 2)(1)
+
+        jit(lambda x: x + 2)(1)
+        self.assertGreater(
+            durations["/jax/compilation_cache/cache_retrieval_time_sec"], 0)
+        if use_original:
+          self.assertGreater(
+              durations[
+                  "/jax/compilation_cache/original_compile_time_saved_sec"
+              ], 0)
+        else:
+          if xla_bridge.using_pjrt_c_api():
+            raise SkipTest("PJRT C API not supported yet.")
+          self.assertGreater(
+              durations["/jax/compilation_cache/compile_time_saved_sec"], 0)
+
+  def test_task_using_cache_metric(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      cc.initialize_cache(tmpdir)
+
+      jit(lambda x: x + 1)(1)
+      self.assertEqual(
+          _counts["/jax/compilation_cache/tasks_using_cache"], 1)
+
+      # Verify that the count is incremented only once per task.
+      cc.reset_cache()
+      cc.initialize_cache(tmpdir)
+      jit(lambda x: x + 3)(3)
+      self.assertEqual(
+          _counts["/jax/compilation_cache/tasks_using_cache"], 1)
+
+  def test_compile_requests_use_cache_metric(self):
+    previous_counts = Counter(_counts)
+    with tempfile.TemporaryDirectory() as tmpdir:
+      cc.initialize_cache(tmpdir)
+
+      jit(lambda x: x + 1)(1)
+      jit(lambda x: x + 2)(1)
+      jit(lambda x: x + 1)(1)
+
+    self.assertEqual(
+        _counts["/jax/compilation_cache/compile_requests_use_cache"]
+        - previous_counts["/jax/compilation_cache/compile_requests_use_cache"],
+        3)
+
+  def test_cache_misses_metric(self):
+    previous_counts = Counter(_counts)
+    with (
+      tempfile.TemporaryDirectory() as tmpdir,
+      config.persistent_cache_min_compile_time_secs(2),
+    ):
+      cc.initialize_cache(tmpdir)
+
+      # Mock time to create a long compilation time and make cache misses.
+      with mock.patch("time.monotonic", side_effect=np.arange(0, 100, 10)):
+        jit(lambda x: x + 1)(1)
+        jit(lambda x: x + 2)(1)
+
+    self.assertEqual(
+        _counts["/jax/compilation_cache/cache_misses"]
+        - previous_counts["/jax/compilation_cache/cache_misses"],
+        2)
+
+  # TODO(b/293308239) Remove the parameters after the new compilation cache key
+  # implementation is enabled.
+  @parameterized.parameters(True, False)
+  def test_cache_hits_metric(self, use_original):
+    previous_counts = Counter(_counts)
+    with (
+      tempfile.TemporaryDirectory() as tmpdir,
+      config.persistent_cache_min_compile_time_secs(2),
+      config.use_original_compilation_cache_key_generation(use_original),
+    ):
+      cc.initialize_cache(tmpdir)
+
+      # Mock time to create a long compilation time, cache saved.
+      with mock.patch("time.monotonic", side_effect=np.arange(0, 100, 10)):
+        jit(lambda x: x + 1)(1)
+      jit(lambda x: x + 1)(1)
+
+    if use_original:
+      self.assertEqual(
+          _counts["/jax/compilation_cache/cache_hits_original"]
+          - previous_counts["/jax/compilation_cache/cache_hits_original"],
+          1)
+    else:
+      # TODO(b/293308239) Remove this skipping when pjrt c api is supported.
+      if xla_bridge.using_pjrt_c_api():
+        raise SkipTest("PJRT C API not supported yet.")
+      self.assertEqual(
+          _counts["/jax/compilation_cache/cache_hits"]
+          - previous_counts["/jax/compilation_cache/cache_hits"],
+          1)
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

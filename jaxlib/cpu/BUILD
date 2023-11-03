@@ -57,8 +57,8 @@ pybind_extension(
     module_name = "_lapack",
     deps = [
         ":lapack_kernels",
-        "//jaxlib:kernel_pybind11_helpers",
-        "@pybind11",
+        "//jaxlib:kernel_nanobind_helpers",
+        "@nanobind",
     ],
 )
 
@@ -78,8 +78,8 @@ cc_library(
     deps = [
         ":ducc_fft_flatbuffers_cc",
         "@xla//xla/service:custom_call_status",
-        "@ducc",
-        "@flatbuffers//:runtime_cc",
+        "@com_github_google_flatbuffers//:flatbuffers",
+        "@ducc//:fft",
     ],
 )
 
@@ -95,9 +95,9 @@ pybind_extension(
     deps = [
         ":ducc_fft_flatbuffers_cc",
         ":ducc_fft_kernels",
-        "//jaxlib:kernel_pybind11_helpers",
-        "@flatbuffers//:runtime_cc",
-        "@pybind11",
+        "//jaxlib:kernel_nanobind_helpers",
+        "@com_github_google_flatbuffers//:flatbuffers",
+        "@nanobind",
     ],
 )
 

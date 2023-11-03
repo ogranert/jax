@@ -34,19 +34,21 @@ from jax.test_util import check_grads
 from jax import tree_util
 import jax.util
 
-from jax.interpreters import xla
-from jax._src.interpreters import mlir
 from jax.interpreters import batching
+from jax.interpreters import xla
 from jax._src import array
+from jax._src import config
 from jax._src import dtypes
-from jax._src.interpreters import pxla
-from jax._src import test_util as jtu
 from jax._src import lax_reference
+from jax._src import test_util as jtu
+from jax._src.interpreters import mlir
+from jax._src.interpreters import pxla
+from jax._src.internal_test_util import lax_test_util
 from jax._src.lax import lax as lax_internal
 from jax._src.lib import xla_client as xc
-from jax._src.internal_test_util import lax_test_util
+from jax._src.lib import xla_extension_version
+from jax._src.util import NumpyComplexWarning
 
-from jax import config
 config.parse_flags_with_absl()
 
 
@@ -94,13 +96,23 @@ class LaxTest(jtu.JaxTestCase):
         dtype=rec.dtypes)
       for rec in lax_test_util.lax_ops()))
   def testOpAgainstNumpy(self, op_name, rng_factory, shapes, dtype, tol):
-    if (not config.x64_enabled and op_name == "nextafter"
+    if (not config.enable_x64.value and op_name == "nextafter"
         and dtype == np.float64):
       raise SkipTest("64-bit mode disabled")
     rng = rng_factory(self.rng())
     args_maker = lambda: [rng(shape, dtype) for shape in shapes]
     op = getattr(lax, op_name)
     numpy_op = getattr(lax_reference, op_name)
+    tol = tol or jtu.default_tolerance()
+    if jtu.test_device_matches(["tpu"]):
+      if dtype in (np.float32, np.complex64) and op_name in (
+        "acosh", "asinh", "cos", "cosh", "digamma", "exp", "exp2", "igamma",
+        "igammac", "log", "log1p", "logistic", "pow", "sin", "sinh", "tan"):
+        tol = jtu.join_tolerance(tol, 2e-4)
+      elif op_name == "asinh" and dtype == np.float16:
+        tol = jtu.join_tolerance(tol, 1e-3)
+      elif op_name == "lgamma" and dtype == np.float32:
+        tol = jtu.join_tolerance(tol, 1e-3)
     self._CheckAgainstNumpy(numpy_op, op, args_maker, tol=tol)
 
   # TODO test shift_left, shift_right_arithmetic, shift_right_logical
@@ -279,16 +291,17 @@ class LaxTest(jtu.JaxTestCase):
     [dict(dtype=dtype, preferred_element_type=preferred)
      for dtype, preferred in preferred_type_combinations]
   )
+  @jax.default_matmul_precision("float32")
   def testConvPreferredElement(self, lhs_shape, rhs_shape, dtype, preferred_element_type):
-    if (not config.x64_enabled and
+    if (not config.enable_x64.value and
        (dtype == np.float64 or preferred_element_type == np.float64
         or dtype == np.int64 or preferred_element_type == np.int64
         or dtype == np.complex128 or preferred_element_type == np.complex128)):
       raise SkipTest("64-bit mode disabled")
-    if (jtu.device_under_test() == "tpu" and
+    if (jtu.test_device_matches(["tpu"]) and
        (dtype == np.complex128 or preferred_element_type == np.complex128)):
       raise SkipTest("np.complex128 is not yet supported on TPU")
-    if jtu.device_under_test() == "gpu" and np.issubdtype(dtype, np.integer):
+    if jtu.test_device_matches(["gpu"]) and np.issubdtype(dtype, np.integer):
       # TODO(b/183565702): Support integer convolutions on CPU/GPU.
       raise SkipTest("Integer convolution not yet supported on GPU")
     # x64 implementation is only accurate to ~float32 precision for this case.
@@ -296,6 +309,13 @@ class LaxTest(jtu.JaxTestCase):
       tol = 1e-5
     else:
       tol = {np.float64: 1e-14}
+    if (jtu.test_device_matches(["tpu"]) and dtype == np.float16 and
+        preferred_element_type == np.float32):
+      tol = 2e-3
+    if (jtu.test_device_matches(["tpu"]) and dtype == jnp.bfloat16 and
+        preferred_element_type == np.float32):
+      tol = 1e-5
+
     rng = jtu.rand_default(self.rng())
     x = rng(lhs_shape, dtype)
     y = rng(rhs_shape, dtype)
@@ -393,7 +413,7 @@ class LaxTest(jtu.JaxTestCase):
                                dimension_numbers, perms):
     if np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.bool_):
       # TODO(b/183565702): Support integer convolutions on CPU/GPU.
-      if jtu.device_under_test() == "gpu":
+      if jtu.test_device_matches(["gpu"]):
         raise SkipTest("Integer convolution not yet supported on GPU")
     rng = jtu.rand_small(self.rng())
     lhs_perm, rhs_perm = perms  # permute to compatible shapes
@@ -449,7 +469,7 @@ class LaxTest(jtu.JaxTestCase):
                              dimension_numbers, perms):
     if np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.bool_):
       # TODO(b/183565702): Support integer convolutions on CPU/GPU.
-      if jtu.device_under_test() == "gpu":
+      if jtu.test_device_matches(["gpu"]):
         raise SkipTest("Integer convolution not yet supported on GPU")
     rng = jtu.rand_small(self.rng())
     lhs_perm, rhs_perm = perms  # permute to compatible shapes
@@ -466,6 +486,7 @@ class LaxTest(jtu.JaxTestCase):
 
     self._CompileAndCheck(fun, args_maker)
 
+  @jax.default_matmul_precision("float32")
   def testConvGeneralDilatedPatchesOverlapping1D(self):
     lhs = np.array([[1]], np.float32).reshape((1, 1))
     patches = lax.conv_general_dilated_patches(
@@ -598,7 +619,7 @@ class LaxTest(jtu.JaxTestCase):
                                                   precision):
     if np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.bool_):
       # TODO(b/183565702): Support integer convolutions on CPU/GPU.
-      if jtu.device_under_test() == "gpu":
+      if jtu.test_device_matches(["gpu"]):
         raise SkipTest("Integer convolution not yet supported on GPU")
     rng = jtu.rand_small(self.rng())
     lhs = rng(lhs_shape, dtype)
@@ -661,7 +682,11 @@ class LaxTest(jtu.JaxTestCase):
         patches,
         range(len(filter_shape)),
         [out_spec.index(c) for c in out_spec if c not in ('N', 'C')])
-    self.assertAllClose(out, patches)
+    tol = None
+    if (jtu.test_device_matches(["tpu"]) and
+        precision in (None, lax.Precision.DEFAULT)):
+      tol = 1e-3
+    self.assertAllClose(out, patches, atol=tol, rtol=tol)
 
   @jtu.sample_product(
       [
@@ -1008,14 +1033,14 @@ class LaxTest(jtu.JaxTestCase):
   )
   def testDotPreferredElement(self, lhs_shape, rhs_shape, dtype,
                               preferred_element_type):
-    if (not config.x64_enabled and
+    if (not config.enable_x64.value and
        (dtype == np.float64 or preferred_element_type == np.float64
         or dtype == np.int64 or preferred_element_type == np.int64)):
       raise SkipTest("64-bit mode disabled")
-    if (jtu.device_under_test() == "tpu" and
+    if (jtu.test_device_matches(["tpu"]) and
        (dtype == np.complex128 or preferred_element_type == np.complex128)):
       raise SkipTest("np.complex128 is not yet supported on TPU")
-    if jtu.device_under_test() == "gpu":
+    if jtu.test_device_matches(["gpu"]):
       # TODO(b/189287598)
       raise SkipTest("dot_general with preferred_element_type returns NaN "
                      "non-deterministically on GPU")
@@ -1657,7 +1682,7 @@ class LaxTest(jtu.JaxTestCase):
       ],
   )
   def testReduce(self, op, reference_op, init_val, shape, dtype, dims, primitive):
-    if not config.x64_enabled and dtype in (np.float64, np.int64, np.uint64):
+    if not config.enable_x64.value and dtype in (np.float64, np.int64, np.uint64):
       raise SkipTest("x64 mode is disabled.")
     def reference_fun(operand):
       if hasattr(reference_op, "reduce"):
@@ -1805,7 +1830,7 @@ class LaxTest(jtu.JaxTestCase):
   @jtu.skip_on_devices("gpu")
   def testReduceWindowVariadic(self, dtype, shape, dims, strides, padding,
                                base_dilation, window_dilation):
-    if (jtu.device_under_test() == "tpu" and
+    if (jtu.test_device_matches(["tpu"]) and
         any(d != 1 for d in window_dilation)):
       raise SkipTest("TPU support missing for arbitrary window dilation.")
     rng = jtu.rand_small(self.rng())
@@ -1936,7 +1961,10 @@ class LaxTest(jtu.JaxTestCase):
         return np.logaddexp.accumulate(x, axis=axis, dtype=dtype)
     args_maker = lambda: [rng(shape, dtype)]
     self._CompileAndCheck(fun, args_maker)
-    self._CheckAgainstNumpy(np_fun, fun, args_maker)
+    tol = None
+    if jtu.test_device_matches(["tpu"]) and dtype == np.float32:
+      tol = 1e-4
+    self._CheckAgainstNumpy(np_fun, fun, args_maker, atol=tol, rtol=tol)
 
   @jtu.sample_product(
     shape=[(), (3,), (3, 4)],
@@ -1951,6 +1979,14 @@ class LaxTest(jtu.JaxTestCase):
     np_fun = lambda x: np.asarray(x).astype(out_dtype).astype(dtype)
     self._CheckAgainstNumpy(np_fun, fun, args_maker)
     self._CompileAndCheck(fun, args_maker)
+
+  def testReducePrecisionGrad(self):
+    info = dtypes.finfo(jnp.dtype('bfloat16'))
+    y, f_vjp = jax.vjp(lambda x: lax.reduce_precision(x, info.nexp, info.nmant), jnp.pi)
+    y2 = f_vjp(jnp.pi)
+    y3 = lax.reduce_precision(jnp.pi, info.nexp, info.nmant)
+    self.assertArraysEqual(y, y2)
+    self.assertArraysEqual(y, y3)
 
   @jtu.sample_product(
     [dict(shape=shape, axis=axis)
@@ -2002,7 +2038,7 @@ class LaxTest(jtu.JaxTestCase):
   )
   def testSortKeyVal(self, shape, key_dtype, val_dtype, axis, is_stable):
     if (np.issubdtype(key_dtype, np.complexfloating) and
-        jtu.device_under_test() == "cpu"):
+        jtu.test_device_matches(["cpu"])):
       raise SkipTest("Complex-valued sort not implemented")
     rng = jtu.rand_default(self.rng())
     # This test relies on the property that wherever keys are tied, values are
@@ -2039,7 +2075,7 @@ class LaxTest(jtu.JaxTestCase):
   )
   def testSortKeyValAgainstNumpy(self, shape, key_dtype, val_dtype, axis):
     if (np.issubdtype(key_dtype, np.complexfloating) and
-        jtu.device_under_test() == "cpu"):
+        jtu.test_device_matches(["cpu"])):
       raise SkipTest("Complex-valued sort not implemented")
     rng = jtu.rand_default(self.rng())
     # This test relies on the property that wherever keys are tied, values are
@@ -2303,6 +2339,29 @@ class LaxTest(jtu.JaxTestCase):
     self._CompileAndCheck(fun, args_maker)
 
   @jtu.sample_product(
+    [dict(arg_shape=arg_shape, idxs=idxs, update_shape=update_shape, dnums=dnums)
+      for arg_shape, idxs, update_shape, dnums in [
+          ((5,), np.array([[0], [2]]), (2,), lax.ScatterDimensionNumbers(
+            update_window_dims=(), inserted_window_dims=(0,),
+            scatter_dims_to_operand_dims=(0,))),
+          ((10,), np.array([[0], [0], [0]]), (3, 2), lax.ScatterDimensionNumbers(
+            update_window_dims=(1,), inserted_window_dims=(),
+            scatter_dims_to_operand_dims=(0,))),
+          ((10, 5,), np.array([[0], [2], [1]]), (3, 3), lax.ScatterDimensionNumbers(
+            update_window_dims=(1,), inserted_window_dims=(0,),
+            scatter_dims_to_operand_dims=(0,))),
+    ]],
+    dtype=lax_test_util.float_dtypes,
+  )
+  def testScatterApply(self, arg_shape, dtype, idxs, update_shape, dnums):
+    rng = jtu.rand_default(self.rng())
+    rng_idx = jtu.rand_int(self.rng(), high=max(arg_shape))
+    rand_idxs = lambda: rng_idx(idxs.shape, idxs.dtype)
+    args_maker = lambda: [rng(arg_shape, dtype), rand_idxs()]
+    fun = partial(lax.scatter_apply, func=jnp.sin, update_shape=update_shape, dimension_numbers=dnums)
+    self._CompileAndCheck(fun, args_maker)
+
+  @jtu.sample_product(
     [dict(arg_shape=arg_shape, idxs=idxs, update_shape=update_shape,
           dnums=dnums)
       for arg_shape, idxs, update_shape, dnums in [
@@ -2563,7 +2622,7 @@ class LaxTest(jtu.JaxTestCase):
   def testRngBitGenerator(self):
     # This test covers the original behavior of lax.rng_bit_generator, which
     # required x64=True, and only checks shapes and jit invariance.
-    if not config.x64_enabled:
+    if not config.enable_x64.value:
       raise SkipTest("RngBitGenerator requires 64bit key")
 
     key = np.array((1, 2)).astype(np.uint64)
@@ -2630,16 +2689,30 @@ class LaxTest(jtu.JaxTestCase):
     self.assertArraysEqual(np.full((1, 30), np.float32(42)),
                            f(np.zeros((1, 24), dtype=np.float32)))
 
+  def testDynamicSliceUnsignedNoNormalization(self):
+    # Test that no negative index correction is done for unsigned indices.
+    f = lambda x, i: lax.dynamic_slice(x, [i], [1])
+    x = np.arange(200)
+    i = np.uint32(128)
+    jaxpr = jax.make_jaxpr(f)(x, i)
+    self.assertLen(jaxpr.eqns, 1)
+    self.assertEqual(jaxpr.eqns[0].primitive, lax.dynamic_slice_p)
+
+  @unittest.skipIf(xla_extension_version < 175,
+                   "Test requires jaxlib 0.4.15 or newer")
   def testDynamicSliceU8Index(self):
     # Regression test for u8 index in dynamic-slice (#6122)
-    # TODO(b/183216273): enable this test for CPU & GPU when possible.
-    if jtu.device_under_test() == "cpu":
-      raise unittest.SkipTest("DynamicSliceU8Index test is a known failure on CPU.")
-    if jtu.device_under_test() == "gpu":
-      raise unittest.SkipTest("DynamicSliceU8Index test is a known failure on GPU.")
     x = np.arange(200)
     np.testing.assert_equal(
         np.array(lax.dynamic_slice(x, np.uint8([128]), (1,))), [128])
+
+  def test_dot_general_batching_python_builtin_arg(self):
+    # https://github.com/google/jax/issues/16805
+    @jax.remat
+    def f(x):
+      return jax.lax.dot_general(x, x, (([], []), ([], [])))
+
+    jax.hessian(f)(1.0)  # don't crash
 
 
 class LazyConstantTest(jtu.JaxTestCase):
@@ -2732,7 +2805,7 @@ class LazyConstantTest(jtu.JaxTestCase):
 
   @jtu.sample_product(
       dtype_in=lax_test_util.all_dtypes, dtype_out=lax_test_util.all_dtypes)
-  @jtu.ignore_warning(category=np.ComplexWarning)
+  @jtu.ignore_warning(category=NumpyComplexWarning)
   def testConvertElementTypeAvoidsCopies(self, dtype_in, dtype_out):
     x = jax.device_put(np.zeros(5, dtype_in))
     self.assertEqual(x.dtype, dtype_in)
@@ -2800,7 +2873,7 @@ class LazyConstantTest(jtu.JaxTestCase):
     if op_name == "bitwise_not":
       raise unittest.SkipTest("https://github.com/google/jax/issues/12066")
     # Find a valid dtype for the function.
-    for dtype in [np.float_, np.int_, np.complex_, np.bool_]:
+    for dtype in [float, int, complex, bool]:
       dtype = dtypes.canonicalize_dtype(dtype)
       if dtype in rec_dtypes:
         py_val = dtype.type(1).item()
@@ -2890,7 +2963,8 @@ class FooTyRules:
     return handler
 
 
-class FooTy:
+class FooTy(dtypes.ExtendedDType):
+  type = dtypes.extended
   name = 'foo'
   _rules = FooTyRules
 
@@ -2955,8 +3029,8 @@ def shard_foo_array_handler(x, devices, indices, sharding):
   return pxla.batched_device_put(
       aval, jax.sharding.SingleDeviceSharding(device), [x.data], [device])
 
-def foo_array_constant_handler(x, c):
-  return array._array_mlir_constant_handler(x.data, c)
+def foo_array_constant_handler(x):
+  return array._array_mlir_constant_handler(x.data)
 
 def make_lowering(*, shape):
   return jnp.zeros((*shape, 2), 'uint32')
@@ -2982,7 +3056,6 @@ def bake_vmap(batched_args, batch_dims):
 class CustomElementTypesTest(jtu.JaxTestCase):
 
   def setUp(self):
-    dtypes.opaque_dtypes.add(FooTy)
     core.pytype_aval_mappings[FooArray] = \
         lambda x: core.ShapedArray(x.shape, FooTy())
     xla.canonicalize_dtype_handlers[FooArray] = lambda x: x
@@ -2998,7 +3071,6 @@ class CustomElementTypesTest(jtu.JaxTestCase):
     batching.primitive_batchers[bake_p] = bake_vmap
 
   def tearDown(self):
-    dtypes.opaque_dtypes.remove(FooTy)
     del core.pytype_aval_mappings[FooArray]
     del xla.canonicalize_dtype_handlers[FooArray]
     del xla.pytype_aval_mappings[FooArray]

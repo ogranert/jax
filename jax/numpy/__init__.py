@@ -22,9 +22,6 @@ from jax._src.basearray import Array as ndarray
 
 from jax._src.numpy.lax_numpy import (
     ComplexWarning as ComplexWarning,
-    NINF as NINF,
-    NZERO as NZERO,
-    PZERO as PZERO,
     allclose as allclose,
     angle as angle,
     append as append,
@@ -97,6 +94,7 @@ from jax._src.numpy.lax_numpy import (
     expand_dims as expand_dims,
     extract as extract,
     eye as eye,
+    fill_diagonal as fill_diagonal,
     finfo as finfo,
     fix as fix,
     flatnonzero as flatnonzero,
@@ -109,7 +107,9 @@ from jax._src.numpy.lax_numpy import (
     float64 as float64,
     float8_e4m3b11fnuz as float8_e4m3b11fnuz,
     float8_e4m3fn as float8_e4m3fn,
+    float8_e4m3fnuz as float8_e4m3fnuz,
     float8_e5m2 as float8_e5m2,
+    float8_e5m2fnuz as float8_e5m2fnuz,
     float_ as float_,
     floating as floating,
     fmax as fmax,
@@ -158,7 +158,6 @@ from jax._src.numpy.lax_numpy import (
     isrealobj as isrealobj,
     isscalar as isscalar,
     issubdtype as issubdtype,
-    issubsctype as issubsctype,
     iterable as iterable,
     ix_ as ix_,
     kaiser as kaiser,
@@ -206,7 +205,6 @@ from jax._src.numpy.lax_numpy import (
     rot90 as rot90,
     round as round,
     round_ as round_,
-    row_stack as row_stack,
     save as save,
     savez as savez,
     searchsorted as searchsorted,
@@ -227,7 +225,7 @@ from jax._src.numpy.lax_numpy import (
     tensordot as tensordot,
     tile as tile,
     trace as trace,
-    trapz as trapz,
+    trapz as _deprecated_trapz,
     transpose as transpose,
     tri as tri,
     tril as tril,
@@ -314,7 +312,7 @@ from jax._src.numpy.reductions import (
 )
 
 from jax._src.numpy.setops import (
-    in1d as in1d,
+    in1d as _deprecated_in1d,
     intersect1d as intersect1d,
     isin as isin,
     setdiff1d as setdiff1d,
@@ -335,6 +333,7 @@ from jax._src.numpy.ufuncs import (
     arctan2 as arctan2,
     arctanh as arctanh,
     bitwise_and as bitwise_and,
+    bitwise_count as bitwise_count,
     bitwise_not as bitwise_not,
     bitwise_or as bitwise_or,
     bitwise_xor as bitwise_xor,
@@ -414,6 +413,11 @@ from jax._src.numpy.ufuncs import (
     true_divide as true_divide,
 )
 
+from jax._src.numpy.ufunc_api import (
+    frompyfunc as frompyfunc,
+    ufunc as ufunc,
+)
+
 from jax._src.numpy.vectorize import vectorize as vectorize
 
 # Dynamically register numpy-style methods on JAX arrays.
@@ -421,43 +425,62 @@ from jax._src.numpy.array_methods import register_jax_array_methods
 register_jax_array_methods()
 del register_jax_array_methods
 
+try:
+  from numpy import issubsctype as _deprecated_issubsctype
+except ImportError:
+  _deprecated_issubsctype = None
 
 # Deprecations
 
 _deprecations = {
-    # Added March 14, 2023:
-    "DeviceArray": (
-        "jax.numpy.DeviceArray is deprecated. Use jax.Array.",
-        ndarray,
+    # Added August 10, 2023:
+    "NINF": (
+        "jax.numpy.NINF is deprecated. Use -jax.numpy.inf instead.",
+        -inf,
     ),
-    # Added June 2, 2023:
-    "alltrue": (
-        "jax.numpy.alltrue is deprecated. Use jax.numpy.all",
-        all,
+    "NZERO": (
+        "jax.numpy.NZERO is deprecated. Use -0.0 instead.",
+        -0.0,
     ),
-    "cumproduct": (
-        "jax.numpy.cumproduct is deprecated. Use jax.numpy.cumprod",
-        cumprod,
+    "PZERO": (
+        "jax.numpy.PZERO is deprecated. Use 0.0 instead.",
+        0.0,
     ),
-    "product": (
-        "jax.numpy.product is deprecated. Use jax.numpy.prod",
-        prod,
+    # Added Aug 17, 2023:
+    "issubsctype": (
+        "jax.numpy.issubsctype is deprecated. In most cases, jax.numpy.issubdtype can be used instead.",
+        _deprecated_issubsctype,
     ),
-    "sometrue": (
-        "jax.numpy.sometrue is deprecated. Use jax.numpy.any",
-        any,
+    # Added Aug 22, 2023
+    "row_stack": (
+        "jax.numpy.row_stack is deprecated. Use jax.numpy.vstack instead.",
+        vstack,
+    ),
+    # Added Aug 23, 2023
+    "in1d": (
+        "jax.numpy.in1d is deprecated. Use jax.numpy.isin instead.",
+        _deprecated_in1d,
+    ),
+    # Added Aug 24, 2023
+    "trapz": (
+        "jax.numpy.trapz is deprecated. Use jax.scipy.integrate.trapezoid instead.",
+        _deprecated_trapz,
     ),
 }
 
 import typing
 if typing.TYPE_CHECKING:
-  from jax._src.basearray import Array as DeviceArray
-  alltrue = all
-  cumproduct = cumprod
-  product = prod
-  sometrue = any
+  row_stack = vstack
+  NINF = -inf
+  NZERO = -0.0
+  PZERO = 0.0
+  issubsctype = _deprecated_issubsctype
+  in1d = _deprecated_in1d
+  trapz = _deprecated_trapz
 else:
   from jax._src.deprecations import deprecation_getattr as _deprecation_getattr
   __getattr__ = _deprecation_getattr(__name__, _deprecations)
   del _deprecation_getattr
 del typing
+del _deprecated_in1d
+del _deprecated_trapz

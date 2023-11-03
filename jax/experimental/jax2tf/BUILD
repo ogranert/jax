@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+load("@rules_python//python:defs.bzl", "py_library")
 load(
     "//jaxlib:jax.bzl",
     "jax2tf_deps",
+    "jax_visibility",
     "py_deps",
 )
 
@@ -34,32 +36,20 @@ py_library(
 )
 
 py_library(
-    name = "jax_export",
-    srcs = [
-        "jax_export.py",
-        "shape_poly.py",
-    ],
-    srcs_version = "PY3",
-    # TODO: b/255503696: enable pytype
-    tags = ["pytype_unchecked_annotations"],
-    visibility = ["//third_party/py/jax/experimental/jax2tf:__subpackages__"],
-    deps = [
-        "//jax",
-    ] + py_deps("numpy"),
-)
-
-py_library(
     name = "jax2tf_internal",
     srcs = [
         "call_tf.py",
         "impl_no_xla.py",
         "jax2tf.py",
+        "jax_export.py",  # TODO(necula): remove stub
+        "shape_poly.py",  # TODO(necula): remove stub
     ],
     srcs_version = "PY3",
     # TODO: b/255503696: enable pytype
     tags = ["pytype_unchecked_annotations"],
+    visibility = jax_visibility("jax2tf_internal"),
     deps = [
-        ":jax_export",
         "//jax",
+        "//jax/experimental/export",
     ] + py_deps("numpy") + py_deps("tensorflow_core") + jax2tf_deps,
 )

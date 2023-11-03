@@ -11,12 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from collections.abc import Sequence
 import io
 import re
 import textwrap
+from typing import IO
 import unittest
-
-from typing import IO, Sequence
 
 from absl.testing import absltest
 import jax
@@ -24,7 +25,6 @@ from jax import config
 from jax.experimental import pjit
 from jax._src import debugger
 from jax._src import test_util as jtu
-from jax._src import xla_bridge
 import jax.numpy as jnp
 import numpy as np
 
@@ -55,6 +55,11 @@ def tearDownModule():
 foo = 2
 
 class CliDebuggerTest(jtu.JaxTestCase):
+
+  def setUp(self):
+    super().setUp()
+    if not jtu.test_device_matches(["cpu", "gpu", "tpu"]):
+      self.skipTest(f"Host callback not supported on {jtu.device_under_test()}")
 
   def test_debugger_eof(self):
     stdin, stdout = make_fake_stdin_stdout([])
@@ -97,9 +102,6 @@ class CliDebuggerTest(jtu.JaxTestCase):
     self.assertEqual(stdout.getvalue(), expected)
 
   def test_debugger_can_print_value_in_jit(self):
-    if xla_bridge.get_backend().runtime_type == 'stream_executor':
-      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
-
     stdin, stdout = make_fake_stdin_stdout(["p x", "c"])
 
     @jax.jit
@@ -116,9 +118,6 @@ class CliDebuggerTest(jtu.JaxTestCase):
     self.assertEqual(stdout.getvalue(), expected)
 
   def test_debugger_can_print_multiple_values(self):
-    if xla_bridge.get_backend().runtime_type == 'stream_executor':
-      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
-
     stdin, stdout = make_fake_stdin_stdout(["p x, y", "c"])
 
     @jax.jit
@@ -135,9 +134,6 @@ class CliDebuggerTest(jtu.JaxTestCase):
     self.assertEqual(stdout.getvalue(), expected)
 
   def test_debugger_can_print_context(self):
-    if xla_bridge.get_backend().runtime_type == 'stream_executor':
-      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
-
     stdin, stdout = make_fake_stdin_stdout(["l", "c"])
 
     @jax.jit
@@ -160,9 +156,6 @@ class CliDebuggerTest(jtu.JaxTestCase):
     self.assertRegex(stdout.getvalue(), expected)
 
   def test_debugger_can_print_backtrace(self):
-    if xla_bridge.get_backend().runtime_type == 'stream_executor':
-      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
-
     stdin, stdout = make_fake_stdin_stdout(["bt", "c"])
 
     @jax.jit
@@ -179,9 +172,6 @@ class CliDebuggerTest(jtu.JaxTestCase):
     self.assertRegex(stdout.getvalue(), expected)
 
   def test_debugger_can_work_with_multiple_stack_frames(self):
-    if xla_bridge.get_backend().runtime_type == 'stream_executor':
-      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
-
     stdin, stdout = make_fake_stdin_stdout(["l", "u", "p x", "d", "c"])
 
     def f(x):
@@ -220,9 +210,6 @@ class CliDebuggerTest(jtu.JaxTestCase):
     self.assertRegex(stdout.getvalue(), expected)
 
   def test_can_use_multiple_breakpoints(self):
-    if xla_bridge.get_backend().runtime_type == 'stream_executor':
-      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
-
     stdin, stdout = make_fake_stdin_stdout(["p y", "c", "p y", "c"])
 
     def f(x):
@@ -248,9 +235,6 @@ class CliDebuggerTest(jtu.JaxTestCase):
     self.assertEqual(stdout.getvalue(), expected)
 
   def test_debugger_works_with_vmap(self):
-    if xla_bridge.get_backend().runtime_type == 'stream_executor':
-      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
-
     stdin, stdout = make_fake_stdin_stdout(["p y", "c", "p y", "c"])
 
     # On TPU, the breakpoints can be reordered inside of vmap but can be fixed
@@ -280,9 +264,6 @@ class CliDebuggerTest(jtu.JaxTestCase):
     self.assertEqual(stdout.getvalue(), expected)
 
   def test_debugger_works_with_pmap(self):
-    if xla_bridge.get_backend().runtime_type == 'stream_executor':
-      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
-
     if jax.local_device_count() < 2:
       raise unittest.SkipTest("Test requires >= 2 devices.")
 
@@ -308,9 +289,6 @@ class CliDebuggerTest(jtu.JaxTestCase):
     self.assertRegex(stdout.getvalue(), expected)
 
   def test_debugger_works_with_pjit(self):
-    if xla_bridge.get_backend().runtime_type == 'stream_executor':
-      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
-
     if jax.default_backend() != "tpu":
       raise unittest.SkipTest("`pjit` doesn't work with CustomCall.")
 
@@ -360,9 +338,6 @@ class CliDebuggerTest(jtu.JaxTestCase):
     self.assertRegex(stdout.getvalue(), expected)
 
   def test_debugger_accesses_globals(self):
-    if xla_bridge.get_backend().runtime_type == 'stream_executor':
-      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
-
     stdin, stdout = make_fake_stdin_stdout(["p foo", "c"])
 
     @jax.jit
@@ -378,8 +353,6 @@ class CliDebuggerTest(jtu.JaxTestCase):
     self.assertRegex(stdout.getvalue(), expected)
 
   def test_can_limit_num_frames(self):
-    if xla_bridge.get_backend().runtime_type == 'stream_executor':
-      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
     stdin, stdout = make_fake_stdin_stdout(["u", "p x", "c"])
 
     def g():
@@ -424,9 +397,6 @@ class CliDebuggerTest(jtu.JaxTestCase):
     self.assertRegex(stdout.getvalue(), expected)
 
   def test_can_handle_dictionaries_with_unsortable_keys(self):
-    if xla_bridge.get_backend().runtime_type == 'stream_executor':
-      raise unittest.SkipTest('Host callback not supported for runtime type: stream_executor.')
-
     stdin, stdout = make_fake_stdin_stdout(["p x", "p weird_dict",
                                             "p weirder_dict", "c"])
 

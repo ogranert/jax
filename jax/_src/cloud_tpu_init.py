@@ -58,9 +58,7 @@ def cloud_tpu_init() -> None:
   # if the following hold: a) libtpu is installed b) JAX_FORCE_TPU_INIT is set
   # Exit early if we're not running on Cloud TPU.
   libtpu_module = maybe_import_libtpu()
-  if libtpu_module is not None:
-    libtpu_module.configure_library_path()
-  elif not jax_force_tpu_init():
+  if libtpu_module is None and not jax_force_tpu_init():
     return
 
   running_in_cloud_tpu_vm = True
@@ -69,12 +67,13 @@ def cloud_tpu_init() -> None:
   os.environ.setdefault('JAX_PLATFORMS', 'tpu,cpu')
   os.environ['TPU_ML_PLATFORM'] = 'JAX'
 
-  if 'JAX_USE_PJRT_C_API_ON_TPU' not in os.environ:
-    os.environ['JAX_USE_PJRT_C_API_ON_TPU'] = 'true'
-
-  use_pjrt_c_api = os.environ['JAX_USE_PJRT_C_API_ON_TPU']
-  if use_pjrt_c_api in ("false", "0"):
+  # TODO(skyewm): remove this warning at some point, say around Sept 2023.
+  use_pjrt_c_api = os.environ.get('JAX_USE_PJRT_C_API_ON_TPU', None)
+  if use_pjrt_c_api:
     warnings.warn(
-        f"JAX_USE_PJRT_C_API_ON_TPU={use_pjrt_c_api} will no longer be "
-        "supported in an upcoming future release. Please file an issue at "
-        "https://github.com/google/jax/issues if you need this setting.")
+        "JAX_USE_PJRT_C_API_ON_TPU no longer has an effect (the new TPU "
+        "runtime is always enabled now). Unset the environment variable "
+        "to disable this warning.")
+
+  # Remove when minimum jaxlib version is >= 0.4.15
+  os.environ['JAX_USE_PJRT_C_API_ON_TPU'] = "true"

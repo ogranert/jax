@@ -65,14 +65,15 @@ from __future__ import annotations
 
 from functools import partial
 import operator
-from typing import Any, Callable, Optional, NamedTuple
+from typing import Any, Callable, NamedTuple
 import weakref
 
-from jax._src.tree_util import tree_map
-from jax._src.config import config
+from jax._src import config
 from jax._src import core
 from jax._src import traceback_util
+from jax._src.tree_util import tree_map
 from jax._src.util import curry
+
 
 traceback_util.register_exclusion(__file__)
 
@@ -130,6 +131,8 @@ class EqualStore:
         if not okay:
           raise StoreException("Store occupied with not-equal value") from None
 
+  def reset(self):
+    self._store.reset()
 
 
 class WrappedFun:
@@ -233,6 +236,7 @@ class WrappedFun:
 @curry
 def transformation(gen, fun: WrappedFun, *gen_static_args) -> WrappedFun:
   """Adds one more transformation to a WrappedFun.
+
   Args:
     gen: the transformation generator function
     fun: a WrappedFun on which to apply the transformation
@@ -260,7 +264,7 @@ def wrap_init(f, params=None) -> WrappedFun:
   return WrappedFun(f, (), (), params, None, None)
 
 
-def annotate(f: WrappedFun, in_type: Optional[core.InputType]) -> WrappedFun:
+def annotate(f: WrappedFun, in_type: core.InputType | None) -> WrappedFun:
   assert f.in_type is None
   if in_type is None:
     return f
@@ -304,9 +308,9 @@ class TracingDebugInfo(NamedTuple):
   traced_for: str             # e.g. 'jit', 'scan', etc
   func_src_info: str          # e.g. f'{fun.__name__} at {filename}:{lineno}'
   arg_names: tuple[str, ...]  # e.g. ('args[0]', ... )
-  result_paths: Optional[Callable[[], tuple[str, ...]]]
+  result_paths: Callable[[], tuple[str, ...]] | None
 
-def add_debug_info(f: WrappedFun, debug_info: Optional[TracingDebugInfo]
+def add_debug_info(f: WrappedFun, debug_info: TracingDebugInfo | None
                    ) -> WrappedFun:
   """Produce a new WrappedFun with debug_info attached."""
   assert f.debug_info is None
@@ -330,13 +334,13 @@ def cache(call: Callable):
 
   def memoized_fun(fun: WrappedFun, *args):
     cache = fun_caches.setdefault(fun.f, {})
-    if config.jax_check_tracer_leaks:
+    if config.check_tracer_leaks.value:
       key = (_copy_main_traces(fun.transforms), fun.params, fun.in_type, args,
-             config.x64_enabled, config.jax_default_device,
-             config._trace_context())
+             config.enable_x64.value, config.default_device.value,
+             config.config._trace_context())
     else:
-      key = (fun.transforms, fun.params, fun.in_type, args, config.x64_enabled,
-             config.jax_default_device, config._trace_context())
+      key = (fun.transforms, fun.params, fun.in_type, args, config.enable_x64.value,
+             config.default_device.value, config.config._trace_context())
     result = cache.get(key, None)
     if result is not None:
       ans, stores = result

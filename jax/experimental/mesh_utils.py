@@ -15,12 +15,13 @@
 """Utils for building a device mesh."""
 
 import collections
+from collections.abc import Sequence
 import itertools
 import logging
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional
 
-import jax
 import numpy as np
+from jax._src import xla_bridge as xb
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,46 @@ _TRANSPOSE_TRICKS: dict[tuple[int, ...],
 
 # Physical ordering of core IDs in a tray that creates a ring
 _TRAY_RING_ORDER = (0, 1, 2, 3, 6, 7, 4, 5)
+
+
+def _tpu_v2_v3_create_device_mesh(
+    mesh_shape: Sequence[int],
+    devices: Sequence[Any],
+    **unused_kwargs,
+) -> np.ndarray:
+  if len(devices) == 8:
+    logger.info(
+        'Reordering mesh to physical ring order on single-tray TPU v2/v3.'
+    )
+    device_mesh = np.asarray(devices)
+    device_mesh = device_mesh[np.array(_TRAY_RING_ORDER)]
+    device_mesh = device_mesh.reshape(mesh_shape)
+    return device_mesh
+  elif mesh_shape[-1] == 8:
+    device_mesh = np.asarray(devices).reshape(mesh_shape)
+    logger.info(
+        'Reordering mesh to physical ring order on each TPU v2/v3 tray.'
+    )
+    perm = np.array(_TRAY_RING_ORDER)
+    device_mesh = device_mesh[..., perm]
+    return device_mesh
+  else:
+    # TODO(skye): implement 2D mesh_shape logic here:
+    # https://github.com/tensorflow/lingvo/blob/0df40cf604dfcd14e28f7087d73687a0bd2fe5c6/lingvo/core/gshard_utils.py#L187
+    # (possibly replaces above mesh_shape[-1] == 8 case)
+    return np.asarray(devices).reshape(mesh_shape)
+
+
+# Registers functions to create device mesh for specific device kinds. Takes
+# precedence over the more general logic in create_device_mesh(). Handler may
+# return None; in that case, it will fall back to using the default logic.
+device_kind_handler_dict: dict[
+    str,
+    Callable[..., Optional[np.ndarray]],
+] = {
+    _TPU_V2: _tpu_v2_v3_create_device_mesh,
+    _TPU_V3: _tpu_v2_v3_create_device_mesh,
+}
 
 
 def _create_device_mesh_for_nd_torus(
@@ -195,9 +236,9 @@ def _get_physical_tpu_mesh(jax_devices: Sequence[Any]) -> np.ndarray:
     for coords, d in zip(device_coords, jax_devices):
       if d.core_on_chip != 0:
         raise AssertionError(
-            'Creating meshes for TPU >v3 requires one device per chip.'
-            f'Got device id {d.core_on_chip} for a device of kind {device_kind}'
-            f': {d}'
+            'Creating meshes for TPU >v3 requires one device per chip'
+            f' ("megacore" mode). Got device id {d.core_on_chip} for a device'
+            f' of kind {device_kind}: {d}.'
         )
       out[coords[0], coords[1], coords[2]] = d
   return out
@@ -241,39 +282,36 @@ def create_device_mesh(
     devices: optionally, the devices to construct a mesh for. Defaults to
       jax.devices().
     contiguous_submeshes: if True, this function will attempt to create a mesh
-      where each process's local devices form a contiguous submesh. This is
-      required when passing host local inputs to `pjit`. A ValueError will be
-      raised if this function can't produce a suitable mesh.
+      where each process's local devices form a contiguous submesh. A ValueError
+      will be raised if this function can't produce a suitable mesh. This
+      setting was sometimes necessary before the introduction of jax.Array to
+      ensure non-ragged local arrays; if using jax.Arrays, it's better to keep
+      this set to False.
+
+  Raises:
+    ValueError: if the number of devices doesn't equal the product of
+      `mesh_shape`.
 
   Returns:
     A np.ndarray of JAX devices with mesh_shape as its shape that can be fed
     into jax.sharding.Mesh with good collective performance.
   """
   if devices is None:
-    devices = jax.devices()
+    devices = xb.devices()
   if np.prod(mesh_shape) != len(devices):
     raise ValueError(f'Number of devices {len(devices)} must equal the product '
                      f'of mesh_shape {mesh_shape}')
   last_device = devices[-1]
-  if last_device.device_kind in (_TPU_V2, _TPU_V3):
-    if len(devices) == 8:
-      logger.info('Reordering mesh to physical ring order on single-tray TPU v2/v3.')
-      device_mesh = np.asarray(devices)
-      device_mesh = device_mesh[np.array(_TRAY_RING_ORDER)]
-      device_mesh = device_mesh.reshape(mesh_shape)
-      return device_mesh
-    elif mesh_shape[-1] == 8:
-      device_mesh = np.asarray(devices).reshape(mesh_shape)
-      logger.info('Reordering mesh to physical ring order on each TPU v2/v3 tray.')
-      perm = np.array(_TRAY_RING_ORDER)
-      device_mesh = device_mesh[..., perm]
-      return device_mesh
-    else:
-      # TODO(skye): implement 2D mesh_shape logic here:
-      # https://github.com/tensorflow/lingvo/blob/0df40cf604dfcd14e28f7087d73687a0bd2fe5c6/lingvo/core/gshard_utils.py#L187
-      # (possibly replaces above mesh_shape[-1] == 8 case)
-      return np.asarray(devices).reshape(mesh_shape)
-  elif last_device.platform == 'tpu':
+
+  handler = device_kind_handler_dict.get(last_device.device_kind, None)
+  if handler is not None:
+    result = handler(
+        mesh_shape, devices, contiguous_submeshes=contiguous_submeshes
+    )
+    if result is not None:
+      return result
+
+  if last_device.platform == 'tpu':
     physical_mesh = _get_physical_tpu_mesh(devices)
     if contiguous_submeshes:
       physical_mesh = _transpose_trick(physical_mesh, mesh_shape)
@@ -295,8 +333,8 @@ def create_hybrid_device_mesh(mesh_shape: Sequence[int],
     mesh_shape: shape of the logical mesh for the faster/inner network, ordered
       by increasing network intensity, e.g. [replica, data, mdl] where mdl has
       the most network communication requirements.
-    dcn_mesh_shape: shape of the logical mesh for the slower/outer network,
-      in the same order as mesh_shape.
+    dcn_mesh_shape: shape of the logical mesh for the slower/outer network, in
+      the same order as mesh_shape.
     devices: optionally, the devices to construct a mesh for. Defaults to
       jax.devices().
     process_is_granule: if True, this function will treat processes as the units
@@ -304,12 +342,17 @@ def create_hybrid_device_mesh(mesh_shape: Sequence[int],
       attributes on devices and use slices as the units. Enabling this is meant
       as a fallback for platforms (e.g., GPU) that don't set slice_index.
 
+  Raises:
+    ValueError: if the number of slices to which the `devices` belong doesn't
+      equal the product of `dcn_mesh_shape`, or if the number of devices
+      belonging to any single slice does not equal the product of `mesh_shape`.
+
   Returns:
     A np.ndarray of JAX devices with mesh_shape * dcn_mesh_shape as its shape
     that can be fed into jax.sharding.Mesh for hybrid parallelism.
   """
   if devices is None:
-    devices = jax.devices()
+    devices = xb.devices()
   attr = 'process_index' if process_is_granule else 'slice_index'
   assert hasattr(devices[0], attr)
   granule_dict = collections.defaultdict(list)

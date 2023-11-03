@@ -49,6 +49,10 @@ def digamma(x: ArrayLike) -> Array:
   r"""Elementwise digamma: :math:`\psi(x)`."""
   return digamma_p.bind(x)
 
+def polygamma(m: ArrayLike, x: ArrayLike) -> Array:
+  r"""Elementwise polygamma: :math:`\psi^{(m)}(x)`."""
+  return polygamma_p.bind(m, x)
+
 def igamma(a: ArrayLike, x: ArrayLike) -> Array:
   r"""Elementwise regularized incomplete gamma function."""
   return igamma_p.bind(a, x)
@@ -64,6 +68,10 @@ def igamma_grad_a(a: ArrayLike, x: ArrayLike) -> Array:
 def random_gamma_grad(a: ArrayLike, x: ArrayLike) -> Array:
   r"""Elementwise derivative of samples from `Gamma(a, 1)`."""
   return random_gamma_grad_p.bind(a, x)
+
+def zeta(x: ArrayLike, q: ArrayLike) -> Array:
+  r"""Elementwise Hurwitz zeta function: :math:`\zeta(x, q)`"""
+  return zeta_p.bind(x, q)
 
 def bessel_i0e(x: ArrayLike) -> Array:
   r"""Exponentially scaled modified Bessel function of order 0:
@@ -110,6 +118,12 @@ def igammac_gradx(g, a, x):
 
 def igammac_grada(g, a, x):
   return -igamma_grada(g, a, x)
+
+def polygamma_gradm(g, m, x):
+  raise ValueError("polygamma gradient with respect to m is not supported")
+
+def polygamma_gradx(g, m, x):
+  return g * polygamma(add(m, _const(m, 1)), x)
 
 # The below is directly ported from tensorflow/compiler/xla/client/lib/math.cc
 # We try to follow the corresponding functions as closely as possible, so that
@@ -591,7 +605,7 @@ def bessel_i0e_impl(x):
   elif x.dtype == np.float32:
     return _i0e_impl32(x)
   else:
-    # Have to upcast f16 because the magic Cephes coefficents don't have enough
+    # Have to upcast f16 because the magic Cephes coefficients don't have enough
     # precision for it.
     x_dtype = x.dtype
     x = x.astype(np.float32)
@@ -615,6 +629,11 @@ mlir.register_lowering(lgamma_p, partial(_nary_lower_hlo, chlo.LgammaOp))
 
 digamma_p = standard_unop(_float, 'digamma')
 mlir.register_lowering(digamma_p, partial(_nary_lower_hlo, chlo.DigammaOp))
+ad.defjvp(digamma_p, lambda g, x: mul(g, polygamma(_const(x, 1), x)))
+
+polygamma_p = standard_naryop([_float, _float], 'polygamma')
+mlir.register_lowering(polygamma_p, partial(_nary_lower_hlo, chlo.PolygammaOp))
+ad.defjvp(polygamma_p, polygamma_gradm, polygamma_gradx)
 
 igamma_p = standard_naryop([_float, _float], 'igamma')
 mlir.register_lowering(igamma_p, mlir.lower_fun(_up_and_broadcast(igamma_impl),
@@ -638,6 +657,9 @@ random_gamma_grad_p = standard_naryop([_float, _float], 'random_gamma_grad')
 mlir.register_lowering(random_gamma_grad_p,
                        mlir.lower_fun(_up_and_broadcast(random_gamma_grad_impl),
                                       multiple_results=False))
+
+zeta_p = standard_naryop([_float, _float], 'zeta')
+mlir.register_lowering(zeta_p, partial(_nary_lower_hlo, chlo.ZetaOp))
 
 bessel_i0e_p = standard_unop(_float, 'bessel_i0e')
 mlir.register_lowering(bessel_i0e_p,

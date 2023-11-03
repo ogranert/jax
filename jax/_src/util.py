@@ -12,20 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Iterable, Iterator, Sequence
 import functools
 from functools import partial
 import itertools as it
 import logging
 import operator
-from typing import (Any, Callable, Generic, Iterable, Iterator, Optional,
-                    Sequence, TypeVar, overload, TYPE_CHECKING, cast)
+from typing import (Any, Callable, Generic, Optional, TypeVar, overload, TYPE_CHECKING, cast)
 import weakref
 
 import numpy as np
 
+from jax._src import config
 from jax._src.lib import xla_client as xc
 from jax._src.lib import utils as jaxlib_utils
-from jax._src.config import config
 
 logger = logging.getLogger(__name__)
 
@@ -58,17 +58,7 @@ if TYPE_CHECKING:
     return list(zip(*args))
 
 else:
-  # TODO(phawkins): remove the hasattr condition after jaxlib 0.4.9 is the
-  # minimum
-  if hasattr(jaxlib_utils, 'safe_zip'):
-    safe_zip = jaxlib_utils.safe_zip
-  else:
-    def safe_zip(*args):
-      args = list(map(list, args))
-      n = len(args[0])
-      for arg in args[1:]:
-        assert len(arg) == n, f'length mismatch: {list(map(len, args))}'
-      return list(zip(*args))
+  safe_zip = jaxlib_utils.safe_zip
 
 
 if TYPE_CHECKING:
@@ -95,17 +85,7 @@ if TYPE_CHECKING:
     return list(map(f, *args))
 
 else:
-  # TODO(phawkins): remove the hasattr condition after jaxlib 0.4.9 is the
-  # minimum
-  if hasattr(jaxlib_utils, 'safe_map'):
-    safe_map = jaxlib_utils.safe_map
-  else:
-    def safe_map(f, *args):
-      args = list(map(list, args))
-      n = len(args[0])
-      for arg in args[1:]:
-        assert len(arg) == n, f'length mismatch: {list(map(len, args))}'
-      return list(map(f, *args))
+  safe_map = jaxlib_utils.safe_map
 
 def unzip2(xys: Iterable[tuple[T1, T2]]
     ) -> tuple[tuple[T1, ...], tuple[T2, ...]]:
@@ -163,6 +143,27 @@ def merge_lists(bs: Sequence[bool], l0: Sequence[T], l1: Sequence[T]) -> list[T]
   assert next(i0, sentinel) is next(i1, sentinel) is sentinel
   return out
 
+def subs_list(
+    subs: Sequence[Optional[int]], src: Sequence[T], base: Sequence[T],
+) -> list[T]:
+  base_ = iter(base)
+  out = [src[i] if i is not None else next(base_) for i in subs]
+  sentinel = object()
+  assert next(base_, sentinel) is sentinel
+  return out
+
+def subs_list2(
+    subs1: Sequence[Optional[int]], subs2: Sequence[Optional[int]],
+    src1: Sequence[T], src2: Sequence[T], base: Sequence[T],
+) -> list[T]:
+  assert len(subs1) == len(subs2)
+  base_ = iter(base)
+  out = [src1[f1] if f1 is not None else src2[f2] if f2 is not None else
+         next(base_) for f1, f2, in zip(subs1, subs2)]
+  sentinel = object()
+  assert next(base_, sentinel) is sentinel
+  return out
+
 def split_dict(dct, names):
   dct = dict(dct)
   lst = [dct.pop(name) for name in names]
@@ -201,7 +202,7 @@ def curry(f):
   >>> curry(f)(2, 3, 4, 5)()
   26
   """
-  return partial(partial, f)
+  return wraps(f)(partial(partial, f))
 
 def toposort(end_nodes):
   if not end_nodes: return []
@@ -277,10 +278,10 @@ def cache(max_size=4096):
 
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
-      if config.jax_check_tracer_leaks:
+      if config.check_tracer_leaks.value:
         return f(*args, **kwargs)
       else:
-        return cached(config._trace_context(), *args, **kwargs)
+        return cached(config.config._trace_context(), *args, **kwargs)
 
     wrapper.cache_clear = cached.cache_clear
     wrapper.cache_info = cached.cache_info
@@ -298,7 +299,7 @@ def weakref_lru_cache(call: Callable, maxsize=2048):
   behave similar to `functools.lru_cache`.
   """
   global _weakref_lru_caches
-  cached_call = xc.weakref_lru_cache(config._trace_context, call, maxsize)
+  cached_call = xc.weakref_lru_cache(config.config._trace_context, call, maxsize)
   _weakref_lru_caches.add(cached_call)
   return cached_call
 
@@ -484,7 +485,7 @@ def distributed_debug_log(*pairs):
     pairs: A sequence of label/value pairs to log. The first pair is treated as
     a heading for subsequent pairs.
   """
-  if config.jax_distributed_debug:
+  if config.distributed_debug.value:
     lines = ["\nDISTRIBUTED_DEBUG_BEGIN"]
     try:
       lines.append(f"{pairs[0][0]}: {pairs[0][1]}")
@@ -547,8 +548,8 @@ def _original_func(f):
   return f
 
 
-def set_module(module):
-  def wrapper(func):
+def set_module(module: str) -> Callable[[T], T]:
+  def wrapper(func: T) -> T:
     if module is not None:
       func.__module__ = module
     return func
@@ -604,3 +605,11 @@ else:
           "Decorator got wrong type: @use_cpp_method(is_enabled: bool=True)"
       )
     return decorator
+
+
+try:
+  # numpy 1.25.0 or newer
+  NumpyComplexWarning: type[Warning] = np.exceptions.ComplexWarning
+except AttributeError:
+  # legacy numpy
+  NumpyComplexWarning = np.ComplexWarning

@@ -12,23 +12,54 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Sparse test utilities."""
-import functools
-from typing import Any, Callable, Sequence, Union
 
-import numpy as np
+from collections.abc import Iterable, Iterator, Sequence
+import functools
+import itertools
+import math
+from typing import Any, Callable, Union
+from typing import NamedTuple
 
 import jax
 from jax import lax
-from jax._src import test_util as jtu
-from jax._src.typing import DTypeLike
 from jax import tree_util
-from jax.util import safe_zip, split_list
+from jax._src import test_util as jtu
+from jax._src.lax.lax import DotDimensionNumbers
+from jax._src.lib import gpu_sparse
+from jax._src.typing import DTypeLike
 from jax.experimental import sparse
 import jax.numpy as jnp
+from jax.util import safe_zip, split_list
+import numpy as np
+
+MATMUL_TOL = {
+    np.float32: 1e-5,
+    np.float64: 1e-10,
+    np.complex64: 1e-5,
+    np.complex128: 1e-10,
+}
+
+GPU_LOWERING_ENABLED = gpu_sparse and (
+    gpu_sparse.cuda_is_supported or gpu_sparse.rocm_is_supported
+)
 
 
 def is_sparse(x):
   return isinstance(x, sparse.JAXSparse)
+
+
+class BatchedDotGeneralProperties(NamedTuple):
+  lhs_shape: tuple[int, ...]
+  rhs_shape: tuple[int, ...]
+  n_batch: int
+  n_dense: int
+  dimension_numbers: DotDimensionNumbers
+
+
+class SparseLayout(NamedTuple):
+  n_batch: int
+  n_dense: int
+  n_sparse: int
 
 
 class SparseTestCase(jtu.JaxTestCase):
@@ -132,22 +163,24 @@ def _rand_sparse(shape: Sequence[int], dtype: DTypeLike, *,
                                                       [n_batch, n_sparse])
   if 0 <= nse < 1:
     nse = int(np.ceil(nse * np.prod(sparse_shape)))
+  nse_int = int(nse)
   data_rng = rand_method(rng)
-  data_shape = (*batch_shape, nse, *dense_shape)
+  data_shape = (*batch_shape, nse_int, *dense_shape)
   data = jnp.array(data_rng(data_shape, dtype))
 
+  int32 = np.dtype('int32')
   if sparse_format == 'bcoo':
-    index_shape = (*batch_shape, nse, n_sparse)
+    index_shape = (*batch_shape, nse_int, n_sparse)
     indices = jnp.array(
-      rng.randint(0, sparse_shape, size=index_shape, dtype=np.int32))  # type: ignore[arg-type]
+      rng.randint(0, sparse_shape, size=index_shape, dtype=int32))
     return sparse.BCOO((data, indices), shape=shape)
   else:
-    index_shape = (*batch_shape, nse)
+    index_shape = (*batch_shape, nse_int)
     indptr_shape = (*batch_shape, sparse_shape[0] + 1)
     indices = jnp.array(
-      rng.randint(0, sparse_shape[1], size=index_shape, dtype=np.int32))  # type: ignore[arg-type]
+      rng.randint(0, sparse_shape[1], size=index_shape, dtype=int32))
     indptr = jnp.sort(
-      rng.randint(0, nse + 1, size=indptr_shape, dtype=np.int32), axis=-1)  # type: ignore[call-overload]
+      rng.randint(0, nse_int + 1, size=indptr_shape, dtype=int32), axis=-1)
     indptr = indptr.at[..., 0].set(0)
     return sparse.BCSR((data, indices, indptr), shape=shape)
 
@@ -166,3 +199,43 @@ def rand_bcsr(rng: np.random.RandomState,
   return functools.partial(_rand_sparse, rng=rng, rand_method=rand_method,
                            nse=nse, n_batch=n_batch, n_dense=n_dense,
                            sparse_format='bcsr')
+
+
+def iter_subsets(s: Sequence) -> Iterable[tuple]:
+  """Return an iterator over all subsets of a sequence s"""
+  return itertools.chain.from_iterable(
+      itertools.combinations(s, n) for n in range(len(s) + 1)
+  )
+
+
+def iter_sparse_layouts(
+    shape: Sequence[int], min_n_batch=0
+) -> Iterator[SparseLayout]:
+  for n_batch in range(min_n_batch, len(shape) + 1):
+    for n_dense in range(len(shape) + 1 - n_batch):
+      n_sparse = len(shape) - n_batch - n_dense
+      yield SparseLayout(n_batch=n_batch, n_sparse=n_sparse, n_dense=n_dense)
+
+
+def iter_bcsr_layouts(
+    shape: Sequence[int], min_n_batch=0
+) -> Iterator[SparseLayout]:
+  n_sparse = 2
+  for n_batch in range(min_n_batch, len(shape) - 1):
+    n_dense = len(shape) - n_sparse - n_batch
+    yield SparseLayout(n_batch=n_batch, n_sparse=n_sparse, n_dense=n_dense)
+
+
+def rand_sparse(rng, nse=0.5, post=lambda x: x, rand_method=jtu.rand_default):
+  def _rand_sparse(shape, dtype, nse=nse):
+    rand = rand_method(rng)
+    size = math.prod(shape)
+    if 0 <= nse < 1:
+      nse = nse * size
+    nse = min(size, int(nse))
+    M = rand(shape, dtype)
+    indices = rng.choice(size, size - nse, replace=False)
+    M.flat[indices] = 0
+    return post(M)
+
+  return _rand_sparse

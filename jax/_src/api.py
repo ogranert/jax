@@ -23,13 +23,13 @@ arrays.
 from __future__ import annotations
 
 import collections
+from collections.abc import Generator, Hashable, Iterable, Sequence
 from functools import partial
 import inspect
 import math
 import typing
-from typing import (Any, Callable, Generator, Hashable, Iterable, Literal,
-                    NamedTuple, Optional, Sequence, TypeVar, Union,
-                    overload, cast)
+from typing import (Any, Callable, Literal, NamedTuple, TypeVar, overload,
+                    cast)
 import weakref
 
 import numpy as np
@@ -41,6 +41,7 @@ from jax._src.tree_util import (
     tree_map, tree_flatten, tree_unflatten, tree_structure, tree_transpose,
     tree_leaves, Partial, PyTreeDef, all_leaves, keystr, broadcast_prefix,
     prefix_errors, generate_key_paths)
+from jax._src import config
 from jax._src import core
 from jax._src import dispatch
 from jax._src import effects
@@ -52,7 +53,7 @@ from jax._src import source_info_util
 from jax._src import traceback_util
 from jax._src import pjit
 from jax._src import xla_bridge as xb
-from jax._src.core import eval_jaxpr
+from jax._src.core import eval_jaxpr, ShapedArray
 from jax._src.api_util import (
     flatten_fun, apply_flat_fun, flatten_fun_nokwargs, flatten_fun_nokwargs2,
     argnums_partial, argnums_partial_except, flatten_axes, donation_vector,
@@ -62,30 +63,22 @@ from jax._src.api_util import (
 from jax._src.lax import lax as lax_internal
 from jax._src.lib import jax_jit
 from jax._src.lib import xla_client as xc
+from jax._src.lib import xla_extension_version
 from jax._src.lib import pmap_lib
 from jax._src.sharding import Sharding
-from jax._src.sharding_impls import PmapSharding
+from jax._src.sharding_impls import (PmapSharding, TransferToMemoryKind,
+                                     XLACompatibleSharding)
 from jax._src.traceback_util import api_boundary
+from jax._src import tree_util
 from jax._src.util import unzip2, safe_map, safe_zip, wrap_name, wraps
 from jax._src import util
 
-
-from jax._src.interpreters import partial_eval as pe
-from jax._src.interpreters import mlir
-from jax._src.interpreters import xla
-
-from jax._src.config import (
-    config,
-    disable_jit as _disable_jit,
-    debug_nans as config_debug_nans,
-    debug_infs as config_debug_infs,
-    _thread_local_state as config_thread_local_state,
-    explicit_device_put_scope as config_explicit_device_put_scope,
-    explicit_device_get_scope as config_explicit_device_get_scope)
-from jax._src.core import ShapedArray
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
+from jax._src.interpreters import mlir
+from jax._src.interpreters import partial_eval as pe
 from jax._src.interpreters import pxla
+from jax._src.interpreters import xla
 
 
 traceback_util.register_exclusion(__file__)
@@ -114,10 +107,10 @@ def _nan_check_posthook(fun, args, kwargs, output):
       buffers.extend(leaf.device_buffers)
 
   try:
-    dispatch.check_special(pjit.pjit_p, buffers)
+    dispatch.check_special(pjit.pjit_p.name, buffers)
   except FloatingPointError:
     # compiled_fun can only raise in this case
-    assert config.jax_debug_nans or config.jax_debug_infs
+    assert config.debug_nans.value or config.debug_infs.value
     print("Invalid nan value encountered in the output of a C++-jit/pmap "
           "function. Calling the de-optimized version.")
     fun._cache_miss(*args, **kwargs)[0]  # probably won't return
@@ -129,15 +122,15 @@ def _update_debug_special_global(_):
     jax_jit.global_state().post_hook = None
 
 def _update_debug_special_thread_local(_):
-  if (getattr(config_thread_local_state, "jax_debug_nans", False) or
-      getattr(config_thread_local_state, "jax_debug_infs", False)):
+  if (getattr(config._thread_local_state, "jax_debug_nans", False) or
+      getattr(config._thread_local_state, "jax_debug_infs", False)):
     jax_jit.thread_local_state().post_hook = _nan_check_posthook
   else:
     jax_jit.thread_local_state().post_hook = None
 
-config_debug_nans._add_hooks(_update_debug_special_global,
+config.debug_nans._add_hooks(_update_debug_special_global,
                              _update_debug_special_thread_local)
-config_debug_infs._add_hooks(_update_debug_special_global,
+config.debug_infs._add_hooks(_update_debug_special_global,
                              _update_debug_special_thread_local)
 
 
@@ -148,14 +141,15 @@ def jit(
   fun: Callable,
   in_shardings=sharding_impls.UNSPECIFIED,
   out_shardings=sharding_impls.UNSPECIFIED,
-  static_argnums: Union[int, Sequence[int], None] = None,
-  static_argnames: Union[str, Iterable[str], None] = None,
-  donate_argnums: Union[int, Sequence[int]] = (),
+  static_argnums: int | Sequence[int] | None = None,
+  static_argnames: str | Iterable[str] | None = None,
+  donate_argnums: int | Sequence[int] | None = None,
+  donate_argnames: str | Iterable[str] | None = None,
   keep_unused: bool = False,
-  device: Optional[xc.Device] = None,
-  backend: Optional[str] = None,
+  device: xc.Device | None = None,
+  backend: str | None = None,
   inline: bool = False,
-  abstracted_axes: Optional[Any] = None,
+  abstracted_axes: Any | None = None,
 ) -> stages.Wrapped:
   """Sets up ``fun`` for just-in-time compilation with XLA.
 
@@ -237,11 +231,24 @@ def jit(
       result. You should not reuse buffers that you donate to a computation, JAX
       will raise an error if you try to. By default, no argument buffers are
       donated.
-      Note that donate_argnums only work for positional arguments, and keyword
-      arguments will not be donated.
+
+      If neither ``donate_argnums`` nor ``donate_argnames`` is provided, no
+      arguments are donated. If ``donate_argnums`` is not provided but
+      ``donate_argnames`` is, or vice versa, JAX uses
+      :code:`inspect.signature(fun)` to find any positional arguments that
+      correspond to ``donate_argnames``
+      (or vice versa). If both ``donate_argnums`` and ``donate_argnames`` are
+      provided, ``inspect.signature`` is not used, and only actual
+      parameters listed in either ``donate_argnums`` or ``donate_argnames`` will
+      be donated.
 
       For more details on buffer donation see the
       `FAQ <https://jax.readthedocs.io/en/latest/faq.html#buffer-donation>`_.
+    donate_argnames: An optional string or collection of strings specifying
+      which named arguments are donated to the computation. See the
+      comment on ``donate_argnums`` for details. If not
+      provided but ``donate_argnums`` is set, the default is based on calling
+      ``inspect.signature(fun)`` to find corresponding named arguments.
     keep_unused: If `False` (the default), arguments that JAX determines to be
       unused by `fun` *may* be dropped from resulting compiled XLA executables.
       Such arguments will not be transferred to the device nor provided to the
@@ -291,9 +298,9 @@ def jit(
     >>> g(jnp.arange(4), 3)
     Array([   0,    1,  256, 6561], dtype=int32)
   """
-  (in_shardings, out_shardings, donate_argnums, static_argnums,
-    static_argnames) = pjit.pre_infer_params(
-        fun, in_shardings, out_shardings, donate_argnums,
+  (in_shardings, out_shardings, donate_argnums, donate_argnames, static_argnums,
+   static_argnames) = pjit.pre_infer_params(
+        fun, in_shardings, out_shardings, donate_argnums, donate_argnames,
         static_argnums, static_argnames, device, backend, abstracted_axes)
 
   def infer_params(*args, **kwargs):
@@ -301,8 +308,9 @@ def jit(
         fun=fun, in_shardings=in_shardings,
         out_shardings=out_shardings, static_argnums=static_argnums,
         static_argnames=static_argnames, donate_argnums=donate_argnums,
-        device=device, backend=backend, keep_unused=keep_unused,
-        inline=inline, resource_env=None, abstracted_axes=abstracted_axes)
+        donate_argnames=donate_argnames, device=device, backend=backend,
+        keep_unused=keep_unused, inline=inline, resource_env=None,
+        abstracted_axes=abstracted_axes)
     return pjit.common_infer_params(pjit_info_args, *args, **kwargs)
 
   has_explicit_sharding = pjit._pjit_explicit_sharding(
@@ -357,19 +365,19 @@ def disable_jit(disable: bool = True):
   Value of y is [2 4 6]
   [5 7 9]
   """
-  with _disable_jit(disable):
+  with config.disable_jit(disable):
     yield
 
 
 def xla_computation(fun: Callable,
-                    static_argnums: Union[int, Iterable[int]] = (),
-                    axis_env: Optional[Sequence[tuple[AxisName, int]]] = None,
+                    static_argnums: int | Iterable[int] = (),
+                    axis_env: Sequence[tuple[AxisName, int]] | None = None,
                     in_parts=None, out_parts=None,
-                    backend: Optional[str] = None,
+                    backend: str | None = None,
                     tuple_args: bool = False,
-                    instantiate_const_outputs: Optional[bool] = None,
+                    instantiate_const_outputs: bool | None = None,
                     return_shape: bool = False,
-                    donate_argnums: Union[int, Iterable[int]] = ()) -> Callable:
+                    donate_argnums: int | Iterable[int] = ()) -> Callable:
   """Creates a function that produces its XLA computation given example args.
 
   Args:
@@ -538,7 +546,7 @@ def xla_computation(fun: Callable,
     f, dyn_args = argnums_partial_except(f, static_argnums, args, allow_invalid=False)
     args_flat, in_tree = tree_flatten((dyn_args, kwargs))
     if donate_argnums:
-      donated_invars = donation_vector(donate_argnums, dyn_args, kwargs)
+      donated_invars = donation_vector(donate_argnums, (), dyn_args, kwargs)
     else:
       donated_invars = (False,) * len(args_flat)
 
@@ -557,13 +565,14 @@ def xla_computation(fun: Callable,
           core.ClosedJaxpr(jaxpr, consts),
           ordered_effects=ordered_effects,
           backend_or_name=backend,
-          platform=platform,
+          platforms=[platform],
           axis_context=sharding_impls.ReplicaAxisContext(axis_env_),
           name_stack=source_info_util.new_name_stack(
               wrap_name(fun_name, "xla_computation")),
           donated_args=donated_invars,
           arg_shardings=None,
-          result_shardings=None)
+          result_shardings=None,
+          lowering_parameters=mlir.LoweringParameters())
       built = xc._xla.mlir.mlir_module_to_xla_computation(
           mlir.module_to_string(lowering_result.module),
           use_tuple_args=tuple_args,
@@ -584,7 +593,7 @@ def xla_computation(fun: Callable,
 
   return computation_maker
 
-def grad(fun: Callable, argnums: Union[int, Sequence[int]] = 0,
+def grad(fun: Callable, argnums: int | Sequence[int] = 0,
          has_aux: bool = False, holomorphic: bool = False,
          allow_int: bool = False,
          reduce_axes: Sequence[AxisName] = ()) -> Callable:
@@ -655,7 +664,7 @@ def grad(fun: Callable, argnums: Union[int, Sequence[int]] = 0,
 
   return grad_f_aux if has_aux else grad_f
 
-def value_and_grad(fun: Callable, argnums: Union[int, Sequence[int]] = 0,
+def value_and_grad(fun: Callable, argnums: int | Sequence[int] = 0,
                    has_aux: bool = False, holomorphic: bool = False,
                    allow_int: bool = False, reduce_axes: Sequence[AxisName] = ()
   ) -> Callable[..., tuple[Any, Any]]:
@@ -755,7 +764,7 @@ def _check_input_dtype_revderiv(name, holomorphic, allow_int, x):
     if not dtypes.issubdtype(aval.dtype, np.complexfloating):
       raise TypeError(f"{name} with holomorphic=True requires inputs with complex dtype, "
                       f"but got {aval.dtype.name}.")
-  if (dtypes.is_opaque_dtype(aval.dtype) or
+  if (dtypes.issubdtype(aval.dtype, dtypes.extended) or
       dtypes.issubdtype(aval.dtype, np.integer) or
       dtypes.issubdtype(aval.dtype, np.bool_)):
     if not allow_int:
@@ -770,7 +779,7 @@ _check_input_dtype_grad = partial(_check_input_dtype_revderiv, "grad")
 
 def _check_output_dtype_revderiv(name, holomorphic, x):
   aval = core.get_aval(x)
-  if dtypes.is_opaque_dtype(aval.dtype):
+  if dtypes.issubdtype(aval.dtype, dtypes.extended):
     raise TypeError(
         f"{name} with output element type {aval.dtype.name}")
   if holomorphic:
@@ -791,7 +800,7 @@ def _check_output_dtype_revderiv(name, holomorphic, x):
 _check_output_dtype_grad = partial(_check_output_dtype_revderiv, "grad")
 
 
-def jacfwd(fun: Callable, argnums: Union[int, Sequence[int]] = 0,
+def jacfwd(fun: Callable, argnums: int | Sequence[int] = 0,
            has_aux: bool = False, holomorphic: bool = False) -> Callable:
   """Jacobian of ``fun`` evaluated column-by-column using forward-mode AD.
 
@@ -856,7 +865,7 @@ def jacfwd(fun: Callable, argnums: Union[int, Sequence[int]] = 0,
 def _check_input_dtype_jacfwd(holomorphic: bool, x: Any) -> None:
   dispatch.check_arg(x)
   aval = core.get_aval(x)
-  if dtypes.is_opaque_dtype(aval.dtype):
+  if dtypes.issubdtype(aval.dtype, dtypes.extended):
     raise TypeError(
         f"jacfwd with input element type {aval.dtype.name}")
   if holomorphic:
@@ -877,7 +886,7 @@ def _check_output_dtype_jacfwd(holomorphic, x):
       raise TypeError("jacfwd with holomorphic=True requires outputs with complex dtype, "
                       f"but got {aval.dtype.name}.")
 
-def jacrev(fun: Callable, argnums: Union[int, Sequence[int]] = 0,
+def jacrev(fun: Callable, argnums: int | Sequence[int] = 0,
            has_aux: bool = False, holomorphic: bool = False, allow_int: bool = False) -> Callable:
   """Jacobian of ``fun`` evaluated row-by-row using reverse-mode AD.
 
@@ -947,7 +956,7 @@ _check_input_dtype_jacrev = partial(_check_input_dtype_revderiv, "jacrev")
 _check_output_dtype_jacrev = partial(_check_output_dtype_revderiv, "jacrev")
 
 
-def hessian(fun: Callable, argnums: Union[int, Sequence[int]] = 0,
+def hessian(fun: Callable, argnums: int | Sequence[int] = 0,
             has_aux: bool = False, holomorphic: bool = False) -> Callable:
   """Hessian of ``fun`` as a dense array.
 
@@ -1065,11 +1074,11 @@ def _split(x, indices, axis):
 
 
 def vmap(fun: F,
-         in_axes: Union[int, None, Sequence[Any]] = 0,
+         in_axes: int | None | Sequence[Any] = 0,
          out_axes: Any = 0,
-         axis_name: Optional[AxisName] = None,
-         axis_size: Optional[int] = None,
-         spmd_axis_name: Optional[Union[AxisName, tuple[AxisName, ...]]] = None
+         axis_name: AxisName | None = None,
+         axis_size: int | None = None,
+         spmd_axis_name: AxisName | tuple[AxisName, ...] | None = None
          ) -> F:
   """Vectorizing map. Creates a function which maps ``fun`` over argument axes.
 
@@ -1275,6 +1284,11 @@ def _mapped_axis_size(fn, tree, vals, dims, name):
     msg = f"{name} must have at least one non-None value in in_axes"
     raise ValueError(msg)
 
+  def _get_argument_type(x):
+    try:
+      return shaped_abstractify(x).str_short()
+    except TypeError: #Catch all for user specified objects that can't be interpreted as a data type
+      return "unknown"
   msg = [f"{name} got inconsistent sizes for array axes to be mapped:\n"]
   args, kwargs = tree_unflatten(tree, vals)
   try:
@@ -1283,15 +1297,15 @@ def _mapped_axis_size(fn, tree, vals, dims, name):
     ba = None
   if ba is None:
     args_paths = [f'args{keystr(p)} '
-                  f'of type {shaped_abstractify(x).str_short()}'
+                  f'of type {_get_argument_type(x)}'
                   for p, x in generate_key_paths(args)]
     kwargs_paths = [f'kwargs{keystr(p)} '
-                    f'of type {shaped_abstractify(x).str_short()}'
+                    f'of type {_get_argument_type(x)}'
                     for p, x in generate_key_paths(kwargs)]
     key_paths = [*args_paths, *kwargs_paths]
   else:
     key_paths = [f'argument {name}{keystr(p)} '
-                 f'of type {shaped_abstractify(x).str_short()}'
+                 f'of type {_get_argument_type(x)}'
                  for name, arg in ba.arguments.items()
                  for p, x in generate_key_paths(arg)]
   all_sizes = [_get_axis_size(name, np.shape(x), d) if d is not None else None
@@ -1303,8 +1317,8 @@ def _mapped_axis_size(fn, tree, vals, dims, name):
       if core.definitely_equal(isz, sz): return i
     assert False, (sz, all_sizes)
 
-  ex, *examples = [key_paths[_all_sizes_index(sz)] for sz, _ in counts]
-  ax, *axs = [dims[_all_sizes_index(sz)] for sz, _ in counts]
+  ex, *examples = (key_paths[_all_sizes_index(sz)] for sz, _ in counts)
+  ax, *axs = (dims[_all_sizes_index(sz)] for sz, _ in counts)
   if ct == 1:
     msg.append(f"  * one axis had size {sz}: axis {ax} of {ex};\n")
   else:
@@ -1319,16 +1333,16 @@ def _mapped_axis_size(fn, tree, vals, dims, name):
 
 def pmap(
     fun: Callable,
-    axis_name: Optional[AxisName] = None,
+    axis_name: AxisName | None = None,
     *,
     in_axes=0,
     out_axes=0,
-    static_broadcasted_argnums: Union[int, Iterable[int]] = (),
-    devices: Optional[Sequence[xc.Device]] = None,  # noqa: F811
-    backend: Optional[str] = None,
-    axis_size: Optional[int] = None,
-    donate_argnums: Union[int, Iterable[int]] = (),
-    global_arg_shapes: Optional[tuple[tuple[int, ...], ...]] = None,
+    static_broadcasted_argnums: int | Iterable[int] = (),
+    devices: Sequence[xc.Device] | None = None,  # noqa: F811
+    backend: str | None = None,
+    axis_size: int | None = None,
+    donate_argnums: int | Iterable[int] = (),
+    global_arg_shapes: tuple[tuple[int, ...], ...] | None = None,
   ) -> Any:
   """Parallel map with support for collective operations.
 
@@ -1554,7 +1568,7 @@ def pmap(
 
   # TODO(yashkatariya): Move this out after shard_map is out of experimental and
   # in _src
-  if config.jax_pmap_shmap_merge:
+  if config.pmap_shmap_merge.value:
     from jax.experimental.shard_map import pmap
     return pmap(fun, axis_name, in_axes=in_axes, out_axes=out_axes,
                 static_broadcasted_argnums=static_broadcasted_argnums,
@@ -1580,16 +1594,16 @@ class PmapCallInfo(NamedTuple):
   out_tree: Callable[[], PyTreeDef]
   flat_args: Sequence[Any]
   donated_invars: Sequence[bool]
-  in_axes_flat: Sequence[Optional[int]]
+  in_axes_flat: Sequence[int | None]
   local_axis_size: int
   out_axes_thunk: Callable
-  devices: Optional[Sequence[xc.Device]]
+  devices: Sequence[xc.Device] | None
   global_axis_size: int
   is_explicit_global_axis_size: bool
 
 
 def _get_global_axis_size(local_axis_size: int, in_devices, backend_name: str,
-                          global_axis_size: Optional[int]):
+                          global_axis_size: int | None):
   """Determine global_axis_size for multi-host pmap."""
   # TODO(mattjj,skyewm): revive this check (inner_pmap always False now)
   # if xb.process_count() > 1 and global_axis_size is None and inner_pmap:
@@ -1645,8 +1659,8 @@ def _prepare_pmap(fun, in_axes, out_axes, static_broadcasted_tuple,
     dyn_args, dyn_in_axes = args, in_axes
   args, in_tree = tree_flatten((dyn_args, kwargs))
 
-  if donate_tuple and not config.jax_debug_nans:
-    donated_invars = donation_vector(donate_tuple, dyn_args, kwargs)
+  if donate_tuple and not config.debug_nans.value:
+    donated_invars = donation_vector(donate_tuple, (), dyn_args, kwargs)
   else:
     donated_invars = (False,) * len(args)
   try:
@@ -1721,13 +1735,13 @@ class _PmapFastpathData(NamedTuple):
   out_handler: Any
   out_pytree_def: Any
   # Data needed to handle the inputs.
-  input_sharding_specs: Sequence[sharding_specs.ShardingSpec]
+  input_sharding_specs: Sequence[sharding_specs.ShardingSpec] | None
   input_devices: Sequence[xc.Device]
   input_indices: Sequence[sharding_specs.Index]
   input_array_shardings: Sequence[Any]
   # Data needed to build the Array from C++.
-  out_sharding_specs: Sequence[sharding_specs.ShardingSpec]
-  out_indices: Sequence[sharding_specs.Index]
+  out_sharding_specs: Sequence[sharding_specs.ShardingSpec] | None
+  out_indices: Sequence[sharding_specs.Index] | None
   out_avals: Sequence[Any]
   out_array_shardings: Sequence[Any]
   out_committed: Sequence[Any]
@@ -1735,15 +1749,15 @@ class _PmapFastpathData(NamedTuple):
 
 def _cpp_pmap(
     fun: Callable,
-    axis_name: Optional[AxisName] = None,
+    axis_name: AxisName | None = None,
     *,
     in_axes=0,
     out_axes=0,
-    static_broadcasted_argnums: Union[int, Iterable[int]] = (),
-    devices: Optional[Sequence[xc.Device]] = None,  # noqa: F811
-    backend: Optional[str] = None,
-    axis_size: Optional[int] = None,
-    donate_argnums: Union[int, Iterable[int]] = (),
+    static_broadcasted_argnums: int | Iterable[int] = (),
+    devices: Sequence[xc.Device] | None = None,  # noqa: F811
+    backend: str | None = None,
+    axis_size: int | None = None,
+    donate_argnums: int | Iterable[int] = (),
   ) -> Any:
   axis_name, static_broadcasted_tuple, donate_tuple = _shared_code_pmap(
       fun, axis_name, static_broadcasted_argnums, donate_argnums, in_axes,
@@ -1774,7 +1788,7 @@ def _cpp_pmap(
     map_bind_continuation, top_trace, fun_, tracers, params = (
         core.map_bind_with_continuation(pxla.xla_pmap_p, p.flat_fun,
                                         *p.flat_args, **params))
-    execute: Optional[Callable] = None
+    execute: Callable | None = None
     if isinstance(top_trace, core.EvalTrace):
       execute = pxla.xla_pmap_impl_lazy(fun_, *tracers, **params)
       out = map_bind_continuation(execute(*tracers))
@@ -1802,11 +1816,26 @@ def _cpp_pmap(
       execute_replicated = typing.cast(pxla.ExecuteReplicated, execute)
       out_handler = execute_replicated.out_handler
       in_handler = execute_replicated.in_handler
-      out_indices = [tuple(s.devices_indices_map(a.shape).values())
-                     for s, a in safe_zip(out_handler.out_shardings, out_handler.out_avals)]
 
       out_array_shardings = [out.sharding for out in out_flat]
       out_committed = [out._committed for out in out_flat]
+      input_sharding_specs = None
+      out_sharding_specs = None
+      out_indices = None
+      # TODO(phawkins): remove sharding specs once minimum jaxlib is 0.4.15.
+      if xla_extension_version < 176:
+        input_sharding_specs = [
+            i.sharding_spec for i in in_handler.in_shardings
+        ]
+        out_sharding_specs = [
+            s.sharding_spec for s in out_handler.out_shardings
+        ]
+        out_indices = [
+            tuple(s.devices_indices_map(a.shape).values())
+            for s, a in safe_zip(
+                out_handler.out_shardings, out_handler.out_avals
+            )
+        ]
 
       fastpath_data = _PmapFastpathData(
           version=1,
@@ -1814,11 +1843,11 @@ def _cpp_pmap(
           in_handler=in_handler,
           out_handler=out_handler,
           out_pytree_def=out_pytree_def,
-          input_sharding_specs=[i.sharding_spec for i in in_handler.in_shardings],
+          input_sharding_specs=input_sharding_specs,
           input_devices=in_handler.local_devices,
           input_indices=in_handler.input_indices,
           input_array_shardings=in_handler.in_shardings,
-          out_sharding_specs=[s.sharding_spec for s in out_handler.out_shardings],
+          out_sharding_specs=out_sharding_specs,
           out_indices=out_indices,
           out_avals=out_handler.out_avals,
           out_array_shardings=out_array_shardings,
@@ -1831,7 +1860,8 @@ def _cpp_pmap(
     return out, fastpath_data
 
   cpp_mapped_f = pmap_lib.pmap(
-      fun, cache_miss, static_broadcasted_tuple, pxla.shard_arg)
+      fun, cache_miss, static_broadcasted_tuple, pxla.shard_arg,
+      pytree_registry=tree_util.default_registry)
   _pmap_cache_clears.add(cpp_mapped_f)
 
   pmap_f = wraps(fun)(cpp_mapped_f)
@@ -1864,8 +1894,8 @@ def _pmap_lower(fun, axis_name, in_axes, out_axes, static_broadcasted_tuple,
     Returns:
       A ``Lowered`` instance representing the post-map lowering.
     """
-    _experimental_lowering_platform = kwargs.pop(
-        '_experimental_lowering_platform', None)
+    lowering_parameters = kwargs.pop(
+        '_experimental_lowering_parameters', mlir.LoweringParameters())
     p = _prepare_pmap(
         fun, in_axes, out_axes, static_broadcasted_tuple, donate_tuple,
         devices, backend, axis_size, args, kwargs)
@@ -1880,7 +1910,7 @@ def _pmap_lower(fun, axis_name, in_axes, out_axes, static_broadcasted_tuple,
         donated_invars=p.donated_invars,
         is_explicit_global_axis_size=p.is_explicit_global_axis_size,
         avals=abstract_args,
-        lowering_platform=_experimental_lowering_platform)
+        lowering_parameters=lowering_parameters)
     return stages.Lowered.from_flat_info(
         computation, p.in_tree, abstract_args, donate_tuple, p.out_tree())
 
@@ -1980,7 +2010,7 @@ def linearize(fun: Callable, *primals, has_aux: Literal[True]
   ...
 
 def linearize(fun: Callable, *primals, has_aux: bool = False
-              ) -> Union[tuple[Any, Callable], tuple[Any, Callable, Any]]:
+              ) -> tuple[Any, Callable] | tuple[Any, Callable, Any]:
   """Produces a linear approximation to ``fun`` using :py:func:`jvp` and partial eval.
 
   Args:
@@ -2147,7 +2177,7 @@ def vjp(fun: Callable[..., tuple[T, U]], *primals: Any,
   ...
 def vjp(  # type: ignore
     fun: Callable, *primals, has_aux: bool = False, reduce_axes=()
-  ) -> Union[tuple[Any, Callable], tuple[Any, Callable, Any]]:
+  ) -> tuple[Any, Callable] | tuple[Any, Callable, Any]:
   """Compute a (reverse-mode) vector-Jacobian product of ``fun``.
 
   :py:func:`grad` is implemented as a special case of :py:func:`vjp`.
@@ -2322,29 +2352,29 @@ def _flat_axes_specs(abstracted_axes, *args, **kwargs
 # non-overlapping. Pytype is happy with them.
 @overload
 def make_jaxpr(fun: Callable,  # type: ignore
-               static_argnums: Union[int, Iterable[int]] = (),
-               axis_env: Optional[Sequence[tuple[AxisName, int]]] = None,
+               static_argnums: int | Iterable[int] = (),
+               axis_env: Sequence[tuple[AxisName, int]] | None = None,
                return_shape: Literal[False] = ...,
-               abstracted_axes: Optional[Any] = None,
+               abstracted_axes: Any | None = None,
                ) -> Callable[..., core.ClosedJaxpr]:
   ...
 
 @overload
 def make_jaxpr(fun: Callable,  # type: ignore
-               static_argnums: Union[int, Iterable[int]] = (),
-               axis_env: Optional[Sequence[tuple[AxisName, int]]] = None,
+               static_argnums: int | Iterable[int] = (),
+               axis_env: Sequence[tuple[AxisName, int]] | None = None,
                return_shape: Literal[True] = ...,
-               abstracted_axes: Optional[Any] = None,
+               abstracted_axes: Any | None = None,
                ) -> Callable[..., tuple[core.ClosedJaxpr, Any]]:
   ...
 
 def make_jaxpr(fun: Callable,
-               static_argnums: Union[int, Iterable[int]] = (),
-               axis_env: Optional[Sequence[tuple[AxisName, int]]] = None,
+               static_argnums: int | Iterable[int] = (),
+               axis_env: Sequence[tuple[AxisName, int]] | None = None,
                return_shape: bool = False,
-               abstracted_axes: Optional[Any] = None,
-               ) -> Callable[..., Union[core.ClosedJaxpr,
-                                        tuple[core.ClosedJaxpr, Any]]]:
+               abstracted_axes: Any | None = None,
+               ) -> Callable[..., (core.ClosedJaxpr |
+                                        tuple[core.ClosedJaxpr, Any])]:
   """Creates a function that produces its jaxpr given example args.
 
   Args:
@@ -2439,7 +2469,11 @@ def make_jaxpr(fun: Callable,
       return closed_jaxpr, tree_unflatten(out_tree(), out_shapes_flat)
     return closed_jaxpr
 
-  make_jaxpr_f.__name__ = f"make_jaxpr({make_jaxpr.__name__})"
+  make_jaxpr_f.__module__ = "jax"
+  if hasattr(fun, "__qualname__"):
+    make_jaxpr_f.__qualname__ = f"make_jaxpr({fun.__qualname__})"
+  if hasattr(fun, "__name__"):
+    make_jaxpr_f.__name__ = f"make_jaxpr({fun.__name__})"
   return make_jaxpr_f
 
 def _infer_src_sharding(src, x):
@@ -2448,10 +2482,21 @@ def _infer_src_sharding(src, x):
   return x.sharding if isinstance(x, array.ArrayImpl) else None
 
 
+# TODO(yashkatariya): Generalize is_compatible_aval (maybe renamed) and use that
+# to check if shardings are compatible with the input.
+def _check_sharding(x, s):
+  if isinstance(s, Sharding):
+    aval = shaped_abstractify(x)
+    if isinstance(s, XLACompatibleSharding) and not isinstance(s, PmapSharding):
+      pjit.pjit_check_aval_sharding(
+          (s,), (aval,), None, "device_put args", allow_uneven_sharding=False)
+    s.shard_shape(aval.shape)  # should raise an Error if incompatible
+
+
 def device_put(
     x,
-    device: Union[None, xc.Device, Sharding, Any] = None,
-    *, src: Union[None, xc.Device, Sharding, Any] = None):
+    device: None | xc.Device | Sharding | Any | TransferToMemoryKind = None,
+    *, src: None | xc.Device | Sharding | Any | TransferToMemoryKind = None):
   """Transfers ``x`` to ``device``.
 
   Args:
@@ -2474,9 +2519,13 @@ def device_put(
   This function is always asynchronous, i.e. returns immediately without
   blocking the calling Python thread until any transfers are completed.
   """
-  with config_explicit_device_put_scope():
-    if ((device is None or isinstance(device, (xc.Device, Sharding))) and
-        (src is None or isinstance(src, (xc.Device, Sharding)))):
+  with config.explicit_device_put_scope():
+    if ((device is None or
+         isinstance(device, (xc.Device, Sharding, TransferToMemoryKind))) and
+        (src is None or
+         isinstance(src, (xc.Device, Sharding, TransferToMemoryKind)))):
+      for leaf in tree_leaves(x):
+        _check_sharding(leaf, s=device)
       return tree_map(
           lambda y: dispatch.device_put_p.bind(
               y, device=device, src=_infer_src_sharding(src, y)), x)
@@ -2484,9 +2533,11 @@ def device_put(
     x_flat, treedef = tree_flatten(x)
     device_flat = flatten_axes("device_put device", treedef, device)
     src_flat = flatten_axes("device_put source", treedef, src)
+    for x_leaf, device_leaf in zip(x_flat, device_flat):
+      _check_sharding(x_leaf, device_leaf)
     out_flat = [
-        dispatch.device_put_p.bind(y, device=d, src=_infer_src_sharding(s, y))
-        for y, d, s in zip(x_flat, device_flat, src_flat)
+        dispatch.device_put_p.bind(xf, device=d, src=_infer_src_sharding(s, xf))
+        for xf, d, s in zip(x_flat, device_flat, src_flat)
     ]
     return tree_unflatten(treedef, out_flat)
 
@@ -2557,12 +2608,12 @@ def device_put_sharded(shards: Sequence[Any], devices: Sequence[xc.Device]):  # 
     stacked_aval = avals[0].update(shape=(len(devices),) + avals[0].shape)
     sharding_spec = sharding_specs.create_pmap_sharding_spec(stacked_aval.shape)
     sharding = PmapSharding(np.array(devices), sharding_spec)
-    if dtypes.is_opaque_dtype(stacked_aval.dtype):
+    if dtypes.issubdtype(stacked_aval.dtype, dtypes.extended):
       return stacked_aval.dtype._rules.device_put_sharded(xs, stacked_aval, sharding, devices)
     return pxla.batched_device_put(stacked_aval, sharding, xs, list(devices))
 
 
-  with config_explicit_device_put_scope():
+  with config.explicit_device_put_scope():
     return tree_map(_device_put_sharded, *shards)
 
 
@@ -2607,12 +2658,12 @@ def device_put_replicated(x: Any, devices: Sequence[xc.Device]):  # noqa: F811
     sharding_spec = sharding_specs.create_pmap_sharding_spec(aval.shape)
     buf = device_put(x, devices[0])
     sharding = PmapSharding(np.array(devices), sharding_spec)
-    if dtypes.is_opaque_dtype(aval.dtype):
+    if dtypes.issubdtype(aval.dtype, dtypes.extended):
       return aval.dtype._rules.device_put_replicated(buf, aval, sharding, devices)
     assert len(xla.aval_to_xla_shapes(aval)) == 1
     return pxla.batched_device_put(aval, sharding, [buf] * len(devices), devices)
 
-  with config_explicit_device_put_scope():
+  with config.explicit_device_put_scope():
     return tree_map(_device_put_replicated, x)
 
 
@@ -2658,7 +2709,7 @@ def device_get(x: Any):
     - device_put_sharded
     - device_put_replicated
   """
-  with config_explicit_device_get_scope():
+  with config.explicit_device_get_scope():
     for y in tree_leaves(x):
       try:
         y.copy_to_host_async()
@@ -2683,7 +2734,7 @@ class ShapeDtypeStruct:
     self.shape = tuple(shape)
     if dtype is None:
       raise ValueError("ShapeDtypeStruct: dtype must be specified.")
-    self.dtype = dtype if dtypes.is_opaque_dtype(dtype) else np.dtype(dtype)
+    self.dtype = dtype if dtypes.issubdtype(dtype, dtypes.extended) else np.dtype(dtype)
     if sharding is not None and not isinstance(sharding, Sharding):
       raise ValueError(
           "sharding should be an instance of `jax.sharding.Sharding`. "
@@ -2722,7 +2773,7 @@ class ShapeDtypeStruct:
     return hash((self.shape, self.dtype, named, self.sharding))
 
 core.pytype_aval_mappings[ShapeDtypeStruct] = (
-    lambda x: ShapedArray(x.shape, dtypes.canonicalize_dtype(x.dtype, allow_opaque_dtype=True),
+    lambda x: ShapedArray(x.shape, dtypes.canonicalize_dtype(x.dtype, allow_extended_dtype=True),
                           weak_type=False, named_shape=x.named_shape))
 
 @api_boundary
@@ -2786,7 +2837,7 @@ def eval_shape(fun: Callable, *args, **kwargs):
 def named_call(
     fun: Callable[..., Any],
     *,
-    name: Optional[str] = None,
+    name: str | None = None,
   ) -> Callable[..., Any]:
   """Adds a user specified name to a function when staging out JAX computations.
 

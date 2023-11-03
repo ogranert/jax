@@ -15,11 +15,12 @@
 Parallelization primitives.
 """
 
+from collections.abc import Sequence
 from functools import partial
 import itertools
 import math
 import string
-from typing import Sequence, Union
+from typing import Union
 
 import numpy as np
 
@@ -34,7 +35,6 @@ from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
 from jax._src.interpreters import pxla
-from jax._src.interpreters import xla
 from jax._src.lax import lax
 from jax._src.lax import slicing
 from jax._src.lib.mlir import ir
@@ -689,7 +689,7 @@ def _batched_reduction_collective(
   return vals_out, [batching.not_mapped] * len(vals_out)
 
 def _replica_groups(axis_env, axis_name, axis_index_groups):
-  replica_groups = xla.axis_groups(axis_env, axis_name)
+  replica_groups = pxla.axis_groups(axis_env, axis_name)
   if axis_index_groups is not None:
     replica_groups = [[axis_group[i] for i in axis_index_group]
                       for axis_group in replica_groups
@@ -725,10 +725,10 @@ def _allreduce_abstract_eval(*args, axes, axis_index_groups):
           for arg, named_shape in zip(args, named_shapes)]
 
 def _allreduce_lowering(prim, pos_fn, ctx, *args, axes, axis_index_groups):
-  if axis_index_groups is not None and ctx.module_context.platform == "tpu":
+  if axis_index_groups is not None and ("tpu" in ctx.module_context.platforms):
     len_0 = len(axis_index_groups[0])
     if any(len(g) != len_0 for g in axis_index_groups):
-      raise ValueError("axis_index_groups must all be the same size")
+      raise ValueError("axis_index_groups must all be the same size for TPU lowering")
   named_axes, positional_axes = axes_partition = [], []
   for axis in axes:
     axes_partition[isinstance(axis, int)].append(axis)
@@ -804,15 +804,14 @@ psum_p = core.AxisPrimitive('psum')
 psum_p.multiple_results = True
 psum_p.def_impl(partial(_allreduce_impl, lax._reduce_sum))
 psum_p.def_abstract_eval(_allreduce_abstract_eval)
-xla.register_collective_primitive(psum_p)
 mlir.register_lowering(
     psum_p, partial(_allreduce_lowering, lax.add_p, lax._reduce_sum))
 ad.deflinear2(psum_p, _psum_transpose_rule)
-pxla.multi_host_supported_collectives.add(psum_p)
 batching.primitive_batchers[psum_p] = partial(_reduction_batcher, psum_p)
 batching.axis_primitive_batchers[psum_p] = \
   partial(_batched_reduction_collective, psum_p, lambda v, axis_size: axis_size * v)
 core.axis_substitution_rules[psum_p] = partial(_subst_all_names_in_param, 'axes')
+
 
 # We set a special bind rule for psum so that psum(1, 'i') can be evaluated at
 # tracing time.
@@ -841,10 +840,8 @@ pmax_p = core.AxisPrimitive('pmax')
 pmax_p.multiple_results = True
 pmax_p.def_impl(partial(_allreduce_impl, lax._reduce_max))
 pmax_p.def_abstract_eval(_allreduce_abstract_eval)
-xla.register_collective_primitive(pmax_p)
 mlir.register_lowering(
     pmax_p, partial(_allreduce_lowering, lax.max_p, lax._reduce_max))
-pxla.multi_host_supported_collectives.add(pmax_p)
 batching.primitive_batchers[pmax_p] = partial(_reduction_batcher, pmax_p)
 batching.axis_primitive_batchers[pmax_p] = \
   partial(_batched_reduction_collective, pmax_p, lambda v, axis_size: v)
@@ -855,10 +852,8 @@ pmin_p = core.AxisPrimitive('pmin')
 pmin_p.multiple_results = True
 pmin_p.def_impl(partial(_allreduce_impl, lax._reduce_min))
 pmin_p.def_abstract_eval(_allreduce_abstract_eval)
-xla.register_collective_primitive(pmin_p)
 mlir.register_lowering(
     pmin_p, partial(_allreduce_lowering, lax.min_p, lax._reduce_min))
-pxla.multi_host_supported_collectives.add(pmin_p)
 batching.primitive_batchers[pmin_p] = partial(_reduction_batcher, pmin_p)
 batching.axis_primitive_batchers[pmin_p] = \
   partial(_batched_reduction_collective, pmin_p, lambda v, axis_size: v)
@@ -925,9 +920,7 @@ def _collective_batcher(prim, args, dims, **params):
 ppermute_p = core.AxisPrimitive('ppermute')
 ppermute_p.def_abstract_eval(lambda x, **params: raise_to_shaped(x))
 ad.deflinear2(ppermute_p, _ppermute_transpose_rule)
-xla.register_collective_primitive(ppermute_p)
 mlir.register_lowering(ppermute_p, _ppermute_lowering)
-pxla.multi_host_supported_collectives.add(ppermute_p)
 batching.primitive_batchers[ppermute_p] = partial(_collective_batcher, ppermute_p)
 batching.axis_primitive_batchers[ppermute_p] = _ppermute_batcher
 core.axis_substitution_rules[ppermute_p] = partial(_subst_all_names_in_param, 'axis_name')
@@ -1077,10 +1070,8 @@ def _all_to_all_abstract_eval(x, axis_name, split_axis, concat_axis, axis_index_
 
 all_to_all_p = core.AxisPrimitive('all_to_all')
 all_to_all_p.def_abstract_eval(_all_to_all_abstract_eval)
-xla.register_collective_primitive(all_to_all_p)
 mlir.register_lowering(all_to_all_p, _all_to_all_lowering)
 ad.deflinear2(all_to_all_p, _all_to_all_transpose_rule)
-pxla.multi_host_supported_collectives.add(all_to_all_p)
 batching.primitive_batchers[all_to_all_p] = _all_to_all_batcher
 batching.axis_primitive_batchers[all_to_all_p] = _all_to_all_batched_collective
 core.axis_substitution_rules[all_to_all_p] = partial(_subst_all_names_in_param, 'axis_name')
@@ -1184,7 +1175,8 @@ def _all_gather_impl(x, *, all_gather_dimension, axis_name, axis_index_groups, a
   raise AssertionError("Unexpected call to _all_gather_impl")
 
 def _all_gather_lowering(ctx, x, *, all_gather_dimension, axis_name,
-                         axis_index_groups, axis_size, tiled):
+                         axis_index_groups, axis_size, tiled,
+                         platform=None):
   # TODO(jekbradbury): enable for all_gather_dimension > 0
   x_aval, = ctx.avals_in
   out_aval, = ctx.avals_out
@@ -1193,9 +1185,8 @@ def _all_gather_lowering(ctx, x, *, all_gather_dimension, axis_name,
       axis_context,
       (sharding_impls.SPMDAxisContext, sharding_impls.ShardingContext),
   )
-  if (ctx.module_context.platform == 'tpu' or
-      ctx.module_context.platform in ('cuda', 'rocm')
-      and all_gather_dimension == 0):
+  if (platform == 'tpu' or
+    (platform in ('cuda', 'rocm') and all_gather_dimension == 0)):
     if not tiled:
       new_shape = list(x_aval.shape)
       new_shape.insert(all_gather_dimension, 1)
@@ -1290,10 +1281,12 @@ def _all_gather_batched_collective(frame_size, frame_name, _, vals_in, dims_in,
 all_gather_p = core.AxisPrimitive('all_gather')
 all_gather_p.def_abstract_eval(_all_gather_abstract_eval)
 all_gather_p.def_impl(_all_gather_impl)
-xla.register_collective_primitive(all_gather_p)
 mlir.register_lowering(all_gather_p, _all_gather_lowering)
+for p in ("cuda", "rocm", "tpu"):
+  mlir.register_lowering(all_gather_p,
+                         partial(_all_gather_lowering, platform=p),
+                         platform=p)
 ad.deflinear2(all_gather_p, _all_gather_transpose_rule)
-pxla.multi_host_supported_collectives.add(all_gather_p)
 batching.primitive_batchers[all_gather_p] = _all_gather_batcher
 batching.axis_primitive_batchers[all_gather_p] = _all_gather_batched_collective
 core.axis_substitution_rules[all_gather_p] = partial(_subst_all_names_in_param, 'axis_name')
@@ -1324,63 +1317,68 @@ def _reduce_scatter_via_reducer(x, *, reducer, scatter_dimension, axis_name,
   return outs
 
 
-def _reduce_scatter_lowering(prim, reducer, ctx, x,
-                             *, scatter_dimension, axis_name,
-                             axis_index_groups, axis_size, tiled):
-  if ctx.module_context.platform in ("tpu", "cuda", "rocm"):
-    x_aval, = ctx.avals_in
-    aval_out, = ctx.avals_out
-    scalar_aval = x_aval.update(shape=())
-    replica_groups = _replica_groups(ctx.module_context.axis_env, axis_name,
-                                     axis_index_groups)
-    scatter_out_shape = list(x_aval.shape)
-    scatter_out_shape[scatter_dimension] //= axis_size
-    axis_context = ctx.module_context.axis_context
-    is_spmd = isinstance(
-        axis_context,
-        (sharding_impls.SPMDAxisContext, sharding_impls.ShardingContext),
-    )
-    if is_spmd:
-      # We want to emit the all-gather with global device IDs and a unique
-      # channel ID, as otherwise it interprets the devices as replicas instead
-      # of partitions - and XLA is configured with only a single replica.
-      channel = ctx.module_context.new_channel()
-      other_args = dict(
-          channel_handle=hlo.ChannelHandle.get(
-              channel, mlir.DEVICE_TO_DEVICE_TYPE),
-          use_global_device_ids=ir.BoolAttr.get(True))
-    else:
-      other_args = {}
-    op = hlo.ReduceScatterOp(
-        mlir.aval_to_ir_type(x_aval.update(shape=scatter_out_shape)),
-        x,
-        scatter_dimension=mlir.i64_attr(scatter_dimension),
-        replica_groups=_replica_groups_hlo(replica_groups),
-        **other_args)
-    scalar_type = mlir.aval_to_ir_type(scalar_aval)
-    reducer_block = op.regions[0].blocks.append(scalar_type, scalar_type)
-    with ir.InsertionPoint(reducer_block):
-      lower_reducer = mlir.lower_fun(prim.bind, multiple_results=False)
-      reducer_ctx = ctx.replace(primitive=None,
-                                avals_in=[scalar_aval] * 2,
-                                avals_out=[scalar_aval])
-      out_nodes = lower_reducer(
-          reducer_ctx, *([a] for a in reducer_block.arguments))
-      hlo.ReturnOp(util.flatten(out_nodes))
-
-    if tiled:
-      return op.results
-    else:
-      return hlo.ReshapeOp(mlir.aval_to_ir_type(aval_out), op.result).results
+def _reduce_scatter_lowering(
+    prim, reducer, ctx, x,
+    *, scatter_dimension, axis_name,
+    axis_index_groups, axis_size, tiled):
+  x_aval, = ctx.avals_in
+  aval_out, = ctx.avals_out
+  scalar_aval = x_aval.update(shape=())
+  replica_groups = _replica_groups(ctx.module_context.axis_env, axis_name,
+                                   axis_index_groups)
+  scatter_out_shape = list(x_aval.shape)
+  scatter_out_shape[scatter_dimension] //= axis_size
+  axis_context = ctx.module_context.axis_context
+  is_spmd = isinstance(
+      axis_context,
+      (sharding_impls.SPMDAxisContext, sharding_impls.ShardingContext),
+  )
+  if is_spmd:
+    # We want to emit the all-gather with global device IDs and a unique
+    # channel ID, as otherwise it interprets the devices as replicas instead
+    # of partitions - and XLA is configured with only a single replica.
+    channel = ctx.module_context.new_channel()
+    other_args = dict(
+        channel_handle=hlo.ChannelHandle.get(
+            channel, mlir.DEVICE_TO_DEVICE_TYPE),
+        use_global_device_ids=ir.BoolAttr.get(True))
   else:
-    return mlir.lower_fun(_reduce_scatter_via_reducer, multiple_results=False)(
-        ctx, x,
-        reducer=reducer,
-        scatter_dimension=scatter_dimension,
-        axis_name=axis_name,
-        axis_index_groups=axis_index_groups,
-        axis_size=axis_size,
-        tiled=tiled)
+    other_args = {}
+  op = hlo.ReduceScatterOp(
+      mlir.aval_to_ir_type(x_aval.update(shape=scatter_out_shape)),
+      x,
+      scatter_dimension=mlir.i64_attr(scatter_dimension),
+      replica_groups=_replica_groups_hlo(replica_groups),
+      **other_args)
+  scalar_type = mlir.aval_to_ir_type(scalar_aval)
+  reducer_block = op.regions[0].blocks.append(scalar_type, scalar_type)
+  with ir.InsertionPoint(reducer_block):
+    lower_reducer = mlir.lower_fun(prim.bind, multiple_results=False)
+    reducer_ctx = ctx.replace(primitive=None,
+                              avals_in=[scalar_aval] * 2,
+                              avals_out=[scalar_aval])
+    out_nodes = lower_reducer(
+        reducer_ctx, *([a] for a in reducer_block.arguments))
+    hlo.ReturnOp(util.flatten(out_nodes))
+
+  if tiled:
+    return op.results
+  else:
+    return hlo.ReshapeOp(mlir.aval_to_ir_type(aval_out), op.result).results
+
+def _reduce_scatter_lowering_via_reducer(
+  prim, reducer, ctx, x,
+  *, scatter_dimension, axis_name,
+  axis_index_groups, axis_size, tiled):
+
+  return mlir.lower_fun(_reduce_scatter_via_reducer, multiple_results=False)(
+      ctx, x,
+      reducer=reducer,
+      scatter_dimension=scatter_dimension,
+      axis_name=axis_name,
+      axis_index_groups=axis_index_groups,
+      axis_size=axis_size,
+      tiled=tiled)
 
 
 def _reduce_scatter_abstract_eval(x, *, axis_name, scatter_dimension,
@@ -1460,11 +1458,17 @@ reduce_scatter_p.def_abstract_eval(_reduce_scatter_abstract_eval)
 ad.deflinear2(reduce_scatter_p, _reduce_scatter_transpose_rule)
 batching.primitive_batchers[reduce_scatter_p] = _reduce_scatter_batcher
 batching.axis_primitive_batchers[reduce_scatter_p] = _reduce_scatter_collective
-xla.register_collective_primitive(reduce_scatter_p)
+
 mlir.register_lowering(
     reduce_scatter_p,
-    partial(_reduce_scatter_lowering, lax.add_p, psum))
-pxla.multi_host_supported_collectives.add(reduce_scatter_p)
+    partial(_reduce_scatter_lowering_via_reducer, lax.add_p, psum))
+reduce_scatter_lowering_for_psum = partial(_reduce_scatter_lowering,
+                                           lax.add_p, psum)
+for p in ("tpu", "cuda", "rocm"):
+  mlir.register_lowering(
+      reduce_scatter_p, reduce_scatter_lowering_for_psum,
+      platform=p)
+
 core.axis_substitution_rules[reduce_scatter_p] = \
     partial(_subst_all_names_in_param, 'axis_name')
 
@@ -1581,10 +1585,8 @@ def _axis_index_abstract_eval(*, axis_name):
   return ShapedArray((), np.int32, named_shape={axis_name: frame.size})
 
 axis_index_p = core.Primitive('axis_index')
-xla.register_collective_primitive(axis_index_p)
 mlir.register_lowering(axis_index_p, _axis_index_lowering)
 axis_index_p.def_abstract_eval(_axis_index_abstract_eval)
-pxla.multi_host_supported_collectives.add(axis_index_p)
 core.axis_substitution_rules[axis_index_p] = partial(_subst_all_names_in_param, 'axis_name')
 
 # Axis index doesn't get any arguments, so that the default bind would have no
@@ -1673,7 +1675,6 @@ def _pdot_lowering(x, y, *, axis_name, pos_contract, pos_batch, precision):
                               precision=precision, preferred_element_type=None)
   return psum(local_out, axis_name) if axis_name is not None else local_out
 
-xla.register_collective_primitive(pdot_p)
 mlir.register_lowering(
     pdot_p,
     mlir.lower_fun(_pdot_lowering, multiple_results=False))
@@ -1689,8 +1690,6 @@ def _pdot_transpose_rhs(g, x, y, *, axis_name, pos_contract, pos_batch, precisio
       g, x, y, dimension_numbers=[pos_contract, pos_batch], precision=precision,
       preferred_element_type=None)
 ad.defbilinear(pdot_p, _pdot_transpose_lhs, _pdot_transpose_rhs)
-
-pxla.multi_host_supported_collectives.add(pdot_p)
 
 
 def _pgather_impl(src, idx, *, axes):
@@ -1765,7 +1764,6 @@ def _pgather_collective_batcher(axis_size, frame_name, _, vals_in, dims_in, *, a
 pgather_p = core.AxisPrimitive('pgather')
 pgather_p.def_impl(_pgather_impl)
 pgather_p.def_abstract_eval(_pgather_abstract_eval)
-xla.register_collective_primitive(pgather_p)
 mlir.register_lowering(pgather_p, _pgather_parallel_lowering)
 # TODO: Transpose? That requires adding pscatter...
 batching.primitive_batchers[pgather_p] = _pgather_batcher

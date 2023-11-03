@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Generator, Iterator
 import functools
 import itertools as it
 import math
 import os
 import re
 from itertools import product, permutations
-from typing import Generator, Iterator, Union, Optional
+from typing import Union, Optional
 from unittest import SkipTest
 
 import numpy as np
@@ -32,23 +33,24 @@ import jax.scipy as jscipy
 from jax._src import test_util as jtu
 from jax import vmap
 from jax import lax
-from jax._src import core
-from jax._src.core import NamedShape
-from jax.experimental import maps
-from jax._src import array
-from jax._src.sharding_impls import NamedSharding
-from jax.experimental.pjit import pjit, with_sharding_constraint
-from jax.sharding import PartitionSpec as P
-from jax.experimental.maps import xmap, serial_loop, SerialLoop
+from jax.ad_checkpoint import checkpoint
 from jax.errors import JAXTypeError
-from jax._src.nn import initializers as nn_initializers
+from jax.experimental.maps import xmap, serial_loop, SerialLoop
+from jax.experimental.pjit import pjit
+from jax.interpreters import batching
+from jax.sharding import PartitionSpec as P
+from jax._src import array
+from jax._src import core
+from jax._src import maps
 from jax._src import xla_bridge
-from jax._src.lib import xla_client
-from jax._src.util import unzip2
+from jax._src.core import NamedShape
 from jax._src.lax import parallel as lax_parallel
 from jax._src.lax.parallel import pgather
-from jax.interpreters import batching
-from jax.ad_checkpoint import checkpoint
+from jax._src.lib import xla_client
+from jax._src.lib import xla_extension_version
+from jax._src.nn import initializers as nn_initializers
+from jax._src.sharding_impls import NamedSharding
+from jax._src.util import unzip2
 
 from jax import config
 config.parse_flags_with_absl()
@@ -235,6 +237,7 @@ def schedules(sizes: dict[str, int]
 
 
 @jtu.pytest_mark_if_available('multiaccelerator')
+@jtu.with_config(jax_legacy_prng_key="allow")
 class XMapTestCase(jtu.BufferDonationTestCase):
   pass
 
@@ -243,10 +246,11 @@ class XMapTestCase(jtu.BufferDonationTestCase):
 class SPMDTestMixin:
   def setUp(self):
     super().setUp()
-    jtu.set_spmd_lowering_flag(True)
+    self.spmd_lowering = maps.SPMD_LOWERING.value
+    config.update('experimental_xmap_spmd_lowering', True)
 
   def tearDown(self):
-    jtu.restore_spmd_lowering_flag()
+    config.update('experimental_xmap_spmd_lowering', self.spmd_lowering)
 
 
 class ManualSPMDTestMixin:
@@ -254,12 +258,14 @@ class ManualSPMDTestMixin:
     if not hasattr(xla_client.OpSharding.Type, "MANUAL"):
       raise SkipTest
     super().setUp()
-    jtu.set_spmd_lowering_flag(True)
-    jtu.set_spmd_manual_lowering_flag(True)
+    self.spmd_lowering = maps.SPMD_LOWERING.value
+    self.spmd_manual_lowering = maps.SPMD_LOWERING_MANUAL.value
+    config.update('experimental_xmap_spmd_lowering', True)
+    config.update('experimental_xmap_spmd_lowering_manual', True)
 
   def tearDown(self):
-    jtu.restore_spmd_manual_lowering_flag()
-    jtu.restore_spmd_lowering_flag()
+    config.update('experimental_xmap_spmd_lowering', self.spmd_lowering)
+    config.update('experimental_xmap_spmd_lowering_manual', self.spmd_manual_lowering)
 
 
 @jtu.pytest_mark_if_available('multiaccelerator')
@@ -430,10 +436,15 @@ class XMapTest(XMapTestCase):
     m_size = math.prod([2] + [2] * (len(mesh) - 2))
     self.assertListEqual(y_op_sharding.tile_assignment_dimensions(),
                          [2, 1, 1, m_size])
-    if config.experimental_xmap_spmd_lowering:
+    if maps.SPMD_LOWERING.value:
       hlo = f.lower(x).compiler_ir(dialect="hlo").as_hlo_text()
       # Make sure that there are non-partial sharding specs in the HLO
-      self.assertRegex(hlo, r"sharding={devices=\[[0-9,]+\][0-9,]+}")
+      if xla_extension_version >= 180:
+        self.assertRegex(
+            hlo, r'sharding={devices=\[[0-9,]+\]<=\[[0-9,]+\](T\([0-9,]+\))?}'
+        )
+      else:
+        self.assertRegex(hlo, r'sharding={devices=\[[0-9,]+\][0-9,]+}')
 
   @jtu.with_and_without_mesh
   def testMultipleCalls(self, mesh, axis_resources):
@@ -451,7 +462,7 @@ class XMapTest(XMapTestCase):
       self.assertAllClose(f_mapped(x, x), expected)
 
   @jtu.with_and_without_mesh
-  @jtu.skip_on_devices("cpu")  # In/out aliasing not supported on CPU.
+  @jtu.device_supports_buffer_donation()  # In/out aliasing not supported on CPU
   def testBufferDonation(self, mesh, axis_resources):
     shard = lambda x: x
     if axis_resources:
@@ -468,7 +479,7 @@ class XMapTest(XMapTestCase):
     self.assertNotDeleted(y)
     self.assertDeleted(x)
 
-  @jtu.skip_on_devices("cpu")  # In/out aliasing not supported on CPU.
+  @jtu.device_supports_buffer_donation()  # In/out aliasing not supported on CPU
   @jtu.with_mesh([('x', 2)])
   @jtu.ignore_warning(category=UserWarning,  # SPMD test generates warning.
                       message="Some donated buffers were not usable*")
@@ -545,6 +556,7 @@ class XMapTest(XMapTestCase):
                          "vmap_as_xmap": vmap_as_xmap}
 
   @parameterized.named_parameters(jtu.named_cases_from_sampler(VmapOfXmapCases))
+  @jax.default_matmul_precision("float32")
   def testNestedMap(self,
                     xmap_in_axes, xmap_out_axes,
                     vmap_in_axes, vmap_out_axes, vmap_result_axis,
@@ -708,9 +720,9 @@ class XMapTest(XMapTestCase):
     f_exe = f.lower(x_f32).compile()
     self.assertRaisesRegex(
         TypeError,
-        r"Computation was compiled for different input types and called with "
-        r"different types. Here are the 1 mismatches:\n"
-        r"Compiled with.*float32.*and called with.*int32.*",
+        r"Argument types differ .*"
+        r"The mismatches are:\n"
+        r"Argument 1/1 compiled with.*float32.*and called with.*int32.*",
       lambda: f_exe(x_i32))
 
   def testLowerAsText(self):
@@ -737,20 +749,18 @@ class XMapTest(XMapTestCase):
              axis_resources={'i': 'x'})
     x = jnp.arange(4, dtype=jnp.float32).reshape((2, 2))
     hlo = f.lower(x).as_text(dialect='stablehlo')
-    if config.experimental_xmap_spmd_lowering:
+    if maps.SPMD_LOWERING.value:
       self.assertIn("mhlo.num_partitions = 2", hlo)
       self.assertIn("mhlo.num_replicas = 1", hlo)
     else:
       self.assertIn("mhlo.num_partitions = 1", hlo)
       self.assertIn("mhlo.num_replicas = 2", hlo)
 
-  @jtu.ignore_warning(category=DeprecationWarning)
   def testLowerCompileCompilerIR(self):
-    # TODO(frostig): remove (deprecated)
     f = xmap(lambda x: x + 4, in_axes=['i', ...], out_axes=['i', ...])
     x = jnp.arange(4, dtype=jnp.float32).reshape((2, 2))
     f = f.lower(x).compile()
-    self.assertIsNotNone(f.compiler_ir())
+    self.assertIsNotNone(f.runtime_executable())
 
   def testLowerCompileAsText(self):
     f = xmap(lambda x: x + 4, in_axes=['i', ...], out_axes=['i', ...])
@@ -758,7 +768,6 @@ class XMapTest(XMapTestCase):
     f = f.lower(x).compile()
     self.assertIsInstance(f.as_text(), (str, type(None)))
 
-  @jtu.skip_on_xla_cpu_mlir
   def testLowerCostAnalysis(self):
     # TODO(b/261771737): add support for uncompiled cost analysis in C API.
     if "PJRT C API" in xla_bridge.get_backend().platform_version:
@@ -768,14 +777,12 @@ class XMapTest(XMapTestCase):
     f = f.lower(x)
     f.cost_analysis()  # doesn't raise
 
-  @jtu.skip_on_xla_cpu_mlir
   def testLowerCompileCostAnalysis(self):
     f = xmap(lambda x: x + 4, in_axes=['i', ...], out_axes=['i', ...])
     x = jnp.arange(4, dtype=jnp.float32).reshape((2, 2))
     f = f.lower(x).compile()
     f.cost_analysis()  # doesn't raise
 
-  @jtu.skip_on_xla_cpu_mlir
   def testLowerCompileMemoryAnalysis(self):
     f = xmap(lambda x: x + 4, in_axes=['i', ...], out_axes=['i', ...])
     x = jnp.arange(4, dtype=jnp.float32).reshape((2, 2))
@@ -827,7 +834,12 @@ class XMapTestSPMD(SPMDTestMixin, XMapTest):
     xshape = (8, 2, 4, 5)
     x = jnp.arange(math.prod(xshape), dtype=float).reshape(xshape)
     hlo = f.lower(x).compiler_ir(dialect="hlo").as_hlo_text()
-    match = re.search(r"sharding={devices=\[([0-9,]+)\][0-9,]+}", hlo)
+    if xla_extension_version >= 180:
+      match = re.search(
+          r'sharding={devices=\[([0-9,]+)\]<=\[[0-9,]+\](T\([0-9,]+\))?}', hlo
+      )
+    else:
+      match = re.search(r'sharding={devices=\[([0-9,]+)\][0-9,]+}', hlo)
     self.assertIsNot(match, None)
     tile_factors = [int(s) for s in match.group(1).split(',')]
     self.assertEqual(set(tile_factors), {1, 2})
@@ -890,7 +902,7 @@ class XMapTestManualSPMD(ManualSPMDTestMixin, XMapTestCase):
   @jtu.with_mesh([('x', 2), ('y', 1)])
   def testNestedConstraint(self):
     # TODO(b/219691408): Using P('y') instead of P() causes an XLA crash!
-    fimpl = lambda x: with_sharding_constraint(jnp.sin(x), P()) + x
+    fimpl = lambda x: jax.lax.with_sharding_constraint(jnp.sin(x), P()) + x
     f = xmap(fimpl, in_axes=['i', ...], out_axes=['i', ...], axis_resources={'i': 'x'})
     h = pjit(lambda x: f(x * x) + x, in_shardings=P('y'), out_shardings=None)
     x = jnp.arange(20, dtype=jnp.float32).reshape(4, 5)
@@ -1192,7 +1204,7 @@ class NewPrimitiveTest(XMapTestCase):
 
   @jtu.with_and_without_mesh
   def testGather(self, mesh, axis_resources):
-    if axis_resources and not config.experimental_xmap_spmd_lowering:
+    if axis_resources and not maps.SPMD_LOWERING.value:
       raise SkipTest("pgather over mesh axes without SPMD lowering not implemented")
     x = jnp.arange(12, dtype=np.float32).reshape((4, 3))
     y = jnp.arange(35).reshape((5, 7)) % 3
@@ -1330,6 +1342,7 @@ class PDotTests(XMapTestCase):
     self.assertAllClose(z, jnp.dot(x, y))
 
   @jtu.with_mesh([('r1', 2)])
+  @jax.default_matmul_precision("float32")
   def testPdotBatching(self):
     def f(x, y):
       return lax.pdot(x, y, 'i')
@@ -1612,6 +1625,7 @@ class PDotTests(XMapTestCase):
 
 
 @jtu.pytest_mark_if_available('multiaccelerator')
+@jtu.with_config(jax_legacy_prng_key="allow")
 class XMapErrorTest(jtu.JaxTestCase):
 
   @jtu.with_mesh([('x', 2)])
@@ -1860,6 +1874,7 @@ class XMapErrorTest(jtu.JaxTestCase):
 
 
 @jtu.pytest_mark_if_available('multiaccelerator')
+@jtu.with_config(jax_legacy_prng_key="allow")
 class NamedAutodiffTests(jtu.JaxTestCase):
 
   def testVjpReduceAxes(self):

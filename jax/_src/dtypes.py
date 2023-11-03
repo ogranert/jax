@@ -19,7 +19,9 @@
 # b) the set of supported types (e.g., bfloat16),
 # so we need our own implementation that deviates from NumPy in places.
 
+from __future__ import annotations
 
+import abc
 import builtins
 import functools
 from typing import cast, overload, Any, Literal, Optional, Union
@@ -28,8 +30,9 @@ import warnings
 import ml_dtypes
 import numpy as np
 
-from jax._src.config import flags, config
-from jax._src.typing import DType, DTypeLike, OpaqueDType
+from jax._src import config
+from jax._src.typing import DType, DTypeLike
+from jax._src.util import set_module
 
 from jax._src import traceback_util
 traceback_util.register_exclusion(__file__)
@@ -43,22 +46,59 @@ else:
     raise ValueError("JAX requires ml_dtypes version 0.2.0 or newer; "
                      f"installed version is {ml_dtypes.__version__}.")
 
-FLAGS = flags.FLAGS
+export = set_module('jax.dtypes')
 
-# TODO(frostig,mattjj): achieve this w/ a protocol instead of registry?
-opaque_dtypes: set[OpaqueDType] = set()
+@export
+class extended(np.generic):
+  """Scalar class for extended dtypes.
 
-def is_opaque_dtype(dtype: Any) -> bool:
-  return type(dtype) in opaque_dtypes
+  This is an abstract class that should never be instantiated, but rather
+  exists for the sake of `jnp.issubdtype`.
+
+  Examples:
+    >>> from jax import random
+    >>> from jax import dtypes
+    >>> key = random.key(0)
+    >>> jnp.issubdtype(key.dtype, dtypes.extended)
+    True
+  """
+
+
+@export
+class prng_key(extended):
+  """Scalar class for PRNG Key dtypes.
+
+  This is an abstract class that should never be instantiated, but rather
+  exists for the sake of `jnp.issubdtype`.
+
+  Examples:
+    >>> from jax import random
+    >>> from jax import dtypes
+    >>> key = random.key(0)
+    >>> jnp.issubdtype(key.dtype, dtypes.prng_key)
+    True
+  """
+
+
+class ExtendedDType(metaclass=abc.ABCMeta):
+  """Abstract Base Class for extended dtypes"""
+  @property
+  @abc.abstractmethod
+  def type(self) -> type: ...
+
 
 # fp8 support
 float8_e4m3b11fnuz: type[np.generic] = ml_dtypes.float8_e4m3b11fnuz
 float8_e4m3fn: type[np.generic] = ml_dtypes.float8_e4m3fn
+float8_e4m3fnuz: type[np.generic] = ml_dtypes.float8_e4m3fnuz
 float8_e5m2: type[np.generic] = ml_dtypes.float8_e5m2
+float8_e5m2fnuz: type[np.generic] = ml_dtypes.float8_e5m2fnuz
 
 _float8_e4m3b11fnuz_dtype: np.dtype = np.dtype(float8_e4m3b11fnuz)
 _float8_e4m3fn_dtype: np.dtype = np.dtype(float8_e4m3fn)
+_float8_e4m3fnuz_dtype: np.dtype = np.dtype(float8_e4m3fnuz)
 _float8_e5m2_dtype: np.dtype = np.dtype(float8_e5m2)
+_float8_e5m2fnuz_dtype: np.dtype = np.dtype(float8_e5m2fnuz)
 
 # bfloat16 support
 bfloat16: type[np.generic] = ml_dtypes.bfloat16
@@ -67,14 +107,25 @@ _bfloat16_dtype: np.dtype = np.dtype(bfloat16)
 _custom_float_scalar_types = [
     float8_e4m3b11fnuz,
     float8_e4m3fn,
+    float8_e4m3fnuz,
     float8_e5m2,
+    float8_e5m2fnuz,
     bfloat16,
 ]
 _custom_float_dtypes = [
     _float8_e4m3b11fnuz_dtype,
     _float8_e4m3fn_dtype,
+    _float8_e4m3fnuz_dtype,
     _float8_e5m2_dtype,
+    _float8_e5m2fnuz_dtype,
     _bfloat16_dtype,
+]
+_float8_dtypes = [
+    _float8_e4m3b11fnuz_dtype,
+    _float8_e4m3fn_dtype,
+    _float8_e4m3fnuz_dtype,
+    _float8_e5m2_dtype,
+    _float8_e5m2fnuz_dtype,
 ]
 
 # 4-bit integer support
@@ -84,13 +135,34 @@ uint4: type[np.generic] = ml_dtypes.uint4
 _int4_dtype: np.dtype = np.dtype(int4)
 _uint4_dtype: np.dtype = np.dtype(uint4)
 
+_int4_dtypes = [
+    _int4_dtype,
+    _uint4_dtype,
+]
+
 # Default types.
-bool_: type = np.bool_
-int_: type = np.int32 if config.jax_default_dtype_bits == '32' else np.int64
-uint: type = np.uint32 if config.jax_default_dtype_bits == '32' else np.uint64
-float_: type = np.float32 if config.jax_default_dtype_bits == '32' else np.float64
-complex_: type = np.complex64 if config.jax_default_dtype_bits == '32' else np.complex128
-_default_types: dict[str, type] = {'b': bool_, 'i': int_, 'u': uint, 'f': float_, 'c': complex_}
+bool_ = np.bool_
+int_: type[Any]
+uint: type[Any]
+float_: type[Any]
+complex_: type[Any]
+if config.default_dtype_bits.value == '32':
+  int_ = np.int32
+  uint = np.uint32
+  float_ = np.float32
+  complex_ = np.complex64
+else:
+  int_ = np.int64
+  uint = np.uint64
+  float_ = np.float64
+  complex_ = np.complex128
+_default_types: dict[str, type[Any]] = {
+    'b': bool_,
+    'i': int_,
+    'u': uint,
+    'f': float_,
+    'c': complex_,
+}
 
 # Trivial vectorspace datatype needed for tangent values of int/bool primals
 float0: np.dtype = np.dtype([('float0', np.void, 0)])
@@ -134,12 +206,12 @@ def to_complex_dtype(dtype: DTypeLike) -> DType:
   return np.dtype('complex64')
 
 
-@functools.lru_cache(maxsize=None)
-def _canonicalize_dtype(x64_enabled: bool, allow_opaque_dtype: bool, dtype: Any) -> Union[DType, OpaqueDType]:
-  if is_opaque_dtype(dtype):
-    if not allow_opaque_dtype:
-      raise ValueError(f"Internal: canonicalize_dtype called on opaque dtype {dtype} "
-                       "with allow_opaque_dtype=False")
+@functools.cache
+def _canonicalize_dtype(x64_enabled: bool, allow_extended_dtype: bool, dtype: Any) -> Union[DType, ExtendedDType]:
+  if issubdtype(dtype, extended):
+    if not allow_extended_dtype:
+      raise ValueError(f"Internal: canonicalize_dtype called on extended dtype {dtype} "
+                       "with allow_extended_dtype=False")
     return dtype
   try:
     dtype_ = np.dtype(dtype)
@@ -152,14 +224,15 @@ def _canonicalize_dtype(x64_enabled: bool, allow_opaque_dtype: bool, dtype: Any)
     return _dtype_to_32bit_dtype.get(dtype_, dtype_)
 
 @overload
-def canonicalize_dtype(dtype: Any, allow_opaque_dtype: Literal[False] = False) -> DType: ...
+def canonicalize_dtype(dtype: Any, allow_extended_dtype: Literal[False] = False) -> DType: ...
 
 @overload
-def canonicalize_dtype(dtype: Any, allow_opaque_dtype: bool = False) -> Union[DType, OpaqueDType]: ...
+def canonicalize_dtype(dtype: Any, allow_extended_dtype: bool = False) -> Union[DType, ExtendedDType]: ...
 
-def canonicalize_dtype(dtype: Any, allow_opaque_dtype: bool = False) -> Union[DType, OpaqueDType]:
+@export
+def canonicalize_dtype(dtype: Any, allow_extended_dtype: bool = False) -> Union[DType, ExtendedDType]:
   """Convert from a dtype to a canonical dtype based on config.x64_enabled."""
-  return _canonicalize_dtype(config.x64_enabled, allow_opaque_dtype, dtype)
+  return _canonicalize_dtype(config.enable_x64.value, allow_extended_dtype, dtype)  # pytype: disable=bad-return-type
 
 # Default dtypes corresponding to Python scalars.
 python_scalar_dtypes : dict[type, DType] = {
@@ -169,11 +242,14 @@ python_scalar_dtypes : dict[type, DType] = {
   complex: np.dtype('complex128'),
 }
 
+@export
 def scalar_type_of(x: Any) -> type:
   """Return the scalar type associated with a JAX value."""
   typ = dtype(x)
   if typ in _custom_float_dtypes:
     return float
+  elif typ in _int4_dtypes:
+    return int
   elif np.issubdtype(typ, np.bool_):
     return bool
   elif np.issubdtype(typ, np.integer):
@@ -240,54 +316,53 @@ def _issubclass(a: Any, b: Any) -> bool:
   except TypeError:
     return False
 
-_type_classes = {
-    np.generic,
-    np.number,
-    np.flexible,
-    np.character,
-    np.integer,
-    np.signedinteger,
-    np.unsignedinteger,
-    np.inexact,
-    np.floating,
-    np.complexfloating,
-}
 
-def _is_typeclass(a: Any) -> bool:
-  try:
-    return a in _type_classes
-  except TypeError:
-    return False
-
-def issubdtype(a: DTypeLike, b: DTypeLike) -> bool:
+# TODO(jakevdp): consider whether to disallow None here. We allow it
+# because np.issubdtype allows it (and treats it as equivalent to float64).
+def issubdtype(a: DTypeLike | None, b: DTypeLike | None) -> bool:
   """Returns True if first argument is a typecode lower/equal in type hierarchy.
 
   This is like :func:`numpy.issubdtype`, but can handle dtype extensions such as
-  :obj:`jax.dtypes.bfloat16`.
+  :obj:`jax.dtypes.bfloat16` and `jax.dtypes.prng_key`.
   """
-  if is_opaque_dtype(a):
-    return a == b
-  # Canonicalizes all concrete types to np.dtype instances
-  a = a if _is_typeclass(a) else np.dtype(a)
-  b = b if _is_typeclass(b) else np.dtype(b)
-  if isinstance(a, np.dtype):
-    if a in _custom_float_dtypes:
-      # Avoid implicitly casting list elements below to a dtype.
-      if isinstance(b, np.dtype):
-        return a == b
-      return b in [np.floating, np.inexact, np.number]
-    if a == _int4_dtype:
-      if isinstance(b, np.dtype):
-        return a == b
-      return b in [np.signedinteger, np.integer, np.number]
-    if a == _uint4_dtype:
-      if isinstance(b, np.dtype):
-        return a == b
-      return b in [np.unsignedinteger, np.integer, np.number]
-  return np.issubdtype(a, b)
+  # Main departures from np.issubdtype are:
+  # - "extended" dtypes (like prng key types) are not normal numpy dtypes, so we
+  #   need to handle them specifically. However, their scalar types do conform to
+  #   the numpy scalar type hierarchy.
+  # - custom dtypes (like bfloat16, int4, etc.) are normal numpy dtypes, but they
+  #   don't conform to the standard numpy type hierarchy (e.g. the bfloat16 scalar
+  #   type is not a subclass of np.floating) so we must also handle these specially.
+
+  # First handle extended dtypes. This is important for performance because
+  # isinstance(x, extended) is called frequently within JAX internals.
+  if _issubclass(b, extended):
+    if isinstance(a, ExtendedDType):
+      return _issubclass(a.type, b)
+    if _issubclass(a, np.generic):
+      return _issubclass(a, b)
+    return _issubclass(np.dtype(a).type, b)
+  if isinstance(b, ExtendedDType):
+    return isinstance(a, ExtendedDType) and a == b
+  if isinstance(a, ExtendedDType):
+    a = a.type
+
+  # For all others, normalize inputs to scalar types.
+  a_sctype = a if _issubclass(a, np.generic) else np.dtype(a).type
+  b_sctype = b if _issubclass(b, np.generic) else np.dtype(b).type
+
+  # Now do special handling of custom float and int types, as they don't conform
+  # to the normal scalar type hierarchy.
+  if a_sctype in _custom_float_scalar_types:
+    return b_sctype in {a_sctype, np.floating, np.inexact, np.number, np.generic}
+  if a_sctype == int4:
+    return b_sctype in {a_sctype, np.signedinteger, np.integer, np.number, np.generic}
+  if a_sctype == uint4:
+    return b_sctype in {a_sctype, np.unsignedinteger, np.integer, np.number, np.generic}
+
+  # Otherwise, fall back to numpy.issubdtype
+  return np.issubdtype(a_sctype, b_sctype)
 
 can_cast = np.can_cast
-issubsctype = np.issubsctype
 
 JAXType = Union[type, DType]
 
@@ -448,11 +523,23 @@ def _least_upper_bound(jax_numpy_dtype_promotion: str, *nodes: JAXType) -> JAXTy
   if len(LUB) == 1:
     return LUB.pop()
   elif len(LUB) == 0:
-    if config.jax_numpy_dtype_promotion == 'strict':
+    if config.numpy_dtype_promotion.value == 'strict':
       msg = (
         f"Input dtypes {tuple(str(n) for n in nodes)} have no available implicit dtype "
         "promotion path when jax_numpy_dtype_promotion=strict. Try explicitly casting "
         "inputs to the desired output type, or set jax_numpy_dtype_promotion=standard.")
+    elif any(n in _float8_dtypes for n in nodes):
+      msg = (
+        f"Input dtypes {tuple(str(n) for n in nodes)} have no available implicit dtype "
+        "promotion path. To avoid unintended promotion, 8-bit floats do not support "
+        "implicit promotion. If you'd like your inputs to be promoted to another type, "
+        "you can do so explicitly using e.g. x.astype('float32')")
+    elif any(n in _int4_dtypes for n in nodes):
+      msg = (
+        f"Input dtypes {tuple(str(n) for n in nodes)} have no available implicit dtype "
+        "promotion path. To avoid unintended promotion, 4-bit integers do not support "
+        "implicit promotion. If you'd like your inputs to be promoted to another type, "
+        "you can do so explicitly using e.g. x.astype('int32')")
     else:
       msg = (
         f"Input dtypes {tuple(str(n) for n in nodes)} have no available implicit dtype "
@@ -482,7 +569,7 @@ def promote_types(a: DTypeLike, b: DTypeLike) -> DType:
   # object identity, not object equality, due to the behavior of np.dtype.__eq__
   a_tp = cast(JAXType, a if any(a is t for t in _weak_types) else np.dtype(a))
   b_tp = cast(JAXType, b if any(b is t for t in _weak_types) else np.dtype(b))
-  return np.dtype(_least_upper_bound(config.jax_numpy_dtype_promotion, a_tp, b_tp))
+  return np.dtype(_least_upper_bound(config.numpy_dtype_promotion.value, a_tp, b_tp))
 
 def is_weakly_typed(x: Any) -> bool:
   try:
@@ -509,17 +596,20 @@ def dtype(x: Any, *, canonicalize: bool = False) -> DType:
     dt = python_scalar_dtypes[x]
   elif type(x) in python_scalar_dtypes:
     dt = python_scalar_dtypes[type(x)]
-  elif is_opaque_dtype(getattr(x, 'dtype', None)):
+  elif _issubclass(x, np.generic):
+    return np.dtype(x)
+  elif issubdtype(getattr(x, 'dtype', None), extended):
     dt = x.dtype
   else:
     try:
       dt = np.result_type(x)
     except TypeError as err:
       raise TypeError(f"Cannot determine dtype of {x}") from err
-  if dt not in _jax_dtype_set and not is_opaque_dtype(dt):
+  if dt not in _jax_dtype_set and not issubdtype(dt, extended):
     raise TypeError(f"Value '{x}' with dtype {dt} is not a valid JAX array "
                     "type. Only arrays of numeric types are supported by JAX.")
-  return canonicalize_dtype(dt, allow_opaque_dtype=True) if canonicalize else dt
+  # TODO(jakevdp): fix return type annotation and remove this ignore.
+  return canonicalize_dtype(dt, allow_extended_dtype=True) if canonicalize else dt  # type: ignore[return-value]
 
 def _lattice_result_type(*args: Any) -> tuple[DType, bool]:
   dtypes, weak_types = zip(*(_dtype_and_weaktype(arg) for arg in args))
@@ -527,20 +617,20 @@ def _lattice_result_type(*args: Any) -> tuple[DType, bool]:
     out_dtype = dtypes[0]
     out_weak_type = weak_types[0]
   elif len(set(dtypes)) == 1 and not all(weak_types):
-    # Trivial promotion case. This allows opaque dtypes through.
+    # Trivial promotion case. This allows extended dtypes through.
     out_dtype = dtypes[0]
     out_weak_type = False
-  elif all(weak_types) and config.jax_numpy_dtype_promotion != 'strict':
+  elif all(weak_types) and config.numpy_dtype_promotion.value != 'strict':
     # If all inputs are weakly typed, we compute the bound of the strongly-typed
     # counterparts and apply the weak type at the end. This avoids returning the
     # incorrect result with non-canonical weak types (e.g. weak int16).
     # TODO(jakevdp): explore removing this special case.
-    result_type = _least_upper_bound(config.jax_numpy_dtype_promotion,
+    result_type = _least_upper_bound(config.numpy_dtype_promotion.value,
                                      *{_jax_type(dtype, False) for dtype in dtypes})
     out_dtype = dtype(result_type)
     out_weak_type = True
   else:
-    result_type = _least_upper_bound(config.jax_numpy_dtype_promotion,
+    result_type = _least_upper_bound(config.numpy_dtype_promotion.value,
                                      *{_jax_type(d, w) for d, w in zip(dtypes, weak_types)})
     out_dtype = dtype(result_type)
     out_weak_type = any(result_type is t for t in _weak_types)
@@ -555,6 +645,7 @@ def result_type(*args: Any, return_weak_type_flag: Literal[False] = False) -> DT
 @overload
 def result_type(*args: Any, return_weak_type_flag: bool = False) -> Union[DType, tuple[DType, bool]]: ...
 
+@export
 def result_type(*args: Any, return_weak_type_flag: bool = False) -> Union[DType, tuple[DType, bool]]:
   """Convenience function to apply JAX argument dtype promotion.
 
@@ -567,16 +658,18 @@ def result_type(*args: Any, return_weak_type_flag: bool = False) -> Union[DType,
   """
   if len(args) == 0:
     raise ValueError("at least one array or dtype is required")
+  dtype: DType | ExtendedDType
   dtype, weak_type = _lattice_result_type(*(float_ if arg is None else arg for arg in args))
   if weak_type:
     dtype = canonicalize_dtype(
       _default_types['f' if dtype in _custom_float_dtypes else dtype.kind])
   else:
-    dtype = canonicalize_dtype(dtype, allow_opaque_dtype=True)
-  return (dtype, weak_type) if return_weak_type_flag else dtype
+    dtype = canonicalize_dtype(dtype, allow_extended_dtype=True)
+  # TODO(jakevdp): fix return type annotation and remove this ignore.
+  return (dtype, weak_type) if return_weak_type_flag else dtype  # type: ignore[return-value]
 
 def check_user_dtype_supported(dtype, fun_name=None):
-  if is_opaque_dtype(dtype):
+  if issubdtype(dtype, extended):
     return
   # Avoid using `dtype in [...]` because of numpy dtype equality overloading.
   if isinstance(dtype, type) and dtype in {bool, int, float, builtins.complex}:
@@ -599,3 +692,40 @@ def check_user_dtype_supported(dtype, fun_name=None):
     fun_name = f"requested in {fun_name}" if fun_name else ""
     truncated_dtype = canonicalize_dtype(dtype).name
     warnings.warn(msg.format(dtype, fun_name, truncated_dtype), stacklevel=3)
+
+def safe_to_cast(input_dtype_or_value: Any,
+                 output_dtype_or_value: Any) -> bool:
+  """Check if a dtype/value is safe to cast to another dtype/value
+
+  Args:
+    input_dtype_or_value: a dtype or value (to be passed to result_type)
+      representing the source dtype.
+    output_dtype_or_value: a dtype or value (to be passed to result_type)
+      representing the target dtype.
+
+  Returns:
+    boolean representing whether the values are safe to cast according to
+    default type promotion semantics.
+
+  Raises:
+    TypePromotionError: if the inputs have differing types and no type promotion
+    path under the current jax_numpy_dtype_promotion setting.
+
+  Examples:
+
+    >>> safe_to_cast('int32', 'float64')
+    True
+    >>> safe_to_cast('float64', 'int32')
+    False
+    >>> safe_to_cast('float32', 'complex64')
+    True
+    >>> safe_to_cast('complex64', 'float64')
+    False
+  """
+  input_dtype = dtype(input_dtype_or_value, canonicalize=True)
+  output_dtype = dtype(output_dtype_or_value, canonicalize=True)
+  if input_dtype == output_dtype:
+    return True
+  # We deliberately use output_dtype rather than output_dtype_or_value here:
+  # this effectively treats the output dtype as always strongly-typed.
+  return result_type(input_dtype_or_value, output_dtype) == output_dtype

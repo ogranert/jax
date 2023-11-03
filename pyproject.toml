@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [tool.mypy]
 show_error_codes = true
-disable_error_code = "attr-defined"
+disable_error_code = "attr-defined, name-defined, annotation-unchecked"
 no_implicit_optional = true
 
 [[tool.mypy.overrides]]
 module = [
     "absl.*",
     "colorama.*",
+    "importlib_metadata.*",
     "IPython.*",
     "numpy.*",
     "opt_einsum.*",
@@ -36,7 +37,8 @@ module = [
     "pytest.*",
     "zstandard.*",
     "jax.experimental.jax2tf.tests.flax_models",
-    "jax.experimental.jax2tf.tests.back_compat_testdata"
+    "jax.experimental.jax2tf.tests.back_compat_testdata",
+    "setuptools.*",
 ]
 ignore_missing_imports = true
 
@@ -70,6 +72,9 @@ filterwarnings = [
     # https://github.com/openxla/xla/commit/fb9dc3db0999bf14c78d95cb7c3aa6815221ddc7)
     "ignore:ml_dtypes.float8_e4m3b11 is deprecated.",
     "ignore:JAX_USE_PJRT_C_API_ON_TPU=false will no longer be supported.*:UserWarning",
+    "ignore:np.find_common_type is deprecated.*:DeprecationWarning",
+    "ignore:jax.numpy.in1d is deprecated.*:DeprecationWarning",
+    "ignore:jax.numpy.trapz is deprecated.*:DeprecationWarning",
 ]
 doctest_optionflags = [
     "NUMBER",

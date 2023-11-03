@@ -13,15 +13,16 @@
 # limitations under the License.
 """See primitives_test docstring for how the Jax2TfLimitations are used."""
 
+from collections.abc import Sequence
 import itertools
-from typing import Any, Callable, Optional, Sequence, Union
+from typing import Any, Callable, Optional, Union
 
 import jax
 from jax import lax
 from jax import numpy as jnp
-from jax import config
-from jax._src import test_util as jtu
+from jax._src import config
 from jax._src import dtypes
+from jax._src import test_util as jtu
 from jax.experimental.jax2tf.tests import primitive_harness
 import numpy as np
 
@@ -113,7 +114,7 @@ class Jax2TfLimitation(primitive_harness.Limitation):
     """Checks if this limitation is enabled for dtype and device and mode."""
     native_serialization_mask = (
         Jax2TfLimitation.FOR_NATIVE
-        if config.jax2tf_default_native_serialization
+        if config.jax2tf_default_native_serialization.value
         else Jax2TfLimitation.FOR_NON_NATIVE)
     return ((mode is None or mode in self.modes) and
             (self.native_serialization & native_serialization_mask) and
@@ -141,7 +142,7 @@ class Jax2TfLimitation(primitive_harness.Limitation):
   # We keep here the explicit set of groups for which we don't have limitations
   harness_groups_no_limitations = {
       "abs", "add", "add_any", "and", "atan2", "bitcast_convert_type",
-      "broadcast", "broadcast_in_dim", "cbrt", "ceil", "clamp", "concatenate",
+      "broadcast", "broadcast_in_dim", "ceil", "clamp", "concatenate",
       "cos", "cosh", "complex", "conj", "convert_element_type", "cummax",
       "cummin", "device_put", "dynamic_slice", "dynamic_update_slice", "exp",
       "eq", "floor", "gather", "ge", "gt", "imag", "iota", "iota_2x32_shape",
@@ -200,7 +201,8 @@ class Jax2TfLimitation(primitive_harness.Limitation):
   @classmethod
   def acosh(cls, harness: primitive_harness.Harness):
     return [
-        custom_numeric(dtypes=[np.complex64], devices=("cpu", "gpu"), tol=1e-3),
+        custom_numeric(dtypes=[np.complex64], devices=("cpu", "gpu", "tpu"),
+                       tol=1e-3),
         custom_numeric(dtypes=[np.complex128], devices=("cpu", "gpu"), tol=1e-12),
         cls.helper_get_trig_custom_limitation(np.cosh)
     ]
@@ -264,6 +266,8 @@ class Jax2TfLimitation(primitive_harness.Limitation):
     return [
         custom_numeric(dtypes=[np.complex64], devices=("cpu", "gpu"), tol=1e-4,
                        modes=("eager", "graph", "compiled")),
+        custom_numeric(dtypes=[np.complex64], devices=("tpu", "gpu"), tol=2e-4,
+                       modes=("eager", "graph", "compiled")),
         custom_numeric(dtypes=[np.complex128], devices=("cpu", "gpu"), tol=1e-12,
                        modes=("eager", "graph", "compiled")),
         cls.helper_get_trig_custom_limitation(np.sin)
@@ -272,7 +276,8 @@ class Jax2TfLimitation(primitive_harness.Limitation):
   @classmethod
   def asinh(cls, harness: primitive_harness.Harness):
     return [
-        custom_numeric(dtypes=[np.complex64], devices=("cpu", "gpu"), tol=1e-3),
+        custom_numeric(dtypes=[np.complex64], devices=("cpu", "gpu", "tpu"),
+                       tol=1e-3),
         custom_numeric(dtypes=[np.complex128], devices=("cpu", "gpu"), tol=1e-12),
         cls.helper_get_trig_custom_limitation(np.sinh)
     ]
@@ -281,6 +286,7 @@ class Jax2TfLimitation(primitive_harness.Limitation):
   def atan(cls, harness: primitive_harness.Harness):
     return [
         custom_numeric(dtypes=[np.complex64], devices=("cpu", "gpu"), tol=1e-5),
+        custom_numeric(dtypes=[np.complex64], devices=("tpu"), tol=1e-3),
         custom_numeric(dtypes=[np.complex128], devices=("cpu", "gpu"), tol=1e-12),
         cls.helper_get_trig_custom_limitation(np.tan)
     ]
@@ -306,6 +312,12 @@ class Jax2TfLimitation(primitive_harness.Limitation):
   @classmethod
   def bessel_i1e(cls, harness: primitive_harness.Harness):
     return cls.bessel_i0e(harness)
+
+  @classmethod
+  def cbrt(cls, harness: primitive_harness.Harness):
+    return [
+        custom_numeric(dtypes=[np.float32], devices=("tpu"), tol=1e-5),
+    ]
 
   @classmethod
   def cholesky(cls, harness: primitive_harness.Harness):
@@ -345,7 +357,18 @@ class Jax2TfLimitation(primitive_harness.Limitation):
 
   @classmethod
   def conv_general_dilated(cls, harness: primitive_harness.Harness):
+    prefer_elem = harness.params["preferred_element_type"]
     return [
+        Jax2TfLimitation(
+          "Non-deterministic NaN for conv_general_dilated with preferred_element_type",
+          dtypes=[
+            jnp.int32, np.int16, np.int64
+          ],
+          devices=["cpu", "gpu", "tpu"],
+          modes=("eager", "graph", "compiled"),
+          enabled=(prefer_elem is not None
+                   and prefer_elem in [jnp.bfloat16, np.float16, np.float32, np.float64]),
+          skip_comparison=True),
         # Even in compiled mode, for GPU we see a bit of discrepancy but
         # very minor.
         custom_numeric(dtypes=[np.float32], devices="gpu",
@@ -484,6 +507,40 @@ class Jax2TfLimitation(primitive_harness.Limitation):
             devices=["cpu", "gpu", "tpu"],
             enabled=prefer_elem and np.dtype(harness.dtype) < np.dtype(prefer_elem),
             skip_comparison=True),
+        # TODO(necula): look into this, but this is only for non-native serialization
+        Jax2TfLimitation(
+            "Errors when lhs_dtype != rhs_dtype for non-native serialization with 64-bit types",
+            devices=["cpu", "gpu", "tpu"],
+            enabled=(harness.dtype != harness.params["rhs_dtype"] and
+                     (harness.dtype in [np.int64, np.uint64, np.float64] or
+                      harness.params["rhs_dtype"] in [np.int64, np.uint64, np.float64])),
+            skip_comparison=True),
+      # TODO(necula): look into this, but this is only for non-native serialization and enable_xla=False
+      Jax2TfLimitation(
+        "Errors for non-native serialization with enable_xla=False for certain input dtype combinations",
+        devices=["cpu", "gpu", "tpu"],
+        enabled=(not harness.params["enable_xla"] and
+                 (harness.dtype in [np.int16, np.uint32, np.uint16] or
+                  harness.params["rhs_dtype"] in [np.int16, np.uint32, np.uint16] or
+                  # Some combinations end up being widened to a larger type that is not
+                  # supported
+                  (harness.dtype, harness.params["rhs_dtype"]) in [
+                    (np.float16, jnp.bfloat16),
+                    (np.int32, np.float16),
+                    (np.int8, np.float16),
+                    (np.int8, np.uint8),
+                  ])),
+        skip_comparison=True,
+        skip_tf_run=True),
+        # TODO(necula): look into this, but this is only for non-native serialization
+        Jax2TfLimitation(
+            "Crash when lhs_dtype != rhs_dtype for non-native serialization on TPU for complex numbers",
+            devices=["tpu"],
+            enabled=(harness.dtype != harness.params["rhs_dtype"] and
+                     (harness.dtype in [np.complex64, np.complex128] or
+                      harness.params["rhs_dtype"] in [np.complex64, np.complex128])),
+            skip_comparison=True,
+            skip_tf_run=True),
         # JAX performs float16 matmuls in float32 on CPU, so the JAX result
         # may be more precise.
         custom_numeric(dtypes=[np.float16], devices=["cpu"], tol=1e-2,
@@ -734,6 +791,8 @@ class Jax2TfLimitation(primitive_harness.Limitation):
       tst.assertAllClose(
           np.full((nr_special_cases,), 0., dtype=dtype),
           result_tf[special_cases])
+      if harness.dtype == np.float32:
+        tol = 1e-5
       # non-special cases are equal
       tst.assertAllClose(
           result_jax[~special_cases],
@@ -1021,6 +1080,10 @@ class Jax2TfLimitation(primitive_harness.Limitation):
             expect_tf_error=False,
             skip_comparison=True,
             enabled=not harness.params["enable_xla"]),
+      custom_numeric(devices="cpu", dtypes=[np.float32],
+                     modes=("eager", "graph", "compiled",), tol=1e-5),
+      custom_numeric(devices=("cpu", "gpu"), dtypes=[np.float16],
+                     modes=("eager", "graph", "compiled",), tol=5e-3),
     ]
 
   @classmethod
@@ -1076,6 +1139,9 @@ class Jax2TfLimitation(primitive_harness.Limitation):
             expect_tf_error=True,
             skip_comparison=True,
             enabled=("modes_out_of_bounds" in harness.name and not harness.params["enable_xla"])),
+      custom_numeric(modes=("eager", "graph", "compiled"),
+                     dtypes=[np.float16], tol=5e-3,
+                     enabled=(not harness.params["enable_xla"])),
     ]
 
   @classmethod
@@ -1172,10 +1238,10 @@ class Jax2TfLimitation(primitive_harness.Limitation):
       # should also consider the gap between it and zero. Note that this code
       # relies on the singular values being in descending order.
       def compute_absolute_gap(s, m, n):
-        forward_appendant = np.Inf if m == n else 0
+        forward_appendant = np.inf if m == n else 0
         forward_diff = jnp.diff(s, axis=-1, append=forward_appendant)
         backward_diff = jnp.diff(
-            s[..., ::-1], axis=-1, append=np.Inf)[..., ::-1]
+            s[..., ::-1], axis=-1, append=np.inf)[..., ::-1]
         absolute_gap = jnp.minimum(jnp.abs(forward_diff),
                                    jnp.abs(backward_diff))
         return absolute_gap
@@ -1305,6 +1371,14 @@ class Jax2TfLimitation(primitive_harness.Limitation):
             modes=("eager", "graph", "compiled"),
             enabled=(compute_uv == True)),
         custom_numeric(
+            tol=1e-5,
+            description="custom numeric comparison when !compute_uv on TPU",
+            dtypes=[np.float32, np.complex64],
+            custom_assert=custom_assert,
+            devices=("tpu"),
+            modes=("eager", "graph", "compiled"),
+            enabled=not compute_uv),
+        custom_numeric(
             tol=1e-2,
             description="custom numeric comparison when compute_uv on TPU",
             dtypes=[np.float32, np.float64, np.complex64, np.complex128],
@@ -1365,7 +1439,8 @@ class Jax2TfLimitation(primitive_harness.Limitation):
             dtypes=[np.float16],
             devices=("gpu", "cpu"),
             modes=("eager", "graph")),
-        custom_numeric(dtypes=[np.float32], tol=5e-3)
+        custom_numeric(dtypes=[np.float32], tol=5e-3,
+                       modes=("eager", "graph", "compiled"))
     ]
 
   @classmethod
@@ -1400,10 +1475,9 @@ def custom_numeric(
 
 def custom_random_keys_output():
   def custom_assert(tst, result_jax, result_tf, *, args, tol, err_msg):
-    # TODO(frostig): Don't need this conditional once we always
-    # enable_custom_prng. We can even assert the isinstance instead.
+    # Here we handle both new-style and old-style keys; see JEP 9263
     def unwrap_keys(keys):
-      if isinstance(keys, jax.random.KeyArray):
+      if jax.dtypes.issubdtype(keys.dtype, jax.dtypes.prng_key):
         return jax._src.prng.random_unwrap(keys)
       else:
         return keys

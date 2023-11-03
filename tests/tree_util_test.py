@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import collections
+import dataclasses
 import functools
 import pickle
 import re
@@ -128,6 +129,36 @@ class FlatCache:
       data, meta = tree_util.tree_flatten(tree_util.tree_unflatten(meta, data))
     return FlatCache(None, leaves=data, treedef=meta)
 
+
+@tree_util.register_static
+class StaticInt(int):
+  pass
+
+
+@tree_util.register_static
+class StaticTuple(tuple):
+  pass
+
+
+@tree_util.register_static
+class StaticDict(dict):
+  pass
+
+
+@tree_util.register_static
+@dataclasses.dataclass
+class BlackBox:
+  """Stores a value but pretends to be equal to every other black box."""
+
+  value: int
+
+  def __hash__(self):
+    return 0
+
+  def __eq__(self, other):
+    return isinstance(other, BlackBox)
+
+
 TREES = (
     (None,),
     ((None,),),
@@ -141,6 +172,9 @@ TREES = (
     ([AnObject2(3, None, [4, "foo"])],),
     (Special(2, 3.),),
     ({"a": 1, "b": 2},),
+    (StaticInt(1),),
+    (StaticTuple((2, 3)),),
+    (StaticDict(foo=4, bar=5),),
     (collections.OrderedDict([("foo", 34), ("baz", 101), ("something", -42)]),),
     (collections.defaultdict(dict,
                              [("foo", 34), ("baz", 101), ("something", -42)]),),
@@ -148,6 +182,7 @@ TREES = (
     (FlatCache(None),),
     (FlatCache(1),),
     (FlatCache({"a": [1, 2]}),),
+    (BlackBox(value=2),),
 )
 
 
@@ -165,6 +200,9 @@ TREE_STRINGS = (
     "PyTreeDef([CustomNode(AnObject2[[4, 'foo']], [*, None])])",
     "PyTreeDef(CustomNode(Special[None], [*, *]))",
     "PyTreeDef({'a': *, 'b': *})",
+    "PyTreeDef(CustomNode(StaticInt[1], []))",
+    "PyTreeDef(CustomNode(StaticTuple[(2, 3)], []))",
+    "PyTreeDef(CustomNode(StaticDict[{'foo': 4, 'bar': 5}], []))",
 )
 
 # pytest expects "tree_util_test.ATuple"
@@ -199,6 +237,10 @@ TREES_WITH_KEYPATH = (
     (collections.defaultdict(dict,
                              [("foo", 34), ("baz", 101), ("something", -42)]),),
     (ANamedTupleSubclass(foo="hello", bar=3.5),),
+    (StaticInt(1),),
+    (StaticTuple((2, 3)),),
+    (StaticDict(foo=4, bar=5),),
+    (BlackBox(value=2),),
 )
 
 
@@ -276,12 +318,114 @@ class TreeTest(jtu.JaxTestCase):
     self.assertEqual(flat2, list(range(10)))
     self.assertEqual(flat3, list(range(10)))
 
-  def testFlattenUpTo(self):
-    _, tree = tree_util.tree_flatten([(1, 2), None, ATuple(foo=3, bar=7)])
-    out = tree.flatten_up_to([({
-        "foo": 7
-    }, (3, 4)), None, ATuple(foo=(11, 9), bar=None)])
-    self.assertEqual(out, [{"foo": 7}, (3, 4), (11, 9), None])
+  @parameterized.parameters(
+      (
+          [(1, 2), None, ATuple(foo=3, bar=7)],
+          [({"foo": 7}, (3, 4)), None, ATuple(foo=(11, 9), bar=None)],
+          [{"foo": 7}, (3, 4), (11, 9), None],
+      ),
+      ([1], [{"a": 7}], [{"a": 7}]),
+      ([1], [[7]], [[7]]),
+      ([1], [(7,)], [(7,)]),
+      ((1, 2), ({"a": 7}, {"a": 8}), [{"a": 7}, {"a": 8}]),
+      ((1,), ([7],), [[7]]),
+      ((1,), ((7,),), [(7,)]),
+      ({"a": 1, "b": (2, 3)}, {"a": [7], "b": ([8], (9,))}, [[7], [8], (9,)]),
+      ({"a": 1}, {"a": (7,)}, [(7,)]),
+      ({"a": 1}, {"a": {"a": 7}}, [{"a": 7}]),
+  )
+  def testFlattenUpTo(self, tree, xs, expected):
+    _, tree_def = tree_util.tree_flatten(tree)
+    out = tree_def.flatten_up_to(xs)
+    self.assertEqual(out, expected)
+
+  @parameterized.parameters(
+      ([1, 2], [7], re.escape("List arity mismatch: 1 != 2; list: [7].")),
+      ((1,), (7, 8), re.escape("Tuple arity mismatch: 2 != 1; tuple: (7, 8).")),
+      (
+          {"a": 1},
+          {"a": 7, "b": 8},
+          re.escape(
+              "Dict key mismatch; expected keys: ['a']; dict: {'a': 7, 'b': 8}."
+          ),
+      ),
+      (
+          {"a": 1},
+          {"b": 7},
+          re.escape("Dict key mismatch; expected keys: ['a']; dict: {'b': 7}."),
+      ),
+      ([1], {"a": 7}, re.escape("Expected list, got {'a': 7}.")),
+      ([1], (7,), re.escape("Expected list, got (7,).")),
+      ((1,), [7], re.escape("Expected tuple, got [7].")),
+      ((1,), {"b": 7}, re.escape("Expected tuple, got {'b': 7}.")),
+      ({"a": 1}, (7,), re.escape("Expected dict, got (7,).")),
+      ({"a": 1}, [7], re.escape("Expected dict, got [7].")),
+      ([[1]], [7], re.escape("Expected list, got 7.")),
+      ([[1]], [(7,)], re.escape("Expected list, got (7,).")),
+      ([[1]], [{"a": 7}], re.escape("Expected list, got {'a': 7}.")),
+      ([(1,)], [7], re.escape("Expected tuple, got 7.")),
+      ([(1,)], [[7]], re.escape("Expected tuple, got [7].")),
+      ([(1,)], [{"a": 7}], re.escape("Expected tuple, got {'a': 7}.")),
+      ([{"a": 1}], [7], re.escape("Expected dict, got 7.")),
+      ([{"a": 1}], [[7]], re.escape("Expected dict, got [7].")),
+      ([{"a": 1}], [(7,)], re.escape("Expected dict, got (7,).")),
+      (
+          [{"a": 1}],
+          [{"b": 7}],
+          re.escape("Dict key mismatch; expected keys: ['a']; dict: {'b': 7}."),
+      ),
+      (([1],), (7,), re.escape("Expected list, got 7.")),
+      (([1],), ((7,),), re.escape("Expected list, got (7,).")),
+      (([1],), ({"a": 7},), re.escape("Expected list, got {'a': 7}.")),
+      (((1,),), (7,), re.escape("Expected tuple, got 7.")),
+      (((1,),), ([7],), re.escape("Expected tuple, got [7].")),
+      (((1,),), ({"a": 7},), re.escape("Expected tuple, got {'a': 7}.")),
+      (({"a": 1},), (7,), re.escape("Expected dict, got 7.")),
+      (({"a": 1},), ([7],), re.escape("Expected dict, got [7].")),
+      (({"a": 1},), ((7,),), re.escape("Expected dict, got (7,).")),
+      (
+          ({"a": 1},),
+          ({"b": 7},),
+          re.escape("Dict key mismatch; expected keys: ['a']; dict: {'b': 7}."),
+      ),
+      ({"a": [1]}, {"a": 7}, re.escape("Expected list, got 7.")),
+      ({"a": [1]}, {"a": (7,)}, re.escape("Expected list, got (7,).")),
+      ({"a": [1]}, {"a": {"a": 7}}, re.escape("Expected list, got {'a': 7}.")),
+      ({"a": (1,)}, {"a": 7}, re.escape("Expected tuple, got 7.")),
+      ({"a": (1,)}, {"a": [7]}, re.escape("Expected tuple, got [7].")),
+      (
+          {"a": (1,)},
+          {"a": {"a": 7}},
+          re.escape("Expected tuple, got {'a': 7}."),
+      ),
+      ({"a": {"a": 1}}, {"a": 7}, re.escape("Expected dict, got 7.")),
+      ({"a": {"a": 1}}, {"a": [7]}, re.escape("Expected dict, got [7].")),
+      ({"a": {"a": 1}}, {"a": (7,)}, re.escape("Expected dict, got (7,).")),
+      (
+          {"a": {"a": 1}},
+          {"a": {"b": 7}},
+          re.escape("Dict key mismatch; expected keys: ['a']; dict: {'b': 7}."),
+      ),
+      (
+          [ATuple(foo=1, bar=2)],
+          [(1, 2)],
+          re.escape("Expected named tuple, got (1, 2)."),
+      ),
+      (
+          [ATuple(foo=1, bar=2)],
+          [ATuple2(foo=1, bar=2)],
+          re.escape("Named tuple type mismatch"),
+      ),
+      (
+          [AnObject(x=[1], y=(2,), z={"a": [1]})],
+          [([1], (2,), {"a": [1]})],
+          re.escape("Custom node type mismatch"),
+      ),
+  )
+  def testFlattenUpToErrors(self, tree, xs, error):
+    _, tree_def = tree_util.tree_flatten(tree)
+    with self.assertRaisesRegex(ValueError, error):
+      tree_def.flatten_up_to(xs)
 
   def testTreeMap(self):
     x = ((1, 2), (3, 4, 5))
@@ -413,9 +557,11 @@ class TreeTest(jtu.JaxTestCase):
 
   @parameterized.parameters(*TREES)
   def testPickleRoundTrip(self, tree):
-    treedef = tree_util.tree_structure(tree)
+    leaves, treedef = tree_util.tree_flatten(tree)
     treedef_restored = pickle.loads(pickle.dumps(treedef))
     self.assertEqual(treedef, treedef_restored)
+    reconstituted = treedef_restored.unflatten(leaves)
+    self.assertEqual(tree, reconstituted)
 
   def testDictKeysSortable(self):
     d = {"a": 1, 2: "b"}
@@ -504,12 +650,12 @@ class TreeTest(jtu.JaxTestCase):
 
   def testTreeMapWithPathWithIsLeafArgument(self):
     x = ((1, 2), [3, 4, 5])
-    y = (([3], jnp.array((0))), ([0], 7, [5, 6]))
+    y = (([3], jnp.array(0)), ([0], 7, [5, 6]))
     out = tree_util.tree_map_with_path(
         lambda kp, *xs: tuple((kp[0].idx, *xs)), x, y,
         is_leaf=lambda n: isinstance(n, list))
     self.assertEqual(out, (((0, 1, [3]),
-                            (0, 2, jnp.array((0)))),
+                            (0, 2, jnp.array(0))),
                            (1, [3, 4, 5], ([0], 7, [5, 6]))))
 
   def testFlattenWithPathWithIsLeafArgument(self):
@@ -588,6 +734,66 @@ class TreeTest(jtu.JaxTestCase):
   def testNamedTupleRegisteredWithoutKeysIsntTreatedAsLeaf(self):
     leaves, _ = tree_util.tree_flatten_with_path(ATuple2(1, 'hi'))
     self.assertLen(leaves, 1)
+
+
+class StaticTest(parameterized.TestCase):
+
+  @parameterized.parameters(
+      (StaticInt(2),),
+      (StaticTuple((2, None)),),
+      (StaticDict(foo=2),),
+  )
+  def test_trace_just_once_with_same_static(self, y):
+    num_called = 0
+
+    @jax.jit
+    def fn(x: int, static_y: StaticInt):
+      nonlocal num_called
+      num_called += 1
+      unstatic_y = type(static_y).__base__(static_y)
+      [y] = tree_util.tree_leaves(unstatic_y)
+      return x + y
+
+    fn(1, y)
+    fn(3, y)
+    self.assertEqual(num_called, 1)
+
+  def test_name(self):
+    self.assertEqual(StaticInt.__name__, "StaticInt")
+    self.assertEqual(BlackBox.__name__, "BlackBox")
+
+  @parameterized.parameters(
+      (StaticInt(2), StaticInt(4)),
+      (StaticTuple((2, None)), StaticTuple((4, None))),
+      (StaticDict(foo=2), StaticDict(foo=4)),
+  )
+  def test_trace_twice_with_different_static(self, y1, y2):
+    num_called = 0
+
+    @jax.jit
+    def fn(x: int, static_y: StaticInt):
+      nonlocal num_called
+      num_called += 1
+      unstatic_y = type(static_y).__base__(static_y)
+      [y] = tree_util.tree_leaves(unstatic_y)
+      return x + y
+
+    fn(1, y1)
+    fn(3, y2)
+    self.assertEqual(num_called, 2)
+
+  def test_trace_just_once_if_static_looks_constant(self):
+    num_called = 0
+
+    @jax.jit
+    def fn(x: int, static_y: BlackBox):
+      nonlocal num_called
+      num_called += 1
+      return x + static_y.value
+
+    self.assertEqual(fn(1, BlackBox(2)), 3)
+    self.assertEqual(fn(3, BlackBox(1)), 5)
+    self.assertEqual(num_called, 1)
 
 
 class RavelUtilTest(jtu.JaxTestCase):

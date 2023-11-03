@@ -110,7 +110,7 @@ class Rotation(typing.NamedTuple):
   def as_euler(self, seq: str, degrees: bool = False):
     """Represent as Euler angles."""
     if len(seq) != 3:
-      raise ValueError("Expected 3 axes, got {}.".format(seq))
+      raise ValueError(f"Expected 3 axes, got {seq}.")
     intrinsic = (re.match(r'^[XYZ]{1,3}$', seq) is not None)
     extrinsic = (re.match(r'^[xyz]{1,3}$', seq) is not None)
     if not (intrinsic or extrinsic):
@@ -149,15 +149,15 @@ class Rotation(typing.NamedTuple):
 
   def mean(self, weights: typing.Optional[jax.Array] = None):
     """Get the mean of the rotations."""
-    weights = jnp.where(weights is None, jnp.ones(self.quat.shape[0], dtype=self.quat.dtype), jnp.asarray(weights, dtype=self.quat.dtype))
-    if weights.ndim != 1:
+    w = jnp.ones(self.quat.shape[0], dtype=self.quat.dtype) if weights is None else jnp.asarray(weights, dtype=self.quat.dtype)
+    if w.ndim != 1:
       raise ValueError("Expected `weights` to be 1 dimensional, got "
-                       "shape {}.".format(weights.shape))
-    if weights.shape[0] != len(self):
+                       "shape {}.".format(w.shape))
+    if w.shape[0] != len(self):
       raise ValueError("Expected `weights` to have number of values "
                        "equal to number of rotations, got "
-                       "{} values and {} rotations.".format(weights.shape[0], len(self)))
-    K = jnp.dot(weights[jnp.newaxis, :] * self.quat.T, self.quat)
+                       "{} values and {} rotations.".format(w.shape[0], len(self)))
+    K = jnp.dot(w[jnp.newaxis, :] * self.quat.T, self.quat)
     _, v = jnp.linalg.eigh(K)
     return Rotation(v[:, -1])
 
@@ -308,7 +308,7 @@ def _elementary_basis_index(axis: str) -> int:
     return 1
   elif axis == 'z':
     return 2
-  raise ValueError("Expected axis to be from ['x', 'y', 'z'], got {}".format(axis))
+  raise ValueError(f"Expected axis to be from ['x', 'y', 'z'], got {axis}")
 
 
 @functools.partial(jnp.vectorize, signature=('(m),(m),(),()->(n)'))

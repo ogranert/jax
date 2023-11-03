@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from collections.abc import Sequence
 from functools import partial
 import itertools as it
-
-from typing import Any, Callable, NamedTuple, Optional, Sequence, Union
+from typing import Any, Callable, NamedTuple, Optional, Union
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -23,8 +24,8 @@ import jax
 from jax import random
 from jax import lax
 from jax._src import core
+from jax._src import config
 from jax._src import linear_util as lu
-from jax import config
 from jax._src.interpreters import partial_eval as pe
 from jax._src import test_util as jtu
 from jax._src.util import tuple_insert
@@ -412,12 +413,12 @@ class StatePrimitivesTest(jtu.JaxTestCase):
   def test_vmap(self, ref_shape, ref_bdim, idx_shape, indexed_dims,
                     idx_bdims, out_bdim, op):
 
-    float_ = (jnp.dtype('float64') if jax.config.jax_enable_x64 else
+    float_ = (jnp.dtype('float64') if config.enable_x64.value else
               jnp.dtype('float32'))
-    int_ = (jnp.dtype('int64') if jax.config.jax_enable_x64 else
+    int_ = (jnp.dtype('int64') if config.enable_x64.value else
             jnp.dtype('int32'))
     axis_size = 7
-    out_shape = tuple([d for d, b in zip(ref_shape, indexed_dims) if not b])
+    out_shape = tuple(d for d, b in zip(ref_shape, indexed_dims) if not b)
     if any(indexed_dims):
       out_shape = (*idx_shape, *out_shape)
 
@@ -438,7 +439,7 @@ class StatePrimitivesTest(jtu.JaxTestCase):
 
     def f(x_ref, *idxs):
       idxs_ = iter(idxs)
-      indexer = tuple([next(idxs_) if b else slice(None) for b in indexed_dims])
+      indexer = tuple(next(idxs_) if b else slice(None) for b in indexed_dims)
       return op(x_ref, indexer)
 
     rng = self.rng()
@@ -496,7 +497,7 @@ class StateDischargeTest(jtu.JaxTestCase):
     self.assertLen(discharged_jaxpr.invars, 1)
     self.assertLen(discharged_jaxpr.outvars, 2)
     self.assertIn(lax.dynamic_slice_p,
-                  set(eqn.primitive for eqn in discharged_jaxpr.eqns))
+                  {eqn.primitive for eqn in discharged_jaxpr.eqns})
     # Should be able to evaluate this jaxpr
     inval = jnp.arange(24., dtype=jnp.float32).reshape((4, 3, 2))
     outval, refval = core.eval_jaxpr(discharged_jaxpr, (), inval)
@@ -547,9 +548,9 @@ class StateDischargeTest(jtu.JaxTestCase):
     self.assertLen(discharged_jaxpr.invars, 1)
     self.assertLen(discharged_jaxpr.outvars, 1)
     self.assertIn(lax.dynamic_update_slice_p,
-                  set(eqn.primitive for eqn in discharged_jaxpr.eqns))
+                  {eqn.primitive for eqn in discharged_jaxpr.eqns})
     self.assertIn(lax.dynamic_slice_p,
-                  set(eqn.primitive for eqn in discharged_jaxpr.eqns))
+                  {eqn.primitive for eqn in discharged_jaxpr.eqns})
     # Should be able to evaluate this jaxpr
     inval = jnp.arange(24., dtype=jnp.float32).reshape((4, 3, 2))
     refval, = core.eval_jaxpr(discharged_jaxpr, (), inval)
@@ -598,11 +599,11 @@ class StateDischargeTest(jtu.JaxTestCase):
     self.assertLen(discharged_jaxpr.invars, 1)
     self.assertLen(discharged_jaxpr.outvars, 1)
     self.assertIn(lax.dynamic_update_slice_p,
-                  set(eqn.primitive for eqn in discharged_jaxpr.eqns))
+                  {eqn.primitive for eqn in discharged_jaxpr.eqns})
     self.assertIn(lax.add_p,
-                  set(eqn.primitive for eqn in discharged_jaxpr.eqns))
+                  {eqn.primitive for eqn in discharged_jaxpr.eqns})
     self.assertIn(lax.dynamic_slice_p,
-                  set(eqn.primitive for eqn in discharged_jaxpr.eqns))
+                  {eqn.primitive for eqn in discharged_jaxpr.eqns})
     inval = jnp.arange(24., dtype=jnp.float32).reshape((4, 3, 2))
     refval, = core.eval_jaxpr(discharged_jaxpr, (), inval)
     self.assertTrue((refval == inval.at[0, 1].add(1.)).all())
@@ -830,7 +831,7 @@ if CAN_USE_HYPOTHESIS:
 
     @hp.given(get_vmap_params())
     @hp.settings(deadline=None, print_blob=True,
-        max_examples=config.FLAGS.jax_num_generated_cases)
+                 max_examples=jtu.NUM_GENERATED_CASES.value)
     def test_get_vmap(self, get_vmap_param: GetVmapParams):
 
       indexed_dims = get_vmap_param.vmap_index_param.index_param.indexed_dims
@@ -869,9 +870,10 @@ if CAN_USE_HYPOTHESIS:
 
     @hp.given(set_vmap_params())
     @hp.settings(deadline=None, print_blob=True,
-                 max_examples=config.FLAGS.jax_num_generated_cases)
+                 max_examples=jtu.NUM_GENERATED_CASES.value)
     def test_set_vmap(self, set_vmap_param: SetVmapParams):
-
+      if jtu.test_device_matches(["gpu"]):
+        self.skipTest("Scatter is nondeterministic on GPU")
       indexed_dims = set_vmap_param.vmap_index_param.index_param.indexed_dims
 
       def f(ref, val, *non_slice_idx):
@@ -913,7 +915,7 @@ if CAN_USE_HYPOTHESIS:
 
     @hp.given(set_vmap_params())
     @hp.settings(deadline=None, print_blob=True,
-                 max_examples=config.FLAGS.jax_num_generated_cases)
+                 max_examples=jtu.NUM_GENERATED_CASES.value)
     def test_addupdate_vmap(self, set_vmap_param: SetVmapParams):
 
       indexed_dims = set_vmap_param.vmap_index_param.index_param.indexed_dims
@@ -1203,6 +1205,37 @@ class StateControlFlowTest(jtu.JaxTestCase):
     self.assertAllClose(jax.jit(f)(0, 1, 5, zs), (35, 11))
     self.assertAllClose(jax.jit(f)(1, 1, 2, zs), (21, 11))
 
+  def test_scan_with_state_in_body_nested(self):
+    @run_state
+    def g(refs):
+      a_ref, x_ref, w_ref, y_ref, zs_ref = refs
+
+      def f(x, w, y, zs):
+        @run_state
+        def loop(refs):
+          x_ref, w_ref = refs
+          def body(y, z):
+            x_ref[...] += y
+            w_ref[...] += z
+            a_ref[...] += z
+            return y + 1, ()
+          lax.scan(body, y, zs)
+        a_ref[...] += 1
+        out = loop((x, w))
+        a_ref[...] += 1
+        return out
+
+      x, w = f(x_ref[...], w_ref[...], y_ref[...], zs_ref[...])
+      x_ref[...] = x
+      w_ref[...] = w
+
+    zs = jnp.arange(5)
+    jaxpr = jax.make_jaxpr(g)((1, 0, 1, 5, zs)).jaxpr
+    self.assertEmpty(jaxpr.effects)
+    self.assertAllClose(jax.jit(g)((1, 0, 1, 5, zs))[:3], (13, 35, 11))
+    self.assertAllClose(jax.jit(g)((1, 1, 1, 2, zs))[:3], (13, 21, 11))
+
+
 class GeneralRefTest(jtu.JaxTestCase):
 
   def test_unshaped_ref(self):
@@ -1251,6 +1284,23 @@ class RunStateTest(jtu.JaxTestCase):
       y_ref[...] = x * 2
       x_ref[...] = y_ref[...] + x_ref[...]
       # x + x * y * 2, x * y * 2
+    x, y = run_state(f)((2, 3))
+    self.assertEqual(x, 2 + 2 * 3 * 2)
+    self.assertEqual(y, 2 * 3 * 2)
+
+  def test_nontrivial_run_state_jit(self):
+    def f(refs):
+      x_ref, y_ref = refs
+
+      @jax.jit
+      def g():
+        x = x_ref[...] * y_ref[...]
+        y_ref[...] = x * 2
+        x_ref[...] = y_ref[...] + x_ref[...]
+        # x + x * y * 2, x * y * 2
+
+      g()
+
     x, y = run_state(f)((2, 3))
     self.assertEqual(x, 2 + 2 * 3 * 2)
     self.assertEqual(y, 2 * 3 * 2)
@@ -1485,9 +1535,10 @@ if CAN_USE_HYPOTHESIS:
 
   class RunStateHypothesisTest(jtu.JaxTestCase):
 
+    @jax.legacy_prng_key('allow')
     @hp.given(hps.data())
     @hp.settings(deadline=None, print_blob=True,
-                 max_examples=config.FLAGS.jax_num_generated_cases)
+                 max_examples=jtu.NUM_GENERATED_CASES.value)
     def test_jvp(self, data):
 
       spec = data.draw(func_spec())
@@ -1509,9 +1560,10 @@ if CAN_USE_HYPOTHESIS:
       self.assertAllClose(y, y_ref)
       self.assertAllClose(y_t, y_ref_t)
 
+    @jax.legacy_prng_key('allow')
     @hp.given(hps.data())
     @hp.settings(deadline=None, print_blob=True,
-                 max_examples=config.FLAGS.jax_num_generated_cases)
+                 max_examples=jtu.NUM_GENERATED_CASES.value)
     def test_linearize(self, data):
 
       spec = data.draw(func_spec())
@@ -1534,9 +1586,10 @@ if CAN_USE_HYPOTHESIS:
       t = random.normal(k2, x.shape)
       self.assertAllClose(impl_lin(t), ref_lin(t), atol=1e-2, rtol=1e-2)
 
+    @jax.legacy_prng_key('allow')
     @hp.given(hps.data())
     @hp.settings(deadline=None, print_blob=True,
-                 max_examples=config.FLAGS.jax_num_generated_cases)
+                 max_examples=jtu.NUM_GENERATED_CASES.value)
     def test_vjp(self, data):
 
       spec = data.draw(func_spec())

@@ -14,6 +14,8 @@
 
 """JAX tools."""
 
+load("@rules_python//python:py_binary.bzl", "py_binary")
+
 def _shell_quote(s):
     """Copy of bazel-skylib's shell.quote.
 
@@ -138,7 +140,6 @@ def jax_to_ir(name, deps, fn, input_shapes, constants = None, format = "HLO"):
 from absl import app
 import jax.tools.jax_to_ir as jax_to_ir
 
-jax_to_ir.set_up_flags()
 app.run(jax_to_ir.main)
 EOF
         """.format(runner = runner),
@@ -149,7 +150,7 @@ EOF
     else:
         jax_to_ir_rule = "//third_party/py/jax/tools:jax_to_ir"
 
-    native.py_binary(
+    py_binary(
         name = runner,
         srcs = [
             runner + ".py",

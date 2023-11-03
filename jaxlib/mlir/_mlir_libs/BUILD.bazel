@@ -85,6 +85,25 @@ py_extension(
     ],
 )
 
+# This is here, instead of in jaxlib/mosaic/python, so it's in the same
+# directory as libjaxlib_mlir_capi.so (produced by
+# :jaxlib_mlir_capi_shared_library). This ensures that the RPATH works correctly
+# across platforms. It's not clear if Windows supports RPATH-like functionality
+# across different directories at all.
+py_extension(
+    name = "_tpu_ext",
+    srcs = ["tpu_ext.cc"],
+    copts = COPTS,
+    linkopts = LINKOPTS,
+    deps = [
+        ":jaxlib_mlir_capi_shared_library",
+        "//jaxlib/mosaic:tpu_dialect_capi_headers",
+        "@llvm-project//mlir:CAPIIR",
+        "@llvm-project//mlir:MLIRBindingsPythonHeadersAndDeps",
+        "@pybind11",
+    ],
+)
+
 symlink_inputs(
     name = "_mlir_libs",
     rule = py_library,
@@ -106,8 +125,14 @@ py_extension(
     copts = COPTS,
     linkopts = LINKOPTS,
     deps = [
+        ":jax_dialects_capi_headers",
         ":jaxlib_mlir_capi_shared_library",
+        "@llvm-project//mlir:CAPIArithHeaders",
         "@llvm-project//mlir:CAPIIRHeaders",
+        "@llvm-project//mlir:CAPIMathHeaders",
+        "@llvm-project//mlir:CAPIMemRefHeaders",
+        "@llvm-project//mlir:CAPITransformsHeaders",
+        "@llvm-project//mlir:CAPIVectorHeaders",
         "@llvm-project//mlir:MLIRBindingsPythonHeaders",
         "@local_config_python//:headers",
         "@pybind11",
@@ -177,22 +202,6 @@ py_extension(
     ],
 )
 
-# JAX plugins
-
-py_extension(
-    name = "_jax_passes",
-    srcs = [
-        "py_jax_passes.cc",
-    ],
-    copts = COPTS,
-    linkopts = LINKOPTS,
-    deps = [
-        ":jaxlib_mlir_capi_shared_library",
-        "//jaxlib/mlir/_mlir_libs/passes:capi_jax_passes_headers",
-        "@pybind11",
-    ],
-)
-
 # Shared C++ extension library
 
 cc_library(
@@ -209,11 +218,35 @@ cc_library(
 )
 
 cc_library(
+    name = "jax_dialects_capi",
+    srcs = ["jax_dialects.cc"],
+    hdrs = ["jax_dialects.h"],
+    deps = [
+        "@llvm-project//mlir:CAPIIRHeaders",
+        "@llvm-project//mlir:SCFDialect",
+    ],
+    alwayslink = 1,
+)
+
+cc_library(
+    name = "jax_dialects_capi_headers",
+    hdrs = ["jax_dialects.h"],
+    deps = [
+        "@llvm-project//mlir:CAPIIRHeaders",
+    ],
+)
+
+cc_library(
     name = "jaxlib_mlir_capi_objects",
     deps = [
-        "//jaxlib/mlir/_mlir_libs/passes:capi_jax_passes",
+        ":jax_dialects_capi",
+        "//jaxlib/mosaic:tpu_dialect_capi_objects",
+        "@llvm-project//mlir:CAPIArithObjects",
+        "@llvm-project//mlir:CAPIMathObjects",
+        "@llvm-project//mlir:CAPIMemRefObjects",
         "@llvm-project//mlir:CAPISparseTensorObjects",
         "@llvm-project//mlir:CAPITransformsObjects",
+        "@llvm-project//mlir:CAPIVectorObjects",
         "@llvm-project//mlir:MLIRBindingsPythonCAPIObjects",
         "@stablehlo//:chlo_capi_objects",
         "@stablehlo//:stablehlo_capi_objects",

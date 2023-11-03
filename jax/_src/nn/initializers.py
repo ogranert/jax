@@ -17,8 +17,9 @@ Common neural network layer initializers, consistent with definitions
 used in Keras and Sonnet.
 """
 
+from collections.abc import Sequence
 import math
-from typing import Any, Literal, Protocol, Sequence, Union
+from typing import Any, Literal, Protocol, Union
 
 import numpy as np
 
@@ -27,12 +28,12 @@ from jax import lax
 from jax import random
 from jax._src import core
 from jax._src import dtypes
+from jax._src.typing import Array, ArrayLike
 from jax._src.util import set_module
 
 export = set_module('jax.nn.initializers')
 
-KeyArray = random.KeyArray
-Array = Any
+KeyArray = Array
 # TODO: Import or define these to match
 # https://github.com/numpy/numpy/blob/main/numpy/typing/_dtype_like.py.
 DTypeLikeFloat = Any
@@ -46,7 +47,7 @@ class Initializer(Protocol):
   def __call__(key: KeyArray,
                shape: core.Shape,
                dtype: DTypeLikeInexact = jnp.float_) -> Array:
-    ...
+    raise NotImplementedError
 
 @export
 def zeros(key: KeyArray,
@@ -80,7 +81,7 @@ def ones(key: KeyArray,
   return jnp.ones(shape, dtypes.canonicalize_dtype(dtype))
 
 @export
-def constant(value: Array,
+def constant(value: ArrayLike,
              dtype: DTypeLikeInexact = jnp.float_
              ) -> Initializer:
   """Builds an initializer that returns arrays full of a constant ``value``.
@@ -146,12 +147,49 @@ def normal(stddev: RealNumeric = 1e-2,
   >>> initializer(jax.random.PRNGKey(42), (2, 3), jnp.float32)  # doctest: +SKIP
   Array([[ 3.0613258 ,  5.6129413 ,  5.6866574 ],
          [-4.063663  , -4.4520254 ,  0.63115686]], dtype=float32)
-   """
+  """
   def init(key: KeyArray,
            shape: core.Shape,
            dtype: DTypeLikeInexact = dtype) -> Array:
     dtype = dtypes.canonicalize_dtype(dtype)
     return random.normal(key, shape, dtype) * stddev
+  return init
+
+@export
+def truncated_normal(stddev: RealNumeric = 1e-2,
+                     dtype: DTypeLikeInexact = jnp.float_,
+                     lower: RealNumeric = -2.0,
+                     upper: RealNumeric = 2.0) -> Initializer:
+  r"""Builds an initializer that returns truncated-normal random arrays.
+
+  Args:
+    stddev: optional; the standard deviation of the untruncated distribution.
+      Note that this function does not apply the stddev correction as is done in
+      the variancescaling initializers, and users are expected to apply this
+      correction themselves via the stddev arg if they wish to employ it.
+    dtype: optional; the initializer's default dtype.
+    min_val: Float representing the lower bound for truncation. Applied before
+      the output is multiplied by the stddev.
+    max_val: Float representing the upper bound for truncation. Applied before
+      the output is multiplied by the stddev.
+
+  Returns:
+    An initializer that returns arrays whose values follow the truncated normal
+    distribution with mean ``0`` and standard deviation ``stddev``, and range
+    :math:`\rm{lower * stddev} < x < \rm{upper * stddev}`.
+
+  >>> import jax, jax.numpy as jnp
+  >>> initializer = jax.nn.initializers.truncated_normal(5.0)
+  >>> initializer(jax.random.PRNGKey(42), (2, 3), jnp.float32)  # doctest: +SKIP
+  Array([[ 2.9047365,  5.2338114,  5.29852  ],
+         [-3.836303 , -4.192359 ,  0.6022964]], dtype=float32)
+  """
+
+  def init(key: KeyArray,
+           shape: core.Shape,
+           dtype: DTypeLikeInexact = dtype) -> Array:
+    dtype = dtypes.canonicalize_dtype(dtype)
+    return random.truncated_normal(key, lower, upper, shape, dtype) * stddev
   return init
 
 @export
@@ -201,7 +239,7 @@ def _complex_uniform(key: KeyArray,
   theta = 2 * jnp.pi * random.uniform(key_theta, shape, real_dtype).astype(dtype)
   return r * jnp.exp(1j * theta)
 
-def _complex_truncated_normal(key: KeyArray, upper: Array,
+def _complex_truncated_normal(key: KeyArray, upper: ArrayLike,
                               shape: Union[Sequence[int], core.NamedShape],
                               dtype: DTypeLikeInexact) -> Array:
   """
@@ -480,7 +518,7 @@ def he_uniform(in_axis: Union[int, Sequence[int]] = -2,
   Example:
 
   >>> import jax, jax.numpy as jnp
-  >>> initializer = jax.nn.initializers.kaiming_uniform()
+  >>> initializer = jax.nn.initializers.he_uniform()
   >>> initializer(jax.random.PRNGKey(42), (2, 3), jnp.float32)  # doctest: +SKIP
   Array([[ 0.79611576,  1.2789248 ,  1.2896855 ],
          [-1.0108745 , -1.0855657 ,  0.17398663]], dtype=float32)
@@ -518,7 +556,7 @@ def he_normal(in_axis: Union[int, Sequence[int]] = -2,
   Example:
 
   >>> import jax, jax.numpy as jnp
-  >>> initializer = jax.nn.initializers.kaiming_normal()
+  >>> initializer = jax.nn.initializers.he_normal()
   >>> initializer(jax.random.PRNGKey(42), (2, 3), jnp.float32)  # doctest: +SKIP
   Array([[ 0.6604483 ,  1.1900088 ,  1.2047218 ],
          [-0.87225807, -0.95321447,  0.1369438 ]], dtype=float32)

@@ -5,7 +5,7 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.14.4
+    jupytext_version: 1.15.2
 kernelspec:
   display_name: Python 3
   name: python3
@@ -354,23 +354,23 @@ for most of them. However, XLA includes a `CustomCall` operation that can be use
 ```{code-cell} ipython3
 :id: FYQWSSjKJaWP
 
-from jax._src.lib import xla_client
-@trace("multiply_add_xla_translation")
-def multiply_add_xla_translation(ctx, avals_in, avals_out, xc, yc, zc):
+from jax._src.lib.mlir.dialects import hlo
+@trace("multiply_add_lowering")
+def multiply_add_lowering(ctx, xc, yc, zc):
   """The compilation to XLA of the primitive.
 
-  Given an XlaBuilder and XlaOps for each argument, return the XlaOp for the
-  result of the function.
+  Given an mlir.ir.Value for each argument, return the mlir.ir.Values for
+  the results of the function.
 
   Does not need to be a JAX-traceable function.
   """
-  return [xla_client.ops.Add(xla_client.ops.Mul(xc, yc), zc)]
+  return [hlo.AddOp(hlo.MulOp(xc, yc), zc).result]
 
-# Now we register the XLA compilation rule with JAX
+# Now we register the lowering rule with JAX
 # For GPU see the [Custom operations for GPUs](https://jax.readthedocs.io/en/latest/Custom_Operation_for_GPUs.html)
 # TODO: TPU?
-from jax.interpreters import xla
-xla.register_translation(multiply_add_p, multiply_add_xla_translation, platform='cpu')
+from jax.interpreters import mlir
+mlir.register_lowering(multiply_add_p, multiply_add_lowering, platform='cpu')
 ```
 
 +++ {"id": "K98LX-VaJkFu"}
@@ -453,7 +453,7 @@ def multiply_add_value_and_jvp(arg_values, arg_tangents):
   xt, yt, zt = arg_tangents
   _trace("Primal evaluation:")
   # Now we have a JAX-traceable computation of the output. 
-  # Normally, we can use the ma primtive itself to compute the primal output. 
+  # Normally, we can use the ma primitive itself to compute the primal output. 
   primal_out = multiply_add_prim(x, y, z)
   
   _trace("Tangent evaluation:")

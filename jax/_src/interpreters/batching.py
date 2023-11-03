@@ -13,14 +13,16 @@
 # limitations under the License.
 from __future__ import annotations
 
+import collections
+from collections.abc import Iterable, Sequence
 import dataclasses
 from functools import partial
-from typing import Any, Callable, Iterable, Optional, Sequence, Union
+from typing import Any, Callable, Union
 
 import numpy as np
 
 import jax
-from jax import config
+from jax._src import config
 from jax._src import core
 from jax._src import source_info_util
 from jax._src import linear_util as lu
@@ -31,23 +33,23 @@ from jax._src.core import raise_to_shaped, Trace, Tracer, AxisName
 from jax._src.interpreters import partial_eval as pe
 from jax._src.tree_util import (tree_unflatten, tree_flatten,
                                 register_pytree_node)
+from jax._src.typing import Array
 from jax._src.util import (unzip2, unzip3, safe_map, safe_zip, split_list,
                            canonicalize_axis, moveaxis, as_hashable_function,
                            curry, memoize, weakref_lru_cache)
 
 
-Array = Any
 map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
 
 
-# Piles
+# Jumbles
 
 # i:(Fin 3) => f32[[3, 1, 4].i]
 @dataclasses.dataclass(frozen=True)
-class PileTy:
+class JumbleTy:
   binder: core.Var
-  length: Union[int, Tracer, core.Var]
+  length: int | Tracer | core.Var
   elt_ty: core.DShapedArray
   def __repr__(self) -> str:
     return f'Var{id(self.binder)}:{self.length} => {self.elt_ty}'
@@ -57,46 +59,46 @@ class PileTy:
 @dataclasses.dataclass(frozen=True)
 class IndexedAxisSize:
   idx: core.Var
-  lengths: Union[Array, core.Var, Tracer]
+  lengths: Array | core.Var | Tracer
   def __repr__(self) -> str:
-    return f'{str(self.lengths)}.Var{id(self.idx)}'
+    return f'{self.lengths}.Var{id(self.idx)}'
   replace = dataclasses.replace
 
-# Pile(aval=a:3 => f32[[3 1 4].a],
-#      data=DeviceArray([0., 1., 2., 0., 0., 1., 2., 3.], dtype=float32))
+# Jumble(aval=a:3 => f32[[3 1 4].a],
+#        data=Array([0., 1., 2., 0., 0., 1., 2., 3.], dtype=float32))
 @dataclasses.dataclass(frozen=True)
-class Pile:
-  aval: PileTy
+class Jumble:
+  aval: JumbleTy
   data: Array
 
-# To vmap over a pile, one must specify the axis as PileAxis.
-class PileAxis: pass
-pile_axis = PileAxis()
+# To vmap over a jumble, one must specify the axis as JumbleAxis.
+class JumbleAxis: pass
+jumble_axis = JumbleAxis()
 
 # As a temporary measure before we have more general JITable / ADable interfaces
-# (analogues to vmappable), to enable Piles to be used with other
+# (analogues to vmappable), to enable Jumbles to be used with other
 # transformations and higher-order primitives (primarily jit, though also grad
 # with allow_int=True) we register them as pytrees.
 # TODO(mattjj): add JITable / ADable interfaces, remove this pytree registration
-def _pile_flatten(pile):
+def _jumble_flatten(jumble):
   lengths = []
   new_shape = [lengths.append(d.lengths) or d.replace(lengths=len(lengths))
                if type(d) is IndexedAxisSize else d
-               for d in pile.aval.elt_ty.shape]
-  elt_ty = pile.aval.elt_ty.update(shape=tuple(new_shape))
-  aval = pile.aval.replace(elt_ty=elt_ty)
-  return (lengths, pile.data), aval
-def _pile_unflatten(aval, x):
+               for d in jumble.aval.elt_ty.shape]
+  elt_ty = jumble.aval.elt_ty.update(shape=tuple(new_shape))
+  aval = jumble.aval.replace(elt_ty=elt_ty)
+  return (lengths, jumble.data), aval
+def _jumble_unflatten(aval, x):
   lengths, data = x
   new_shape = [d.replace(lengths=lengths[d.lengths - 1])
                if type(d) is IndexedAxisSize else d
                for d in aval.elt_ty.shape]
   elt_ty = aval.elt_ty.update(shape=tuple(new_shape))
   aval = aval.replace(elt_ty=elt_ty)
-  return Pile(aval, data)
-register_pytree_node(Pile, _pile_flatten, _pile_unflatten)
+  return Jumble(aval, data)
+register_pytree_node(Jumble, _jumble_flatten, _jumble_unflatten)
 
-def _pile_result(axis_size, stacked_axis, ragged_axes, x):
+def _jumble_result(axis_size, stacked_axis, ragged_axes, x):
   binder = core.Var(0, '', core.ShapedArray((), np.dtype('int32')))
   if stacked_axis != 0:
     raise NotImplementedError  # TODO Transpose x so the stacked axis is axis 0
@@ -105,16 +107,16 @@ def _pile_result(axis_size, stacked_axis, ragged_axes, x):
   for ragged_axis, segment_lens in ragged_axes:
     shape[ragged_axis-1] = IndexedAxisSize(binder, segment_lens)
   elt_ty = core.DShapedArray(tuple(shape), x.dtype, x.weak_type)
-  return Pile(PileTy(binder, axis_size, elt_ty), x)
+  return Jumble(JumbleTy(binder, axis_size, elt_ty), x)
 
 
 @dataclasses.dataclass(frozen=True)
 class RaggedAxis:
   stacked_axis: int
   # For each axis, we store its index and the corresponding segment lengths.
-  # For example, the pile i:(Fin 3) => f32[lens1.i, 7, lens2.i]
+  # For example, the jumble i:(Fin 3) => f32[lens1.i, 7, lens2.i]
   # would be represented with ragged_axes = [(1, lens1), (3, lens2)]
-  ragged_axes: list[tuple[int, Array]]
+  ragged_axes: tuple[tuple[int, Any], ...]
 
   @property
   def size(self):
@@ -130,8 +132,8 @@ class RaggedAxis:
       if self.stacked_axis < ax and ax <= dst:
         return ax - 1
       return ax
-    new_ragged_axes = [(move_axis(ax), sizes) for ax, sizes in self.ragged_axes]
-    return RaggedAxis(dst, new_ragged_axes)
+    new_axes = tuple((move_axis(ax), sizes) for ax, sizes in self.ragged_axes)
+    return RaggedAxis(dst, new_axes)
 
 def transpose_ragged_axes(dim: RaggedAxis, perm: tuple[int, ...]) -> RaggedAxis:
   new_ragged_axes = []
@@ -143,11 +145,13 @@ def transpose_ragged_axes(dim: RaggedAxis, perm: tuple[int, ...]) -> RaggedAxis:
   return _sorted_ragged_axis(dim.stacked_axis, new_ragged_axes)
 
 def _sorted_ragged_axis(stacked_axis, ragged_axes):
-  return RaggedAxis(stacked_axis, list(sorted(ragged_axes, key=lambda p: p[0])))
+  return RaggedAxis(stacked_axis, tuple(sorted(ragged_axes, key=lambda p: p[0])))
 
 def make_batch_axis(
-    ndim: int, stacked_axis: int, ragged_axes: list[tuple[int, Array]]
-  ) -> Union[int, RaggedAxis]:
+    ndim: int,
+    stacked_axis: int,
+    ragged_axes: list[tuple[int, Array | core.Var]],
+) -> int | RaggedAxis:
   if ragged_axes:
     canonical = [(canonicalize_axis(ax, ndim), sz) for ax, sz in ragged_axes]
     return _sorted_ragged_axis(canonicalize_axis(stacked_axis, ndim), canonical)
@@ -155,7 +159,7 @@ def make_batch_axis(
     return canonicalize_axis(stacked_axis, ndim)
 
 def bdim_as_shape(
-    bdim: Union[int, RaggedAxis], data_shape: core.Shape) -> core.Shape:
+    bdim: int | RaggedAxis, data_shape: core.Shape) -> core.Shape:
   if isinstance(bdim, RaggedAxis):
     result = list(data_shape)
     binder = core.Var(0, '', core.ShapedArray((), np.dtype('int32')))
@@ -166,7 +170,7 @@ def bdim_as_shape(
     return data_shape
 
 def shape_as_bdim(
-    stacked_axis: int, data_shape: core.Shape) -> Union[int, RaggedAxis]:
+    stacked_axis: int, data_shape: core.Shape) -> int | RaggedAxis:
   # This assumes that there is only one binder in the data_shape.
   ragged_axes = [(i, size.lengths) for i, size in enumerate(data_shape)
                  if isinstance(size, IndexedAxisSize)]
@@ -174,9 +178,9 @@ def shape_as_bdim(
 
 
 def _update_annotation(
-    f: lu.WrappedFun, orig_type: Optional[core.InputType],
+    f: lu.WrappedFun, orig_type: core.InputType | None,
     axis_size: core.AxisSize, axis_name: AxisName,
-    explicit_in_dims: Sequence[Optional[Union[int, RaggedAxis]]],
+    explicit_in_dims: Sequence[int | RaggedAxis | None],
     segment_lens: Sequence[Array],
   ) -> lu.WrappedFun:
   if orig_type is None: return f
@@ -233,9 +237,9 @@ def to_elt(trace: Trace, get_idx: GetIdx, x: Vmappable, spec: MapSpec) -> Elt:
   handler = to_elt_handlers.get(type(x))
   if handler:
     return handler(partial(to_elt, trace, get_idx), get_idx, x, spec)
-  elif type(x) is Pile:
-    if spec is not pile_axis:
-      raise TypeError("pile input without using pile_axis in_axes spec")
+  elif type(x) is Jumble:
+    if spec is not jumble_axis:
+      raise TypeError("jumble input without using jumble_axis in_axes spec")
     ias: IndexedAxisSize  # Not present in the AxisSize union in core.py
     (d, ias), = ((i, sz)  # type: ignore
                  for i, sz in enumerate(x.aval.elt_ty.shape)
@@ -250,7 +254,7 @@ def to_elt(trace: Trace, get_idx: GetIdx, x: Vmappable, spec: MapSpec) -> Elt:
     assert False
 to_elt_handlers: dict[type, ToEltHandler] = {}
 
-def from_elt(trace: 'BatchTrace', axis_size: AxisSize, x: Elt, spec: MapSpec
+def from_elt(trace: BatchTrace, axis_size: AxisSize, x: Elt, spec: MapSpec
              ) -> Vmappable:
   handler = from_elt_handlers.get(type(x))
   if handler:
@@ -258,10 +262,10 @@ def from_elt(trace: 'BatchTrace', axis_size: AxisSize, x: Elt, spec: MapSpec
   x_ = trace.full_raise(x)
   val, bdim = x_.val, x_.batch_dim
   if type(bdim) is RaggedAxis:
-    if spec is not pile_axis:
+    if spec is not jumble_axis:
       # TODO(mattjj): improve this error message
-      raise TypeError("ragged output without using pile_axis out_axes spec")
-    return _pile_result(axis_size, bdim.stacked_axis, bdim.ragged_axes, val)
+      raise TypeError("ragged output without using jumble_axis out_axes spec")
+    return _jumble_result(axis_size, bdim.stacked_axis, bdim.ragged_axes, val)
   else:
     return matchaxis(trace.axis_name, axis_size, x_.batch_dim, spec, x_.val)
 from_elt_handlers: dict[type, FromEltHandler] = {}
@@ -276,14 +280,14 @@ make_iota_handlers: dict[type, MakeIotaHandler] = {}
 
 def register_vmappable(data_type: type, spec_type: type, axis_size_type: type,
                        to_elt: Callable, from_elt: Callable,
-                       make_iota: Optional[Callable]):
+                       make_iota: Callable | None):
   vmappables[data_type] = (spec_type, axis_size_type)
   spec_types.add(spec_type)
   to_elt_handlers[data_type] = to_elt
   from_elt_handlers[data_type] = from_elt
   if make_iota: make_iota_handlers[axis_size_type] = make_iota
 vmappables: dict[type, tuple[type, type]] = {}
-spec_types: set[type] = {PileAxis}
+spec_types: set[type] = {JumbleAxis}
 
 def unregister_vmappable(data_type: type) -> None:
   spec_type, axis_size_type = vmappables.pop(data_type)
@@ -294,7 +298,7 @@ def unregister_vmappable(data_type: type) -> None:
     del make_iota_handlers[axis_size_type]
 
 def is_vmappable(x: Any) -> bool:
-  return type(x) is Pile or type(x) in vmappables
+  return type(x) is Jumble or type(x) in vmappables
 
 @lu.transformation_with_aux
 def flatten_fun_for_vmap(in_tree, *args_flat):
@@ -312,9 +316,9 @@ not_mapped = None
 class BatchTracer(Tracer):
   __slots__ = ['val', 'batch_dim', 'source_info']
 
-  def __init__(self, trace, val, batch_dim: Union[NotMapped, int, RaggedAxis],
-               source_info: Optional[source_info_util.SourceInfo] = None):
-    if config.jax_enable_checks:
+  def __init__(self, trace, val, batch_dim: NotMapped | int | RaggedAxis,
+               source_info: source_info_util.SourceInfo | None = None):
+    if config.enable_checks.value:
       assert type(batch_dim) in (NotMapped, int, RaggedAxis)
       if type(batch_dim) is int:
         aval = raise_to_shaped(core.get_aval(val))
@@ -404,7 +408,7 @@ class BatchTrace(Trace):
     else:
       axis_size = None  # can't be inferred from data
     if self.axis_name is core.no_axis_name:
-      assert axis_size is not None  # must be inferrable from data
+      assert axis_size is not None  # must be inferable from data
       return core.AxisEnvFrame(self.axis_name, axis_size, self.main)
     frame = core.axis_frame(self.axis_name, self.main)
     assert axis_size is None or axis_size == frame.size, (axis_size, frame.size)
@@ -412,7 +416,7 @@ class BatchTrace(Trace):
     return frame
 
   def process_primitive(self, primitive, tracers, params):
-    if config.jax_dynamic_shapes:
+    if config.dynamic_shapes.value:
       primitive.abstract_eval(*(t.aval for t in tracers), **params)
     vals_in, dims_in = unzip2((t.val, t.batch_dim) for t in tracers)
     is_axis_primitive = primitive in axis_primitive_batchers
@@ -442,11 +446,14 @@ class BatchTrace(Trace):
     sizes = (x.shape[d] if type(d) is int else len(d.segment_lengths)
              for x, d in zip(vals, dims) if d is not not_mapped)
     axis_size, = core.dedup_referents(sizes)
+    segment_lens, dims = indirectify_ragged_axes(dims)
     f_, dims_out = batch_subtrace(f, self.main, tuple(dims))
-    f_ = _update_annotation(f_, f.in_type, axis_size, self.axis_name, dims, [])
-    vals_out = call_primitive.bind(f_, *vals, **params)
+    f_ = _update_annotation(
+        f_, f.in_type, axis_size, self.axis_name, dims, segment_lens)
+    vals_out = call_primitive.bind(f_, *segment_lens, *vals, **params)
+    vals_out, dims_out = resolve_ragged_axes(vals_out, dims_out())
     src = source_info_util.current()
-    return [BatchTracer(self, v, d, src) for v, d in zip(vals_out, dims_out())]
+    return [BatchTracer(self, v, d, src) for v, d in zip(vals_out, dims_out)]
 
   def post_process_call(self, call_primitive, out_tracers, params):
     vals, dims, srcs = unzip3((t.val, t.batch_dim, t.source_info)
@@ -601,7 +608,7 @@ def _main_trace_for_axis_names(main_trace: core.MainTrace,
 
 def batch(fun: lu.WrappedFun, axis_name: AxisName, axis_size,
           in_dims, out_dim_dests, main_type: type[BatchTrace] = BatchTrace,
-          spmd_axis_name: Optional[tuple[AxisName, ...]] = None
+          spmd_axis_name: tuple[AxisName, ...] | None = None
           ) -> lu.WrappedFun:
   # we split up _batch_inner and _batch_outer for the leak checker
   f = _batch_inner(fun, axis_size, out_dim_dests)
@@ -633,20 +640,20 @@ def _batch_inner(axis_size, out_dim_dests, main, in_dims, *in_vals):
 
 # NOTE: This divides the in_axes by the tile_size and multiplies the out_axes by it.
 def vtile(f_flat: lu.WrappedFun,
-          in_axes_flat: tuple[Optional[int], ...],
-          out_axes_flat: tuple[Optional[int], ...],
-          tile_size: Optional[int],
+          in_axes_flat: tuple[int | None, ...],
+          out_axes_flat: tuple[int | None, ...],
+          tile_size: int | None,
           axis_name: AxisName,
           main_type: type[BatchTrace] = BatchTrace):
   @curry
-  def tile_axis(arg, axis: Optional[int], tile_size):
+  def tile_axis(arg, axis: int | None, tile_size):
     if axis is None:
       return arg
     shape = list(arg.shape)
     shape[axis:axis+1] = [tile_size, shape[axis] // tile_size]
     return arg.reshape(shape)
 
-  def untile_axis(out, axis: Optional[int]):
+  def untile_axis(out, axis: int | None):
     if axis is None:
       return out
     shape = list(out.shape)
@@ -670,43 +677,128 @@ def vtile(f_flat: lu.WrappedFun,
 def batch_subtrace(main, in_dims, *in_vals):
   trace = main.with_cur_sublevel()
   in_dims = in_dims() if callable(in_dims) else in_dims
+  in_vals, in_dims = resolve_ragged_axes(in_vals, in_dims)
   in_tracers = [BatchTracer(trace, x, dim, source_info_util.current())
                 if dim is not None else x for x, dim in zip(in_vals, in_dims)]
   outs = yield in_tracers, {}
   out_tracers = map(trace.full_raise, outs)
   out_vals, out_dims = unzip2((t.val, t.batch_dim) for t in out_tracers)
-  yield out_vals, out_dims
+  segment_lens, out_dims = indirectify_ragged_axes(out_dims)
+  yield (*segment_lens, *out_vals), out_dims
 
+def indirectify_ragged_axes(dims):
+  if not any(type(d) is RaggedAxis for d in dims):
+    return [], dims
+  axis_map : dict[int, tuple[Array, pe.DBIdx]] = collections.OrderedDict()
+  def canonicalize_segment_lengths(d: RaggedAxis) -> RaggedAxis:
+    new_ragged_axes = []
+    for ragged_axis, segment_lengths in d.ragged_axes:
+      _, dbidx = axis_map.setdefault(
+          id(core.get_referent(segment_lengths)),
+          (segment_lengths, pe.DBIdx(len(axis_map))))
+      new_ragged_axes.append((ragged_axis, dbidx))
+    return RaggedAxis(d.stacked_axis, tuple(new_ragged_axes))
+  new_dims = [canonicalize_segment_lengths(d)
+              if isinstance(d, RaggedAxis) else d for d in dims]
+  segment_lens = [s for s, _ in axis_map.values()]
+  return segment_lens, new_dims
+
+def indirectify_ragged_axes_against_inputs_outputs(dims, in_vals, out_vals):
+  def canonicalize_segment_lengths(d: RaggedAxis) -> RaggedAxis:
+    new_ragged_axes = []
+    for ragged_axis, segment_lengths in d.ragged_axes:
+      key = id(core.get_referent(segment_lengths))
+      value = _locate_value(key, in_vals, out_vals)
+      new_ragged_axes.append((ragged_axis, value))
+    return RaggedAxis(d.stacked_axis, tuple(new_ragged_axes))
+  new_dims = [canonicalize_segment_lengths(d)
+              if isinstance(d, RaggedAxis) else d for d in dims]
+  return new_dims
+
+def _locate_value(key, in_vals, out_vals):
+  for ix, candidate in enumerate(in_vals):
+    if key == id(candidate):
+      return pe.InDBIdx(ix)
+  for ix, candidate in enumerate(out_vals):
+    if key == id(candidate):
+      return pe.OutDBIdx(ix)
+  assert False, "Could not find segment lengths"
+
+def resolve_ragged_axes(vals, dims):
+  idxs = {lengths_idx.val for d in dims if isinstance(d, RaggedAxis)
+          for (_, lengths_idx) in d.ragged_axes}
+  dims = [RaggedAxis(d.stacked_axis,
+                     tuple((ragged_axis, vals[lengths_idx.val])
+                           for ragged_axis, lengths_idx in d.ragged_axes))
+          if isinstance(d, RaggedAxis) else d for d in dims]
+  vals = [x for i, x in enumerate(vals) if i not in idxs]
+  return vals, dims
+
+def resolve_ragged_axes_against_inputs_outputs(in_vals, out_vals, dims):
+  def fetch(idx):
+    if isinstance(idx, pe.InDBIdx):
+      return in_vals[idx.val]
+    else:
+      assert isinstance(idx, pe.OutDBIdx)
+      return out_vals[idx.val]
+
+  dims = [RaggedAxis(d.stacked_axis,
+                     tuple((ragged_axis, fetch(lengths_idx))
+                           for ragged_axis, lengths_idx in d.ragged_axes))
+          if isinstance(d, RaggedAxis) else d for d in dims]
+  return dims
 
 ### API for batching jaxprs
 
-def batch_jaxpr2(closed_jaxpr: core.ClosedJaxpr,
-                 axis_size: core.AxisSize,
-                 in_axes: tuple[Union[int, NotMapped], ...],
-                 axis_name: AxisName,
-                 spmd_axis_name: AxisName,
-                 main_type: type[BatchTrace],
-                 ) -> tuple[core.ClosedJaxpr, tuple[Union[int, NotMapped], ...]]:
+# TODO(axch): parameterize RaggedAxis annotations by a type parameter so as to
+# indicate whether we're dealing with instances that contain Arrays or DBIdx.
+# Can reuse same pattern for all dynamic shape stuff.
+def batch_jaxpr2(
+    closed_jaxpr: core.ClosedJaxpr,
+    axis_size: core.AxisSize,
+    in_axes: tuple[int | NotMapped | RaggedAxis, ...],
+    axis_name: AxisName,
+    spmd_axis_name: AxisName,
+    main_type: type[BatchTrace],
+  ) -> tuple[core.ClosedJaxpr, tuple[int | NotMapped | RaggedAxis, ...]]:
+  # This is only ever used in pjit.  The difference vs batch_jaxpr is that
+  # batch_jaxpr2 lets the callee decide which outputs are batched and what
+  # their batch axes are; whereas batch_jaxpr has to obey caller-imposed
+  # consistency constraints, such as type-agreement across arms of a
+  # `lax.cond`, or input-output agreement for the body of a `lax.scan`.
   return _batch_jaxpr2(closed_jaxpr, axis_size, tuple(in_axes), axis_name,
                        spmd_axis_name, main_type)
 
 @weakref_lru_cache
-def _batch_jaxpr2(closed_jaxpr: core.ClosedJaxpr,
-                 axis_size: core.AxisSize,
-                 in_axes: tuple[Union[int, NotMapped], ...],
-                 axis_name: AxisName,
-                 spmd_axis_name: AxisName,
-                 main_type: type[BatchTrace],
-                 ) -> tuple[core.ClosedJaxpr, tuple[Union[int, NotMapped], ...]]:
+def _batch_jaxpr2(
+    closed_jaxpr: core.ClosedJaxpr,
+    axis_size: core.AxisSize,
+    in_axes: tuple[int | NotMapped | RaggedAxis, ...],
+    axis_name: AxisName,
+    spmd_axis_name: AxisName,
+    main_type: type[BatchTrace],
+  ) -> tuple[core.ClosedJaxpr, tuple[int | NotMapped, ...]]:
   f = lu.wrap_init(core.jaxpr_as_fun(closed_jaxpr))
   f, out_axes = _batch_jaxpr_inner(f, axis_size)
   f = _batch_jaxpr_outer(f, axis_name, spmd_axis_name, axis_size, in_axes,
                          main_type)
-  avals_in = [core.unmapped_aval(axis_size, axis_name, b, aval)
-              if b is not not_mapped else aval
-              for aval, b in unsafe_zip(closed_jaxpr.in_avals, in_axes)]
-  jaxpr_out, _, consts = pe.trace_to_jaxpr_dynamic(f, avals_in)
+  in_axes2, avals_in = unzip2([
+      handle_ragged(closed_jaxpr.in_avals, dim, aval)
+      if isinstance(dim, RaggedAxis) else (dim, aval)
+      for dim, aval in zip(in_axes, closed_jaxpr.in_avals)])
+  avals_in2 = [core.unmapped_aval(axis_size, axis_name, b, aval)
+               if b is not not_mapped else aval
+               for aval, b in unsafe_zip(avals_in, in_axes2)]
+  jaxpr_out, _, consts = pe.trace_to_jaxpr_dynamic(f, avals_in2)
   return core.ClosedJaxpr(jaxpr_out, consts), out_axes()
+
+def handle_ragged(in_avals: list[core.AbstractValue], dim: RaggedAxis,
+                  aval: core.ShapedArray) -> tuple[int, core.ShapedArray]:
+  new_shape = list(aval.shape)
+  for i, dbi in dim.ragged_axes:
+    new_shape[i - (dim.stacked_axis < i)] = in_avals[dbi.val].dtype.bound
+  new_aval = aval.update(shape=tuple(new_shape))
+  return dim.stacked_axis, new_aval
 
 def batch_jaxpr(closed_jaxpr, axis_size, in_batched, instantiate, axis_name,
                 spmd_axis_name, main_type):
@@ -748,12 +840,15 @@ def _batch_jaxpr_axes(closed_jaxpr, axis_size, in_axes, out_axes_dest,
 @lu.transformation_with_aux
 def _batch_jaxpr_inner(axis_size, main, in_axes, *in_vals):
   trace = main.with_cur_sublevel()
+  _, in_axes = resolve_ragged_axes(in_vals, in_axes)
   in_tracers = [BatchTracer(trace, val, dim) if dim is not None else val
                 for val, dim in zip(in_vals, in_axes)]
   outs = yield in_tracers, {}
   out_tracers = map(trace.full_raise, outs)
   out_vals, out_axes = unzip2((t.val, t.batch_dim) for t in out_tracers)
-  yield out_vals, out_axes
+  new_out_axes = indirectify_ragged_axes_against_inputs_outputs(
+      out_axes, in_vals, out_vals)
+  yield out_vals, new_out_axes
 
 @lu.transformation_with_aux
 def _match_axes_jaxpr(axis_size, out_axes_dest, out_axes, main, in_axes,
@@ -949,28 +1044,30 @@ def reducer_batcher(prim, ident, batched_args, batch_dims, axes, **params):
       else:
         ragged_axes_out.append((out_axis(axes, ragged_axis), segment_lengths))
     operand = mask_ragged_axes(
-        operand, ident, RaggedAxis(bdim.stacked_axis, axes_to_mask))
+        operand, ident, RaggedAxis(bdim.stacked_axis, tuple(axes_to_mask)))
     result = prim.bind(operand, axes=axes, **params)
     return result, make_batch_axis(operand.ndim, bdim_out, ragged_axes_out)
   else:
     assert False
 
-def mask_ragged_axes(operand, ident, axis_spec):
+def mask_ragged_axes(operand: Array, ident, axis_spec: RaggedAxis) -> Array:
   # TODO(mattjj, axch) Can we mask multiple axes more efficiently at
   # once, rather than one at a time?
   for ragged_axis, segment_lengths in axis_spec.ragged_axes:
     this_axis_spec = RaggedAxis(
-        axis_spec.stacked_axis, [(ragged_axis, segment_lengths)])
+        axis_spec.stacked_axis, ((ragged_axis, segment_lengths),))
     operand = _mask_one_ragged_axis(operand, ident, this_axis_spec)
   return operand
 
-def _mask_one_ragged_axis(operand, ident, axis_spec):
+def _mask_one_ragged_axis(
+    operand: Array, ident, axis_spec: RaggedAxis) -> Array:
   assert len(axis_spec.ragged_axes) == 1, "Mask just one ragged axis at a time"
   ragged_axis, segment_lengths = axis_spec.ragged_axes[0]
   value = ident(operand.dtype)
   positions = jax.lax.broadcasted_iota('int32', operand.shape, ragged_axis)
-  # TODO(mattjj, axch) cant get ._data, need to convert it
-  lengths = jax.lax.convert_element_type(segment_lengths._data, 'int32')
+  # TODO(mattjj, axch) can't get ._data, need to convert it
+  # lengths = jax.lax.convert_element_type(segment_lengths._data, 'int32')
+  lengths = jax.lax.convert_element_type(segment_lengths, 'int32')
   limits = jax.lax.broadcast_in_dim(
       lengths, operand.shape, [axis_spec.stacked_axis])
   mask = positions < limits
@@ -984,7 +1081,7 @@ def move_stacked_axis(operand, bdim, dst):
     result = moveaxis(operand, bdim.stacked_axis, dst)
     return result, bdim.move_stacked_axis(dst)
   else:
-    raise TypeError("Unrecognized batch dimension type {}".format(bdim))
+    raise TypeError(f"Unrecognized batch dimension type {bdim}")
 
 ### general utilities for manipulating axes on jaxpr types (not vmappables)
 
@@ -995,16 +1092,16 @@ def broadcast(x, sz, axis):
   return jax.lax.broadcast_in_dim(x, shape, broadcast_dims)
 
 def matchaxis(axis_name, sz, src, dst, x, sum_match=False):
-  if dst == pile_axis:
+  if dst == jumble_axis:
     x = bdim_at_front(x, src, sz)
     elt_ty = x.aval.update(shape=x.shape[1:])
-    aval = PileTy(core.Var(0, '', core.ShapedArray((), np.dtype('int32'))),
-                  x.shape[0], elt_ty)
-    return Pile(aval, x)
+    aval = JumbleTy(core.Var(0, '', core.ShapedArray((), np.dtype('int32'))),
+                    x.shape[0], elt_ty)
+    return Jumble(aval, x)
   try:
     _ = core.get_aval(x)
   except TypeError as e:
-    raise TypeError(f"Output from batched function {repr(x)} with type "
+    raise TypeError(f"Output from batched function {x!r} with type "
                     f"{type(x)} is not a valid JAX type") from e
   if src == dst:
     return x

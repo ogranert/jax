@@ -15,15 +15,14 @@
 from __future__ import annotations
 
 import collections
+from collections import OrderedDict
+from collections.abc import Mapping, Sequence
 import dataclasses
 import enum
 import functools
 import itertools
 import math
-import operator as op
-import sys
-from typing import (Any, Mapping, Optional, OrderedDict, NamedTuple, Sequence,
-                    Union, cast)
+from typing import Any, NamedTuple, Union, cast, Optional
 
 from jax._src import mesh as mesh_lib
 from jax._src.op_shardings import (
@@ -41,11 +40,6 @@ from jax._src.partition_spec import PartitionSpec
 
 import numpy as np
 
-if sys.version_info >= (3, 9):
-  OrderedDictType = OrderedDict
-else:
-  OrderedDictType = dict
-
 
 Shape = tuple[int, ...]
 Device = xc.Device
@@ -53,14 +47,51 @@ Index = tuple[slice, ...]
 XLADeviceAssignment = tuple[Device, ...]
 
 
+@dataclasses.dataclass(frozen=True)
+class TransferToMemoryKind:
+  memory_kind: str
+
+
+@functools.lru_cache(maxsize=4096)
+def common_devices_indices_map(s, global_shape: Shape) -> Mapping[Device, Index]:
+  hlo_sharding = s._to_xla_hlo_sharding(len(global_shape))
+  gspmd_sharding = GSPMDSharding(s._device_assignment, hlo_sharding)
+  return gspmd_sharding.devices_indices_map(global_shape)
+
+
+@functools.lru_cache(maxsize=4096)
+def _common_shard_shape(self, global_shape: Shape) -> Shape:
+  hlo_sharding = self._to_xla_hlo_sharding(len(global_shape))
+  if is_op_sharding_replicated(hlo_sharding):
+    return global_shape
+  partitions, _ = get_num_ways_dim_sharded(hlo_sharding)
+  assert len(partitions) == len(global_shape), (len(partitions), len(global_shape))
+  out = []
+  for dim, (s, p) in enumerate(safe_zip(global_shape, partitions)):
+    try:
+      quotient, remainder = divmod(s, p)
+    except TypeError:
+      # TODO Figure out how to partition dynamic shapes
+      raise NotImplementedError
+    if remainder != 0:
+      raise ValueError(
+          f"Sharding {self} implies that array axis {dim} is partitioned "
+          f"{p} times, but the dimension size is {s} "
+          f"(full shape: {global_shape}, "
+          f"per-dimension tiling factors: {partitions} should evenly divide "
+          "the shape)")
+    out.append(quotient)
+  return tuple(out)
+
+
 # Shardings that inherit from XLACompatibleSharding should implement the
 # `_device_assignment` property and `_to_xla_hlo_sharding` method.
 @use_cpp_class(xc.XLACompatibleSharding)
 class XLACompatibleSharding(sharding.Sharding):
-  """A `Sharding` that describes shardings expressible to XLA.
+  """A :class:`Sharding` that describes shardings expressible to XLA.
 
-  Any ``Sharding`` that is a subclass of ``XLACompatibleSharding`` will work
-  with all JAX APIs and transformations that use XLA.
+  Subclasses of :class:`XLACompatibleSharding` work with
+  all JAX APIs and transformations that use XLA.
   """
 
   # Abstract methods below that subclasses should implement.
@@ -75,43 +106,24 @@ class XLACompatibleSharding(sharding.Sharding):
   #############################################################################
   # Default implementations below that all subclasses will inherit.
 
-  @functools.lru_cache(maxsize=4096)
   def devices_indices_map(self, global_shape: Shape) -> Mapping[Device, Index]:
-    hlo_sharding = self._to_xla_hlo_sharding(len(global_shape))
-    gspmd_sharding = GSPMDSharding(self._device_assignment, hlo_sharding)
-    return gspmd_sharding.devices_indices_map(global_shape)
+    return common_devices_indices_map(self, global_shape)
 
   @functools.cached_property
   def _addressable_device_assignment(self) -> XLADeviceAssignment:
     return tuple(d for d in self._device_assignment
                  if d.process_index == d.client.process_index())
 
-  @functools.lru_cache(maxsize=4096)
   def shard_shape(self, global_shape: Shape) -> Shape:
-    hlo_sharding = self._to_xla_hlo_sharding(len(global_shape))
-    if is_op_sharding_replicated(hlo_sharding):
-      return global_shape
-    partitions, _ = get_num_ways_dim_sharded(hlo_sharding)
-    assert len(partitions) == len(global_shape), (len(partitions), len(global_shape))
-    out = []
-    for dim, (s, p) in enumerate(safe_zip(global_shape, partitions)):
-      quotient, remainder = divmod(s, p)
-      if remainder != 0:
-        raise ValueError(
-            f"Sharding {self} implies that array axis {dim} is partitioned "
-            f"{p} times, but the dimension size is {s} "
-            f"(full shape: {global_shape}, "
-            f"per-dimension tiling factors: {partitions} should evenly divide "
-            "the shape)")
-      out.append(quotient)
-    return tuple(out)
+    return _common_shard_shape(self, global_shape)
 
   def is_equivalent_to(self: XLACompatibleSharding,  # type: ignore
                        other: XLACompatibleSharding, ndim: int) -> bool:
     try:
       return (are_op_shardings_equal(self._to_xla_hlo_sharding(ndim),
-                                     other._to_xla_hlo_sharding(ndim))
-              and self._device_assignment == other._device_assignment)
+                                      other._to_xla_hlo_sharding(ndim))
+              and self._device_assignment == other._device_assignment and
+              self.memory_kind == other.memory_kind)
     # NotImplementedError is raised by PmapSharding because it can't lower
     # to OpSharding. So if `other` is a PmapSharding, default to a strict
     # equality check.
@@ -119,7 +131,7 @@ class XLACompatibleSharding(sharding.Sharding):
       return self == other
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def _check_mesh_resource_axis(mesh, parsed_pspec):
   try:
     [mesh.shape[r] for p in parsed_pspec if p is not None
@@ -156,31 +168,40 @@ def device_replica_id_map(sharding, global_shape: Shape) -> Mapping[Device, int]
   return out
 
 
+@functools.lru_cache(maxsize=4096)
+def named_sharding_to_xla_hlo_sharding(
+    self, num_dimensions: int) -> xc.HloSharding:
+  sharding_spec, special_axes = self._get_sharding_spec(
+      num_dimensions, self._manual_axes)
+  return sharding_spec.sharding_proto(special_axes=special_axes)
+
+
 @use_cpp_class(xc.NamedSharding)
 class NamedSharding(XLACompatibleSharding):
-  r"""NamedSharding is a way to express ``Sharding``\s using named axes.
+  r"""A :class:`NamedSharding` expresses sharding using named axes.
 
-  ``Mesh`` and ``PartitionSpec`` can be used to express a ``Sharding`` with a name.
+  A :class:`NamedSharding` is a pair of a :class:`Mesh` of devices and
+  :class:`PartitionSpec` which describes how to shard an array across that
+  mesh.
 
-  ``Mesh`` is a NumPy array of JAX devices in a multi-dimensional grid,
-  where each axis of the mesh has a name, e.g. 'x' or 'y'. Another name for
-  ``Mesh`` is "logical mesh".
+  A :class:`Mesh` is a multidimensional NumPy array of JAX devices,
+  where each axis of the mesh has a name, e.g. ``'x'`` or ``'y'``.
 
-  ``PartitionSpec`` is a tuple, whose elements can be a ``None``,
-  a mesh axis or a tuple of mesh axes. Each element describes how an input
+  A :class:`PartitionSpec` is a tuple, whose elements can be a ``None``,
+  a mesh axis, or a tuple of mesh axes. Each element describes how an input
   dimension is partitioned across zero or more mesh dimensions. For example,
-  PartitionSpec('x', 'y') is a PartitionSpec where the first dimension of data
+  ``PartitionSpec('x', 'y')`` says that the first dimension of data
   is sharded across ``x`` axis of the mesh, and the second dimension is sharded
   across ``y`` axis of the mesh.
 
   The Distributed arrays and automatic parallelization
   (https://jax.readthedocs.io/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html#namedsharding-gives-a-way-to-express-shardings-with-names)
-  goes into more details and has diagrams to help explain the concept about
-  ``Mesh`` and ``PartitionSpec``.
+  tutorial has more details and diagrams that explain how
+  :class:`Mesh` and :class:`PartitionSpec` are used.
 
   Args:
-    mesh: A ``jax.sharding.Mesh`` object.
-    spec: A ``jax.sharding.PartitionSpec`` object.
+    mesh: A :class:`jax.sharding.Mesh` object.
+    spec: A :class:`jax.sharding.PartitionSpec` object.
 
   Example:
 
@@ -193,19 +214,23 @@ class NamedSharding(XLACompatibleSharding):
 
   mesh: mesh_lib.Mesh
   spec: PartitionSpec
+  _memory_kind: str | None
   _parsed_pspec: ParsedPartitionSpec
+  _manual_axes: frozenset[MeshAxisName]
+  if xla_extension_version < 188:
+    _manual_axes = frozenset()
 
   @use_cpp_method()
   def __init__(
-      self, mesh: mesh_lib.Mesh, spec: PartitionSpec, _parsed_pspec = None):
-
+      self, mesh: mesh_lib.Mesh, spec: PartitionSpec, *,
+      memory_kind: str | None = None, _parsed_pspec=None,
+      _manual_axes=frozenset()):
     self.mesh = mesh
     self.spec = spec
+    self._memory_kind = memory_kind
     self._parsed_pspec = _parsed_pspec
+    self._manual_axes = _manual_axes
     self._preprocess()
-
-  def __reduce__(self):
-    return type(self), (self.mesh, self.spec)
 
   def _preprocess(self):
     # This split exists because you can pass `_parsed_pspec` that has been
@@ -223,11 +248,24 @@ class NamedSharding(XLACompatibleSharding):
     _check_mesh_resource_axis(self.mesh, self._parsed_pspec)
 
   def __repr__(self):
-    return f'NamedSharding(mesh={dict(self.mesh.shape)}, spec={self.spec})'
+    mesh_repr = ", ".join(f"'{k}': {v}" for k, v in self.mesh.shape.items())
+    mem = '' if self.memory_kind is None else f', memory_kind={self.memory_kind}'
+    return f'NamedSharding(mesh=Mesh({mesh_repr}), spec={self.spec}{mem})'
+
+  def __reduce__(self):
+    return (type(self), (self.mesh, self.spec),
+            {'memory_kind': self.memory_kind,
+             '_manual_axes': self._manual_axes})
+
+  if xla_extension_version >= 178:
+    @property
+    def memory_kind(self) -> str | None:
+      return self._memory_kind
 
   def __hash__(self):
     if not hasattr(self, '_hash'):
-      self._hash = hash((self.mesh, self._parsed_pspec))
+      self._hash = hash(
+          (self.mesh, self.memory_kind, self._parsed_pspec, self._manual_axes))
     return self._hash
 
   def __eq__(self, other):
@@ -235,10 +273,11 @@ class NamedSharding(XLACompatibleSharding):
       return False
     if id(self) == id(other):
       return True
-    parsed_pspec_equal = self._parsed_pspec == other._parsed_pspec
-    if id(self.mesh) == id(other.mesh) and parsed_pspec_equal:
-      return True
-    return self.mesh == other.mesh and parsed_pspec_equal
+    if (self._parsed_pspec != other._parsed_pspec
+        or self.memory_kind != other.memory_kind
+        or self._manual_axes != other._manual_axes):
+      return False
+    return id(self.mesh) == id(other.mesh) or self.mesh == other.mesh
 
   def is_compatible_aval(self, aval_shape: Shape):
     assert self._parsed_pspec is not None
@@ -251,8 +290,16 @@ class NamedSharding(XLACompatibleSharding):
           f"{len(aval_shape)}.{extra_msg}")
 
   @classmethod
-  def _from_parsed_pspec(cls, mesh, parsed_pspec):
-    return cls(mesh, parsed_pspec.get_partition_spec(), parsed_pspec)
+  def _from_parsed_pspec(
+      cls, mesh, parsed_pspec, *, memory_kind=None, _manual_axes=frozenset()
+  ):
+    if xla_extension_version >= 188:
+      return cls(mesh, parsed_pspec.get_partition_spec(),
+                 memory_kind=memory_kind, _parsed_pspec=parsed_pspec,
+                 _manual_axes=_manual_axes)
+    else:
+      return cls(mesh, parsed_pspec.get_partition_spec(),
+                 memory_kind=memory_kind, _parsed_pspec=parsed_pspec)
 
   @property
   def device_set(self) -> set[Device]:
@@ -285,7 +332,10 @@ class NamedSharding(XLACompatibleSharding):
       num_partitions *= mesh_shape[name]
     return num_partitions == 1
 
-  def _get_sharding_spec(self, num_dimensions, axis_ctx):
+  def with_memory_kind(self, kind: str) -> NamedSharding:
+    return NamedSharding(self.mesh, self.spec, memory_kind=kind)
+
+  def _get_sharding_spec(self, num_dimensions, manual_axes):
     assert self._parsed_pspec is not None
     array_mapping = get_array_mapping(self._parsed_pspec)
     # TODO(yashkatariya): Move away from sharding spec in NamedSharding
@@ -294,32 +344,36 @@ class NamedSharding(XLACompatibleSharding):
         self.mesh.shape, self.mesh.axis_names)(num_dimensions, array_mapping)
     # Used in `with_sharding_constraint`.
     special_axes = {}
-    # Manual axes is only used with xmap.
-    if axis_ctx is not None and isinstance(axis_ctx, SPMDAxisContext):
+    if manual_axes:
       axis_names = self.mesh.axis_names
-      # Ignore type because mypy doesn't recognize the `hasattr` check above.
-      for manual_axis in axis_ctx.manual_axes:  # type: ignore
+      for manual_axis in manual_axes:
         special_axes[axis_names.index(manual_axis)] = xc.OpSharding.Type.MANUAL
     return sharding_spec, special_axes
 
-  @functools.lru_cache(maxsize=4096)
-  def _to_xla_hlo_sharding(
-      self, num_dimensions: int,
-      axis_ctx: Optional[Union[SPMDAxisContext, ShardingContext]] = None
-  ) -> xc.HloSharding:
-    sharding_spec, special_axes = self._get_sharding_spec(
-        num_dimensions, axis_ctx)
-    return sharding_spec.sharding_proto(special_axes=special_axes)
+  if xla_extension_version >= 188:
+    def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
+      return named_sharding_to_xla_hlo_sharding(self, num_dimensions)
+  else:
+    def _to_xla_hlo_sharding(  # type: ignore
+        self, num_dimensions: int,
+        axis_ctx: SPMDAxisContext | ShardingContext | None = None
+    ) -> xc.HloSharding:
+      manual_axes = None
+      if axis_ctx is not None and isinstance(axis_ctx, SPMDAxisContext):
+        manual_axes = axis_ctx.manual_axes  # type: ignore
+      sharding_spec, special_axes = self._get_sharding_spec(
+          num_dimensions, manual_axes)
+      return sharding_spec.sharding_proto(special_axes=special_axes)
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_replicated_hlo_sharding():
   return xc.HloSharding.replicate()
 
 
 @use_cpp_class(xc.SingleDeviceSharding)
 class SingleDeviceSharding(XLACompatibleSharding):
-  """A subclass of ``XLACompatibleSharding`` that places its data on a single device.
+  """A :class:`Sharding` that places its data on a single device.
 
   Args:
     device: A single :py:class:`Device`.
@@ -331,20 +385,23 @@ class SingleDeviceSharding(XLACompatibleSharding):
   """
 
   _device: Device
+  _memory_kind: str | None
 
   @use_cpp_method()
-  def __init__(self, device: Device):
+  def __init__(self, device: Device, *, memory_kind: str | None = None):
     self._device = device
+    self._memory_kind = memory_kind
 
   def __reduce__(self):
-    return type(self), (self._device,)
+    return type(self), (self._device,), {'memory_kind': self._memory_kind}
 
   def __repr__(self):
-    return f"SingleDeviceSharding(device={repr(self._device)})"
+    mem = '' if self._memory_kind is None else f', memory_kind={self._memory_kind}'
+    return f"SingleDeviceSharding(device={self._device!r}{mem})"
 
   def __hash__(self):
     if not hasattr(self, '_hash'):
-      self._hash = hash(self._device)
+      self._hash = hash((self._device, self.memory_kind))
     return self._hash
 
   def __eq__(self, other):
@@ -352,11 +409,19 @@ class SingleDeviceSharding(XLACompatibleSharding):
       return False
     if id(self) == id(other):
       return True
-    return self._device == other._device
+    return (self._device == other._device and
+            self.memory_kind == other.memory_kind)
 
   @property
   def device_set(self) -> set[Device]:
     return {self._device}
+
+  @property
+  def memory_kind(self) -> str | None:
+    return self._memory_kind
+
+  def with_memory_kind(self, kind: str) -> SingleDeviceSharding:
+    return SingleDeviceSharding(self._device, memory_kind=kind)
 
   def devices_indices_map(self, global_shape: Shape) -> Mapping[Device, Index]:  # type: ignore
     return {self._device: (slice(None),) * len(global_shape)}
@@ -372,33 +437,55 @@ class SingleDeviceSharding(XLACompatibleSharding):
   def is_fully_replicated(self) -> bool:
     return True
 
+  @property
+  def is_fully_addressable(self) -> bool:
+    return True
+
+
+@functools.lru_cache(maxsize=4096)
+def pmap_sharding_devices_indices_map(
+    self, global_shape: Shape) -> Mapping[Device, Index]:
+  self.shard_shape(global_shape)  # raises a good error message
+  indices = sharding_specs.spec_to_indices(global_shape, self.sharding_spec)
+  return dict(safe_zip(self.devices.flat, indices))  # type: ignore[arg-type]
+
 
 @use_cpp_class(xc.PmapSharding)
 class PmapSharding(XLACompatibleSharding):
+  """Describes a sharding used by :func:`jax.pmap`."""
   devices: np.ndarray
   sharding_spec: sharding_specs.ShardingSpec
 
   @use_cpp_method()
-  def __init__(self, devices: Union[Sequence[Device], np.ndarray],
+  def __init__(self, devices: Sequence[Device] | np.ndarray,
                sharding_spec: sharding_specs.ShardingSpec):
     self.devices = np.asarray(devices)
     # The sharding spec should be pmap's sharding spec.
     self.sharding_spec = sharding_spec
 
   def __reduce__(self):
-    return type(self), (self.devices, self.sharding_spec)
+    return (type(self), (self.devices, self.sharding_spec),
+            {'memory_kind': self.memory_kind})
 
   def __eq__(self, other):
     if not isinstance(other, PmapSharding):
       return False
     if id(self) == id(other):
       return True
-    return (self.sharding_spec == other.sharding_spec and
-            np.array_equal(self.devices, other.devices))
+    if xla_extension_version >= 185:
+      return (self.sharding_spec == other.sharding_spec and
+              self.devices.shape == other.devices.shape and
+              self._internal_device_list == other._internal_device_list)  # type: ignore
+    else:
+      return (self.sharding_spec == other.sharding_spec and
+              np.array_equal(self.devices, other.devices))
 
   def __hash__(self):
     if not hasattr(self, '_hash'):
-      self._hash = hash((tuple(self.devices.flat), self.sharding_spec))
+      if xla_extension_version >= 185:
+        self._hash = hash((self._internal_device_list, self.sharding_spec))  # type: ignore
+      else:
+        self._hash = hash((tuple(self.devices.flat), self.sharding_spec))
     return self._hash
 
   def __str__(self):
@@ -419,17 +506,16 @@ class PmapSharding(XLACompatibleSharding):
   # TODO(yashkatariya): Expose `sharded_dim_size` in the API if required.
   @classmethod
   def default(cls, shape: Shape, sharded_dim: int = 0,
-              devices: Optional[Sequence[xc.Device]] = None) -> PmapSharding:
-    """Creates a `PmapSharding` which matches the implicit device order used by
-    `pmap` if devices is None. If devices is specified, it will use those
-    devices.
+              devices: Sequence[xc.Device] | None = None) -> PmapSharding:
+    """Creates a :class:`PmapSharding` which matches the default placement
+    used by :func:`jax.pmap`.
 
     Args:
       shape: The shape of the input array.
       sharded_dim: Dimension the input array is sharded on. Defaults to 0.
-      devices: Optional sequence of devices used to create PmapSharding. If not
-        specified, it will use the implicit device order used by pmap which is
-        the order of jax.local_devices()
+      devices: Optional sequence of devices to use. If omitted, the implicit
+      device order used by pmap is used, which is the order of
+        :func:`jax.local_devices`.
     """
     # The dtype doesn't matter here. Its only used for creating the
     # sharding_spec.
@@ -456,15 +542,25 @@ class PmapSharding(XLACompatibleSharding):
   def device_set(self) -> set[Device]:
     return set(self.devices.flat)
 
-  @functools.lru_cache(maxsize=4096)
   def devices_indices_map(self, global_shape: Shape) -> Mapping[Device, Index]:
-    self.shard_shape(global_shape)  # raises a good error message
-    indices = sharding_specs.spec_to_indices(global_shape, self.sharding_spec)
-    return dict(safe_zip(self.devices.flat, indices))  # type: ignore[arg-type]
+    return pmap_sharding_devices_indices_map(self, global_shape)
 
   @functools.cached_property
   def _device_assignment(self) -> XLADeviceAssignment:
     return tuple(self.devices.flat)
+
+  @property
+  def memory_kind(self) -> str | None:
+    if xla_extension_version >= 182:
+      try:
+        return self._internal_device_list.default_memory_kind  # type: ignore
+      except:
+        return None
+    else:
+      return None
+
+  def with_memory_kind(self, kind: str):
+    return NotImplementedError("pmap does not support memories.")
 
   def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
     raise NotImplementedError("pmap doesn't use OpSharding.")
@@ -476,7 +572,13 @@ class PmapSharding(XLACompatibleSharding):
         return False
     return True
 
-  @functools.lru_cache(maxsize=4096)
+  @functools.cached_property
+  def is_fully_addressable(self) -> bool:
+    if xla_extension_version >= 188:
+      return self._internal_device_list.is_fully_addressable  # type: ignore
+    else:
+      return len(self.device_set) == len(self.addressable_devices)  # type: ignore
+
   def shard_shape(self, global_shape: Shape) -> Shape:
     sharded_dim = None
     sharded_dim_size = None
@@ -498,48 +600,83 @@ class PmapSharding(XLACompatibleSharding):
 
 def _op_sharding_to_pos_sharding(
     op_sharding: Union[xc.OpSharding, xc.HloSharding],
-    device_assignment: Sequence[xc.Device]) -> PositionalSharding:
-  if isinstance(op_sharding, xc.HloSharding):
-    op_sharding = op_sharding.to_proto()  # type: ignore
+    device_assignment: Sequence[xc.Device],
+    memory_kind: Optional[str] = None) -> PositionalSharding:
+  if isinstance(op_sharding, xc.OpSharding):
+    op_sharding = xc.HloSharding.from_proto(op_sharding)  # type: ignore
 
-  if op_sharding.type == xc.OpSharding.Type.REPLICATED:
-    return PositionalSharding(device_assignment).replicate()
+  if op_sharding.is_replicated():
+    return PositionalSharding(
+        device_assignment, memory_kind=memory_kind).replicate()
 
-  if op_sharding.last_tile_dims == [xc.OpSharding.Type.REPLICATED]:
-    replicate_on_last_tile_dim = True
-  else:
-    replicate_on_last_tile_dim = op_sharding.replicate_on_last_tile_dim
-    if op_sharding.last_tile_dims:
-      raise NotImplementedError(
-          "Unhandled OpSharding type. Please open a bug report!")
+  if len(op_sharding.subgroup_types()) > 1:
+    raise NotImplementedError(
+        'Unhandled HloSharding type. Please open a bug report!'
+    )
 
   name = device_assignment[0].platform.upper()
-  ids = np.array([DeviceIdSet(name, i)
-                  for i in op_sharding.tile_assignment_devices])
-  p = PositionalSharding.remake(tuple(device_assignment), ids)
-  p = p.reshape(op_sharding.tile_assignment_dimensions)
-  if replicate_on_last_tile_dim:
+  ids = np.array(
+      [DeviceIdSet(name, i) for i in op_sharding.tile_assignment_devices()]
+  )
+  p = PositionalSharding._remake(tuple(device_assignment), ids,
+                                 memory_kind=memory_kind)
+  p = p.reshape(op_sharding.tile_assignment_dimensions())
+  if op_sharding.replicate_on_last_tile_dim():
     p = p.replicate(-1, keepdims=False)
   return p
 
 
+@functools.lru_cache(maxsize=4096)
+def _positional_sharding_to_xla_hlo_sharding(
+    self, num_dimensions: int) -> xc.HloSharding:
+  if self.shape == (1,) * self.ndim:
+    return get_replicated_hlo_sharding()
+
+  pbuf = xc.OpSharding()
+  shape = self.shape[self.ndim - num_dimensions:]  # 'rank promotion' of val
+  set_size, = {len(device_set) for device_set in self._ids.flat}
+  pbuf.type = xc.OpSharding.Type.OTHER
+  if set_size > 1:
+    pbuf.last_tile_dims = [xc.OpSharding.Type.REPLICATED]
+    pbuf.tile_assignment_dimensions = (*shape, set_size)
+  else:
+    pbuf.tile_assignment_dimensions = shape
+  pbuf.tile_assignment_devices = [i for ids in self._ids.flat for i in ids]
+  product_of_dims = math.prod(pbuf.tile_assignment_dimensions)
+  num_devices = len(pbuf.tile_assignment_devices)
+  assert product_of_dims == num_devices, (product_of_dims, num_devices)
+  return xc.HloSharding.from_proto(pbuf)
+
+
 class PositionalSharding(XLACompatibleSharding):
   _devices: tuple[xc.Device, ...]
+  _memory_kind: str | None
   _ids: np.ndarray  # dtype DeviceIdSet
 
-  def __init__(self, devices: Union[Sequence[xc.Device], np.ndarray]):
+  def __init__(self, devices: Sequence[xc.Device] | np.ndarray,
+               *, memory_kind: str | None = None):
     if not isinstance(devices, np.ndarray):
       devices = np.array(devices, dtype='object')
     if not devices.size:
       raise ValueError(f"{self.__class__.__name__}.__init__ requires at least "
                        f"one device, got {devices}")
     self._devices = tuple(devices.flat)
+    self._memory_kind = memory_kind
     name = self._devices[0].platform.upper()
     self._ids = np.array([DeviceIdSet(name, i) for i in range(devices.size)],
                          dtype='object').reshape(devices.shape)
+    if xla_extension_version >= 182:
+      self._internal_device_list = xc.DeviceList(self._devices)
+      self._memory_kind = xc.check_and_canonicalize_memory_kind(
+          self._memory_kind, self._internal_device_list)
 
-  shape = property(op.attrgetter('_ids.shape'))
-  ndim = property(op.attrgetter('_ids.ndim'))
+  @property
+  def shape(self):
+    return self._ids.shape
+
+  @property
+  def ndim(self):
+    return self._ids.ndim
 
   def __repr__(self) -> str:
     cls_name = self.__class__.__name__
@@ -549,32 +686,43 @@ class PositionalSharding(XLACompatibleSharding):
       ids[idx] = DeviceIdSet(platform_name, *(self._devices[i].id for i in x))
     body = np.array2string(ids, prefix=cls_name + '(', suffix=')',
                            max_line_width=100)
-    return f'{cls_name}({body})'
+    mem = '' if self._memory_kind is None else f', memory_kind={self._memory_kind}'
+    return f'{cls_name}({body}{mem})'
 
-  def reshape(self, *shape):
-    return self.remake(self._devices, self._ids.reshape(*shape))
+  def reshape(self, *shape) -> PositionalSharding:
+    return self._remake(self._devices, self._ids.reshape(*shape))
 
-  def transpose(self, *axes):
-    return self.remake(self._devices, self._ids.transpose(*axes))
+  def transpose(self, *axes) -> PositionalSharding:
+    return self._remake(self._devices, self._ids.transpose(*axes))
   T = property(transpose)
 
-  def replicate(self, axis=None, keepdims=True):
+  def replicate(self, axis=None, keepdims=True) -> PositionalSharding:
     new_ids = self._ids.sum(axis=axis, keepdims=keepdims)  # union
-    return self.remake(self._devices, new_ids)
+    return self._remake(self._devices, new_ids)
 
   @classmethod
-  def remake(
-      cls, devices: tuple[xc.Device, ...], ids: np.ndarray) -> PositionalSharding:
+  def _remake(
+      cls, devices: tuple[xc.Device, ...], ids: np.ndarray,
+      *, memory_kind: str | None = None) -> PositionalSharding:
     self = cls.__new__(cls)
     self._devices = devices
     self._ids = ids
+    if xla_extension_version >= 182:
+      self._internal_device_list = xc.DeviceList(self._devices)
+      self._memory_kind = xc.check_and_canonicalize_memory_kind(
+          memory_kind, self._internal_device_list)
+    else:
+      self._memory_kind = memory_kind
     return self
 
   # Hashable
 
   def __hash__(self) -> int:
     if not hasattr(self, '_hash'):
-      self._hash = hash(self._devices)
+      if xla_extension_version >= 182:
+        self._hash = hash((self._internal_device_list, self.memory_kind))
+      else:
+        self._hash = hash((self._devices, self.memory_kind))
     return self._hash
 
   def __eq__(self, other) -> bool:
@@ -583,15 +731,29 @@ class PositionalSharding(XLACompatibleSharding):
     if id(self) == id(other):
       return True
     all_ids_equal = np.array_equal(self._ids,other._ids)
-    if id(self._devices) == id(other._devices) and all_ids_equal:
+    mem_kind_equal = self.memory_kind == other.memory_kind
+    if (id(self._devices) == id(other._devices) and mem_kind_equal and
+        all_ids_equal):
       return True
-    return self._devices == other._devices and all_ids_equal
+    if xla_extension_version >= 182:
+      return (mem_kind_equal and all_ids_equal and
+              self._internal_device_list == other._internal_device_list)
+    else:
+      return (self._devices == other._devices and mem_kind_equal and
+              all_ids_equal)
 
   # Sharding interface
 
   @functools.cached_property
   def device_set(self) -> set[xc.Device]:
     return set(self._devices)
+
+  @property
+  def memory_kind(self) -> str | None:
+    return self._memory_kind
+
+  def with_memory_kind(self, kind: str) -> PositionalSharding:
+    return PositionalSharding(self._devices, memory_kind=kind)
 
   @functools.cached_property
   def is_fully_replicated(self) -> bool:
@@ -603,25 +765,15 @@ class PositionalSharding(XLACompatibleSharding):
   def _device_assignment(self) -> XLADeviceAssignment:
     return self._devices
 
-  @functools.lru_cache(maxsize=4096)
   def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
-    if self.shape == (1,) * self.ndim:
-      return get_replicated_hlo_sharding()
+    return _positional_sharding_to_xla_hlo_sharding(self, num_dimensions)
 
-    pbuf = xc.OpSharding()
-    shape = self.shape[self.ndim - num_dimensions:]  # 'rank promotion' of val
-    set_size, = {len(device_set) for device_set in self._ids.flat}
-    pbuf.type = xc.OpSharding.Type.OTHER
-    if set_size > 1:
-      pbuf.last_tile_dims = [xc.OpSharding.Type.REPLICATED]
-      pbuf.tile_assignment_dimensions = (*shape, set_size)
+  @functools.cached_property
+  def is_fully_addressable(self) -> bool:
+    if xla_extension_version >= 188:
+      return self._internal_device_list.is_fully_addressable
     else:
-      pbuf.tile_assignment_dimensions = shape
-    pbuf.tile_assignment_devices = [i for ids in self._ids.flat for i in ids]
-    product_of_dims = math.prod(pbuf.tile_assignment_dimensions)
-    num_devices = len(pbuf.tile_assignment_devices)
-    assert product_of_dims == num_devices, (product_of_dims, num_devices)
-    return xc.HloSharding.from_proto(pbuf)
+      return len(self.device_set) == len(self.addressable_devices)  # type: ignore
 
 
 class DeviceIdSet:
@@ -653,29 +805,43 @@ class DeviceIdSet:
             self._ids == other._ids)
 
 
+@functools.lru_cache(maxsize=4096)
+def gspmd_sharding_devices_indices_map(
+    self, global_shape: Shape) -> Mapping[Device, Index]:
+  self.shard_shape(global_shape)  # raises a good error message
+  indices = op_sharding_to_indices(self._hlo_sharding, global_shape,
+                                    len(self._devices))
+  return dict(safe_zip(self._devices, indices))
+
+
 @use_cpp_class(xc.GSPMDSharding)
 class GSPMDSharding(XLACompatibleSharding):
   _devices: tuple[Device, ...]
   _hlo_sharding: xc.HloSharding
+  _memory_kind: str | None
 
   @use_cpp_method()
   def __init__(self, devices: Sequence[Device],
-               op_sharding: Union[xc.OpSharding, xc.HloSharding]):
+               op_sharding: xc.OpSharding | xc.HloSharding,
+               *, memory_kind: str | None = None):
     self._devices = tuple(devices)
     if isinstance(op_sharding, xc.OpSharding):
       self._hlo_sharding = xc.HloSharding.from_proto(op_sharding)
     else:
       self._hlo_sharding = op_sharding
+    self._memory_kind = memory_kind
 
-  if xla_extension_version < 159:
-    @property
-    def _hlo_sharding(self):  # type: ignore
-      if isinstance(self._op_sharding, xc.OpSharding):  # type: ignore
-        return xc.HloSharding.from_proto(self._op_sharding)  # type: ignore
-      return self._op_sharding  # type: ignore
+  if xla_extension_version < 182:
+    def _preprocess(self):
+      # Preprocessing is no longer necessary, but the method must exist for a
+      # previous release of jaxlib that calls back this method from C++>
+      # TODO(yashkatariya): Remove this method once jaxlib with
+      # xla_extension_version >= 182 is released.
+      pass
 
   def __reduce__(self):
-    return type(self), (self._devices, self._hlo_sharding.to_proto())
+    return (type(self), (self._devices, self._hlo_sharding.to_proto()),
+            {'memory_kind': self._memory_kind})
 
   @functools.cached_property
   def _hlo_sharding_hash(self):
@@ -686,16 +852,28 @@ class GSPMDSharding(XLACompatibleSharding):
       return False
     if id(self) == id(other):
       return True
-    return (are_op_shardings_equal(self._hlo_sharding, other._hlo_sharding)
-            and self._devices == other._devices)
+    if xla_extension_version >= 185:
+      return (are_op_shardings_equal(self._hlo_sharding, other._hlo_sharding)
+              and self.memory_kind == other.memory_kind
+              and self._internal_device_list == other._internal_device_list)  # type: ignore
+    else:
+      return (are_op_shardings_equal(self._hlo_sharding, other._hlo_sharding)
+              and self._devices == other._devices and
+              self.memory_kind == other.memory_kind)
 
   def __hash__(self):
     if not hasattr(self, '_hash'):
-      self._hash = hash((self._devices, self._hlo_sharding_hash))
+      if xla_extension_version >= 185:
+        self._hash = hash((self._internal_device_list, self._hlo_sharding_hash,  # type: ignore
+                          self.memory_kind))
+      else:
+        self._hash = hash((self._devices, self._hlo_sharding_hash,
+                          self.memory_kind))
     return self._hash
 
   def __repr__(self):
-    return f'GSPMDSharding({repr(self._hlo_sharding)})'
+    mem = '' if self._memory_kind is None else f', memory_kind={self._memory_kind}'
+    return f'GSPMDSharding({self._hlo_sharding!r}{mem})'
 
   def is_compatible_aval(self, aval_shape: Shape):
     num_ways_dim_sharded, _ = get_num_ways_dim_sharded(self._hlo_sharding)
@@ -709,12 +887,15 @@ class GSPMDSharding(XLACompatibleSharding):
   def device_set(self) -> set[Device]:
     return set(self._devices)
 
-  @functools.lru_cache(maxsize=4096)
+  @property
+  def memory_kind(self) -> str | None:
+    return self._memory_kind
+
+  def with_memory_kind(self, kind: str) -> GSPMDSharding:
+    return GSPMDSharding(self._devices, self._hlo_sharding, memory_kind=kind)
+
   def devices_indices_map(self, global_shape: Shape) -> Mapping[Device, Index]:
-    self.shard_shape(global_shape)  # raises a good error message
-    indices = op_sharding_to_indices(self._hlo_sharding, global_shape,
-                                     len(self._devices))
-    return dict(safe_zip(self._devices, indices))
+    return gspmd_sharding_devices_indices_map(self, global_shape)
 
   @property
   def _device_assignment(self) -> XLADeviceAssignment:
@@ -727,9 +908,17 @@ class GSPMDSharding(XLACompatibleSharding):
   def is_fully_replicated(self) -> bool:
     return is_op_sharding_replicated(self._hlo_sharding)
 
+  @functools.cached_property
+  def is_fully_addressable(self) -> bool:
+    if xla_extension_version >= 188:
+      return self._internal_device_list.is_fully_addressable  # type: ignore
+    else:
+      return len(self.device_set) == len(self.addressable_devices)  # type: ignore
+
   @classmethod
-  def get_replicated(cls, device_assignment):
-    return cls(tuple(device_assignment), get_replicated_hlo_sharding())
+  def get_replicated(cls, device_assignment, *, memory_kind: str | None = None):
+    return cls(tuple(device_assignment), get_replicated_hlo_sharding(),
+               memory_kind=memory_kind)
 
 
 class AUTO:
@@ -771,7 +960,7 @@ that would mean that a flat list of chunks would get assigned to a flattened lis
 mesh devices without any modifications. If the mapping was {'y': 1, 'x': 1}, then the
 mesh devices ndarray would have to be transposed before flattening and assignment.
 """
-ArrayMapping = OrderedDictType[MeshAxisName, int]
+ArrayMapping = OrderedDict[MeshAxisName, int]
 ArrayMappingOrAutoOrUnspecified = Union[ArrayMapping, AUTO, UnspecifiedValue]
 
 def array_mapping_to_axis_resources(array_mapping: ArrayMapping):
@@ -793,7 +982,7 @@ def array_mapping_to_axis_resources(array_mapping: ArrayMapping):
   return PartitionSpec(*partitions)
 
 def get_array_mapping(
-    axis_resources: Union[ParsedPartitionSpec, AUTO, UnspecifiedValue]
+    axis_resources: ParsedPartitionSpec | AUTO | UnspecifiedValue
 ) -> ArrayMappingOrAutoOrUnspecified:
   # TODO(yashkatariya): Use `TypeGuard` on `is_auto` when it is supported.
   # Don't use `is_auto` here to satisfy pytype and mypy.
@@ -1157,23 +1346,25 @@ def explode_superdims(sizes, dims):
     final_dims += reversed(new_dims)
   return final_dims
 
-def parse_flatten_op_sharding(op_sharding: Union[xc.OpSharding, xc.HloSharding],
+def parse_flatten_op_sharding(hlo_sharding: xc.OpSharding | xc.HloSharding,
                               mesh: mesh_lib.Mesh) -> Sequence[ParsedPartitionSpec]:
-  if isinstance(op_sharding, xc.HloSharding):
-    op_sharding = op_sharding.to_proto()  # type: ignore
-  if op_sharding.type == xc.OpSharding.Type.TUPLE:
+  if isinstance(hlo_sharding, xc.OpSharding):
+    hlo_sharding = xc.HloSharding.from_proto(hlo_sharding)  # type: ignore
+  if hlo_sharding.tuple_elements():
     out: list[ParsedPartitionSpec] = []
-    for s in op_sharding.tuple_shardings:
+    for s in hlo_sharding.tuple_elements():
       out.extend(parse_flatten_op_sharding(s, mesh))
     return out
-  elif op_sharding.type == xc.OpSharding.Type.REPLICATED:
+  elif hlo_sharding.is_replicated():
     return [CanonicalizedParsedPartitionSpec(
         ParsedPartitionSpec(PartitionSpec(), ()))]
-  elif op_sharding.type == xc.OpSharding.Type.OTHER:
+  elif hlo_sharding.is_tiled():
     mesh_shape = mesh.shape
-    mesh_axis_order = unflatten_array(mesh.shape, op_sharding.tile_assignment_devices)
+    mesh_axis_order = unflatten_array(
+        mesh.shape, hlo_sharding.tile_assignment_devices()
+    )
     mesh_axis = iter(mesh_axis_order)
-    shape = op_sharding.tile_assignment_dimensions
+    shape = hlo_sharding.tile_assignment_dimensions()
     partitions = []
     for dim_size in shape:
       dim_partitions = []
@@ -1184,13 +1375,11 @@ def parse_flatten_op_sharding(op_sharding: Union[xc.OpSharding, xc.HloSharding],
         dim_size //= axis_size
         dim_partitions.append(axis)
       partitions.append(tuple(dim_partitions))
-    if op_sharding.last_tile_dims == [xc.OpSharding.Type.REPLICATED]:
-      replicate_on_last_tile_dim = True
-    else:
-      replicate_on_last_tile_dim = op_sharding.replicate_on_last_tile_dim
-      if op_sharding.last_tile_dims:
-        raise NotImplementedError("Unhandled OpSharding type. Please open a bug report!")
-    if replicate_on_last_tile_dim:
+    if len(hlo_sharding.subgroup_types()) > 1:
+      raise NotImplementedError(
+          'Unhandled HloSharding type. Please open a bug report!'
+      )
+    if hlo_sharding.replicate_on_last_tile_dim():
       partitions = partitions[:-1]
     return [CanonicalizedParsedPartitionSpec(
         ParsedPartitionSpec('<internally generated spec>', partitions))]

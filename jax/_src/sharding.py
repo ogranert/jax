@@ -14,8 +14,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 import functools
-from typing import Mapping, Optional, Sequence
 
 from jax._src import util
 from jax._src import xla_bridge as xb
@@ -29,7 +29,7 @@ XLADeviceAssignment = Sequence[Device]
 
 @functools.lru_cache(maxsize=4096)
 def _addressable_devices_indices_map(
-    sharding: Sharding, global_shape: Shape) -> Mapping[Device, Optional[Index]]:
+    sharding: Sharding, global_shape: Shape) -> Mapping[Device, Index | None]:
   if sharding.is_fully_addressable:
     return sharding.devices_indices_map(global_shape)
   return {d: ind for d, ind in sharding.devices_indices_map(global_shape).items()
@@ -38,14 +38,13 @@ def _addressable_devices_indices_map(
 
 @util.use_cpp_class(xc.Sharding)
 class Sharding:
-  """Abstract ``Sharding`` interface which describes how a ``jax.Array`` is laid out
-  across devices.
+  """Describes how a :class:`jax.Array` is laid out across devices.
   """
 
   # Abstract methods below that subclasses should implement.
   @property
   def device_set(self) -> set[Device]:
-    """A ``set`` of global devices that this ``Sharding`` spans.
+    """The set of devices that this :class:`Sharding` spans.
 
     In multi-controller JAX, the set of devices is global, i.e., includes
     non-addressable devices from other processes.
@@ -53,10 +52,10 @@ class Sharding:
     raise NotImplementedError('Subclasses should implement this method.')
 
   def devices_indices_map(
-      self, global_shape: Shape) -> Mapping[Device, Optional[Index]]:
-    """A global mapping from device to the slice of the global data it contains.
+      self, global_shape: Shape) -> Mapping[Device, Index | None]:
+    """Returns a mapping from devices to the array slices each contains.
 
-    The devices in this mapping are global devices i.e. includes
+    The mapping includes all global devices, i.e., including
     non-addressable devices from other processes.
     """
     raise NotImplementedError('Subclasses should implement this method.')
@@ -64,49 +63,68 @@ class Sharding:
   def shard_shape(self, global_shape: Shape) -> Shape:
     """Returns the shape of the data on each device.
 
-    The shard shape returned by this function is calculated from the global
-    shape (it takes as an input) and the properties of the sharding.
+    The shard shape returned by this function is calculated from
+    ``global_shape`` and the properties of the sharding.
     """
     raise NotImplementedError('Subclasses should implement this method.')
 
   def is_equivalent_to(self, other: Sharding, ndim: int) -> bool:
-    """Returns True if two shardings put the same logical array
-    (sharded/unsharded) on the same device(s).
+    """Returns ``True`` if two shardings are equivalent.
 
-    For example, every XLACompatibleSharding lowers to GSPMDSharding which
-    is a general representation. So `jax.sharding.NamedSharding` is equivalent
-    to `jax.sharding.PositionalSharding` if both of them lower to the same
-    GSPMDSharding.
+    Two shardings are equivalent if they place the same logical array shards on
+    the same devices.
+
+    For example, a :class:`NamedSharding` may be equivalent
+    to a :class:`PositionalSharding` if both place the same shards of the array
+    on the same devices.
     """
     raise NotImplementedError('Subclasses should implement this method.')
 
   @property
   def is_fully_replicated(self) -> bool:
-    """Returns if a sharding is fully replicated on all the devices."""
+    """Is this sharding fully replicated?
+
+    A sharding is fully replicated if each device has a complete copy of the
+    entire data.
+    """
     raise NotImplementedError('Subclasses should implement this method.')
+
+  @property
+  def is_fully_addressable(self) -> bool:
+    """Is this sharding fully addressable?
+
+    A sharding is fully addressable if the current process can address all of
+    the devices named in the :class:`Sharding`. ``is_fully_addressable`` is
+    equivalent to "is_local" in multi-process JAX.
+    """
+    raise NotImplementedError('Subclasses should implement this method.')
+
+  @property
+  def memory_kind(self) -> str | None:
+    """Returns the memory kind of the sharding."""
+    raise NotImplementedError('Subclasses should implement this method.')
+
+  def with_memory_kind(self, kind: str) -> Sharding:
+    """Returns a new Sharding instance with the specified memory kind."""
+    raise NotImplementedError('Subclasses should implement this method')
 
   #############################################################################
   # Default implementations below that all subclasses will inherit.
 
   @functools.cached_property
   def addressable_devices(self) -> set[Device]:
-    """A set of devices that are addressable by the current process."""
+    """The set of devices in the :class:`Sharding` that are addressable by the
+       current process.
+    """
     # Add a fast path for single controller runtimes.
     if xb.process_count() == 1:
       return self.device_set
     return {d for d in self.device_set
             if d.process_index == d.client.process_index()}
 
-  @functools.cached_property
-  def is_fully_addressable(self) -> bool:
-    """True if the current process can address all of the devices in device_set.
-    """
-    # The pytype disable is because pytype can't recognize a cached property.
-    return len(self.device_set) == len(self.addressable_devices)  # type: ignore
-
   def addressable_devices_indices_map(
-      self, global_shape: Shape) -> Mapping[Device, Optional[Index]]:
-    """A mapping from addressable device to the slice of global data it contains.
+      self, global_shape: Shape) -> Mapping[Device, Index | None]:
+    """A mapping from addressable devices to the slice of array data each contains.
 
     ``addressable_devices_indices_map`` contains that part of
     ``device_indices_map`` that applies to the addressable devices.

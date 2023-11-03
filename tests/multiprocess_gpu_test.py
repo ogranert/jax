@@ -29,10 +29,11 @@ import jax
 from jax import config
 from jax._src import core
 from jax._src import distributed
-import jax.numpy as jnp
+from jax._src import maps
 from jax._src import test_util as jtu
 from jax._src import util
 from jax.experimental import pjit
+import jax.numpy as jnp
 
 try:
   import portpicker
@@ -48,7 +49,7 @@ class DistributedTest(jtu.JaxTestCase):
   # is fixed.
   @unittest.SkipTest
   def testInitializeAndShutdown(self):
-    if jtu.device_under_test() != 'gpu':
+    if not jtu.test_device_matches(['gpu']):
       self.skipTest('Test only works with GPUs.')
     # Tests the public APIs. Since they use global state, we cannot use
     # concurrency to simulate multiple tasks.
@@ -61,7 +62,7 @@ class DistributedTest(jtu.JaxTestCase):
 
   @parameterized.parameters([1, 2, 4])
   def testConcurrentInitializeAndShutdown(self, n):
-    if jtu.device_under_test() != 'gpu':
+    if not jtu.test_device_matches(['gpu']):
       self.skipTest('Test only works with GPUs.')
     port = portpicker.pick_unused_port()
     def task(i):
@@ -83,7 +84,7 @@ class DistributedTest(jtu.JaxTestCase):
 class MultiProcessGpuTest(jtu.JaxTestCase):
 
   def test_gpu_distributed_initialize(self):
-    if jtu.device_under_test() != 'gpu':
+    if not jtu.test_device_matches(['gpu']):
       raise unittest.SkipTest('Tests only for GPU.')
 
     port = portpicker.pick_unused_port()
@@ -129,7 +130,7 @@ class MultiProcessGpuTest(jtu.JaxTestCase):
 
   def test_distributed_jax_visible_devices(self):
     """Test jax_visible_devices works in distributed settings."""
-    if jtu.device_under_test() != 'gpu':
+    if not jtu.test_device_matches(['gpu']):
       raise unittest.SkipTest('Tests only for GPU.')
 
     port = portpicker.pick_unused_port()
@@ -182,7 +183,7 @@ class MultiProcessGpuTest(jtu.JaxTestCase):
           proc.kill()
 
   def test_gpu_ompi_distributed_initialize(self):
-    if jtu.device_under_test() != 'gpu':
+    if not jtu.test_device_matches(['gpu']):
       raise unittest.SkipTest('Tests only for GPU.')
     if shutil.which('mpirun') is None:
       raise unittest.SkipTest('Tests only for MPI (mpirun not found).')
@@ -258,7 +259,7 @@ class SlurmMultiNodeGpuTest(jtu.JaxTestCase):
 
   def setUp(self):
     super().setUp()
-    self.xmap_spmd_lowering_enabled = jax.config.experimental_xmap_spmd_lowering
+    self.xmap_spmd_lowering_enabled = maps.SPMD_LOWERING.value
     jax.config.update("experimental_xmap_spmd_lowering", True)
 
   def tearDown(self):
@@ -320,8 +321,6 @@ class SlurmMultiNodeGpuTest(jtu.JaxTestCase):
     self.assertEqual(y[0], jax.device_count())
     print(y)
 
-  # TODO(sudhakarsingh27): To change/omit test in favor of using `Array`
-  # since `GlobalDeviceArray` is going to be deprecated in the future
   def test_pjit_gda_multi_input_multi_output(self):
     jax.distributed.initialize()
     global_mesh = jtu.create_global_mesh((8, 2), ("x", "y"))
@@ -370,8 +369,6 @@ class SlurmMultiNodeGpuTest(jtu.JaxTestCase):
         np.testing.assert_array_equal(np.asarray(s.data),
                                       global_input_data[s.index])
 
-  # TODO(sudhakarsingh27): To change/omit test in favor of using `Array`
-  # since `GlobalDeviceArray` is going to be deprecated in the future
   def test_pjit_gda_non_contiguous_mesh(self):
     jax.distributed.initialize()
     devices = self.sorted_devices()
@@ -428,8 +425,6 @@ class SlurmMultiNodeGpuTest(jtu.JaxTestCase):
         np.testing.assert_array_equal(np.asarray(s.data),
                                       global_input_data[expected_index])
 
-  # TODO(sudhakarsingh27): To change/omit test in favor of using `Array`
-  # since `GlobalDeviceArray` is going to be deprecated in the future
   def test_pjit_gda_non_contiguous_mesh_2d(self):
     jax.distributed.initialize()
     global_mesh = self.create_2d_non_contiguous_mesh()
@@ -504,8 +499,6 @@ class SlurmMultiNodeGpuTest(jtu.JaxTestCase):
       # Fully replicated values + GDA allows a non-contiguous mesh.
       out1, out2 = f(global_input_data, gda2)
 
-  # TODO(sudhakarsingh27): To change/omit test in favor of using `Array`
-  # since `GlobalDeviceArray` is going to be deprecated in the future
   def test_pjit_gda_non_contiguous_mesh_2d_aot(self):
     jax.distributed.initialize()
     global_mesh = self.create_2d_non_contiguous_mesh()
@@ -531,8 +524,6 @@ class SlurmMultiNodeGpuTest(jtu.JaxTestCase):
       self.assertEqual(out1.shape, (8, 2))
       self.assertEqual(out2.shape, (8, 2))
 
-  # TODO(sudhakarsingh27): To change/omit test in favor of using `Array`
-  # since `GlobalDeviceArray` is going to be deprecated in the future
   def test_pjit_gda_eval_shape(self):
     jax.distributed.initialize()
 

@@ -15,11 +15,12 @@
 
 Specific JAX primitive conversion tests are in primitives_test."""
 import collections
+from collections.abc import Sequence
 import contextlib
+import functools
 import math
 import os
 import re
-from typing import Callable, Optional
 import unittest
 
 from absl import logging
@@ -31,20 +32,18 @@ from jax import dtypes
 from jax import lax
 from jax import numpy as jnp
 from jax import sharding
+from jax._src import config
 from jax._src import core
 from jax._src import source_info_util
 from jax._src import test_util as jtu
-from jax._src.lib import xla_client
-from jax._src.lib.mlir.dialects import hlo
-import jax._src.xla_bridge
-from jax import config
+from jax._src import xla_bridge as xb
+from jax._src.interpreters import mlir
 from jax.experimental import jax2tf
-from jax.experimental.jax2tf import jax_export
+from jax.experimental.export import export
 from jax.experimental.jax2tf.tests import tf_test_util
 from jax.experimental.maps import xmap
 from jax.experimental.shard_map import shard_map
 from jax.experimental import pjit
-from jax.interpreters import mlir
 from jax.sharding import PartitionSpec as P
 
 import numpy as np
@@ -57,6 +56,20 @@ config.parse_flags_with_absl()
 
 
 class Jax2TfTest(tf_test_util.JaxToTfTestCase):
+
+  @classmethod
+  def setUpClass(cls):
+    # One TF device of each device_type
+    cls.tf_devices = []
+    for tf_device in (tf.config.list_logical_devices("TPU") +
+                      tf.config.list_logical_devices("GPU") +
+                      tf.config.list_logical_devices()):
+      if tf_device.device_type == "TPU_SYSTEM":
+        continue  # A virtual device
+      if all(tf_device.device_type != d.device_type for d in cls.tf_devices):
+        cls.tf_devices.append(tf_device)
+
+    super(Jax2TfTest, cls).setUpClass()
 
   def test_empty(self):
     f_jax = lambda x, y: x
@@ -189,7 +202,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     f_tf = tf.function(lambda x: x + x)
     self.assertEqual(f_tf(jnp.ones([])).numpy(), 2.)
 
-    # Test with ShardedDeviceArray.
+    # Test with a PmapSharding-sharded Array.
     n = jax.local_device_count()
     mk_sharded = lambda f: jax.pmap(lambda x: x)(f([n]))
     f_tf = tf.function(lambda x: x)
@@ -233,7 +246,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     with_function=[True, False],
   )
   def test_converts_64bit(self, dtype=np.int64, with_function=False):
-    if not config.jax_enable_x64:
+    if not config.enable_x64.value:
       self.skipTest("requires x64 mode")
     big_const = np.full((5,), 2 ** 33, dtype=dtype)
     self.ConvertAndCompare(jnp.sin, big_const)
@@ -249,7 +262,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
 
   def test_64bit_behavior_enable_x64_readme(self):
     # Tests some of the examples from the README
-    if not config.jax_enable_x64:
+    if not config.enable_x64.value:
       self.skipTest("requires x64 mode")
 
     # JAX and TF have different default float types if JAX_ENABLE_X64=1
@@ -266,7 +279,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
 
   def test_64bit_behavior_not_enable_x64_readme(self):
     # Tests some of the examples from the README
-    if config.jax_enable_x64:
+    if config.enable_x64.value:
       self.skipTest("requires not x64 mode")
 
     # JAX and TF have same default float types if JAX_ENABLE_X64=0
@@ -319,6 +332,22 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     self.assertAllClose(0., tape.gradient(u, y))
     self.assertAllClose(5., tape.gradient(v, x))
     self.assertAllClose(4., tape.gradient(v, y))
+
+  def test_higher_order_gradients(self):
+    f = lambda x: x ** 3
+    f_tf = jax2tf.convert(f)
+    x = tf.Variable(4.0, dtype=tf.float32)  # Create a Tensorflow variable initialized to 4.0
+    with tf.GradientTape() as t2:
+      with tf.GradientTape() as t1:
+        y = f_tf(x)
+
+      # Compute the gradient inside the outer `t2` context manager
+      # which means the gradient computation is differentiable as well.
+      dy_dx = t1.gradient(y, x)
+    d2y_dx2 = t2.gradient(dy_dx, x)
+
+    self.assertAllClose(np.float32(48.), dy_dx.numpy())
+    self.assertAllClose(np.float32(24.), d2y_dx2.numpy())
 
   @jtu.sample_product(with_function=[False, True])
   def test_gradients_pytree(self, with_function=False):
@@ -801,7 +830,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     arg = np.array(3.)
     f_tf = jax2tf.convert(jax.grad(remat_f))
     f_tf_hlo = self.TfToHlo(f_tf, arg)
-    if jax.config.jax_remat_opt_barrier:
+    if config.remat_opt_barrier.value:
       self.assertRegex(f_tf_hlo, r"opt-barrier")
     else:
       self.assertRegex(f_tf_hlo,
@@ -833,7 +862,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     f_tf = jax2tf.convert(f_jax)
     # for native serialization the HLO we get from TF is constant-folded, so this
     # test fails.
-    if not config.jax2tf_default_native_serialization:
+    if not config.jax2tf_default_native_serialization.value:
       self.assertIn("sine(", self.TfToHlo(f_tf))
 
   def test_convert_of_nested_independent_jit(self):
@@ -938,7 +967,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
 
       out = jax2tf.convert(caller_jax, with_gradient=False)(2.)
       return out
-    if config.jax2tf_default_native_serialization:
+    if config.jax2tf_default_native_serialization.value:
       self.assertIn("my_test_function_jax/mul", self.TfToHlo(run_tf))
     else:
       graph_def = str(tf.function(run_tf, autograph=False).get_concrete_function().graph.as_graph_def())
@@ -968,7 +997,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
   def test_shared_constants(self):
     # Check that the constants are shared properly in converted functions
     # See https://github.com/google/jax/issues/7992.
-    if config.jax2tf_default_native_serialization:
+    if config.jax2tf_default_native_serialization.value:
       raise unittest.SkipTest("shared constants tests not interesting for native serialization")
     const = np.random.uniform(size=256).astype(np.float32)  # A shared constant
     def f(x):
@@ -980,7 +1009,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
   def test_shared_constants_under_cond(self):
     # Check that the constants are shared properly in converted functions
     # See https://github.com/google/jax/issues/7992.
-    if config.jax2tf_default_native_serialization:
+    if config.jax2tf_default_native_serialization.value:
       raise unittest.SkipTest("shared constants tests not interesting for native serialization")
     const_size = 512
     const = np.random.uniform(size=const_size).astype(np.float32)  # A shared constant
@@ -996,7 +1025,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
 
   def test_shared_constants_under_scan(self):
     # See https://github.com/google/jax/issues/7992.
-    if config.jax2tf_default_native_serialization:
+    if config.jax2tf_default_native_serialization.value:
       raise unittest.SkipTest("shared constants tests not interesting for native serialization")
     const_size = 512
     const = np.random.uniform(size=const_size).astype(np.float32)  # A shared constant
@@ -1015,7 +1044,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
 
   def test_shared_constants_under_jit(self):
     # We do not share constants under jit.
-    if config.jax2tf_default_native_serialization:
+    if config.jax2tf_default_native_serialization.value:
       raise unittest.SkipTest("shared constants tests not interesting for native serialization")
     const = np.random.uniform(size=(16, 16)).astype(np.float32)  # A shared constant
     @jax.jit
@@ -1031,7 +1060,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     # randint has the property that the TF lowering of the randbits_p
     # primitive generates constants that did not exist in the Jaxpr. As such
     # it has created new errors related to the sharing of the constants.
-    if config.jax2tf_default_native_serialization:
+    if config.jax2tf_default_native_serialization.value:
       raise unittest.SkipTest("shared constants tests not interesting for native serialization")
 
     key = jax.random.PRNGKey(42)
@@ -1280,7 +1309,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     x = np.arange(math.prod(shape), dtype=np.float32).reshape(shape)
 
     jax_comp = jax.xla_computation(f_while)(x)
-    backend = jax._src.xla_bridge.get_backend()
+    backend = xb.get_backend()
     modules = backend.compile(jax_comp).hlo_modules()
     jax_opt_hlo = modules[0].to_string()
     print(f"JAX OPT HLO = {jax_opt_hlo}")
@@ -1326,7 +1355,8 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
         self.fail(f"{op.name} does not start with {scope_name}.")
 
   def test_name_scope_polymorphic(self):
-    if config.jax2tf_default_native_serialization and not config.jax_dynamic_shapes:
+    if (config.jax2tf_default_native_serialization.value and
+        not config.dynamic_shapes.value):
       self.skipTest("shape polymorphism but --jax_dynamic_shapes is not set.")
 
     def func_jax(x, y):
@@ -1522,21 +1552,21 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
         stack.enter_context(mesh)
       # Run the JAX native version, to check it works, and to fill caches.
       _ = func_to_convert(*args)
-      exported = jax_export.export(
+      exported = export.export(
           func_to_convert,
-          lowering_platform='tpu'
+          lowering_platforms=("tpu",)
       )(*(core.ShapedArray(a.shape, a.dtype) for a in args))
 
     if transform1 == "shard_map":
-      self.assertIn("stablehlo.all_gather", str(exported.mlir_module))
+      self.assertIn("stablehlo.all_gather", str(exported.mlir_module()))
     else:
-      self.assertIn("stablehlo.reduce_window", str(exported.mlir_module))
+      self.assertIn("stablehlo.reduce_window", str(exported.mlir_module()))
 
   def test_cross_platform_error(self):
     f_tf = jax2tf.convert(jnp.sin, native_serialization=True,
                           native_serialization_platforms=('tpu',))
     x = np.float32(.5)
-    if jtu.device_under_test() == "tpu":
+    if jtu.test_device_matches(["tpu"]):
       self.assertAllClose(jnp.sin(x), f_tf(x))
     else:
       # We can construct the tf.Graph
@@ -1587,7 +1617,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     logging.info("Found graph_def: %s", graph_def)
     self.assertLen(re.findall(r'op:\s*"XlaCallModule"', str(graph_def)), 2)
 
-    if jtu.device_under_test() != "tpu":
+    if not jtu.test_device_matches(["tpu"]):
       with self.assertRaisesRegex(
           tf.errors.NotFoundError,
           r"The current platform .* is not among the platforms required by the module: \[TPU\]"):
@@ -1613,7 +1643,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
   def test_tuple_args(self):
     # On TPU if we have more than 2000 arguments, we pass them as a tuple.
     # This is a compiler option, and should have no effect on lowering.
-    if jtu.device_under_test() != "tpu":
+    if not jtu.test_device_matches(["tpu"]):
       raise unittest.SkipTest("Test enabled on TPU only")
     def f_jax(*many_args):
       acc = 0.
@@ -1648,124 +1678,38 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     f_tf_nested = jax2tf.convert(f_jax_nested, native_serialization=True)
     self.assertAllClose(res, f_tf_nested(inputs))
 
-def get_serialized_computation(
-    f_jax: Callable,
-    *args,
-    abstracted_axes: Optional[tuple[dict[int, str]]] = None,
-    use_pjit: bool = False,
-    in_shardings = None,
-    out_shardings = None) -> tuple[str, int]:
-  if use_pjit:
-    assert not abstracted_axes
-    lowered = pjit.pjit(
-        f_jax, in_shardings=in_shardings, out_shardings=out_shardings
-  ).lower(*args)
-  else:
-    lowered = jax.jit(f_jax, abstracted_axes=abstracted_axes).lower(*args)
-  mlir_module = lowered._lowering.stablehlo()
-  xla_call_module_version = 5
-  mlir_str = mlir.module_to_bytecode(mlir_module)
-  if hlo.get_api_version() < 4:
-    target_version = hlo.get_earliest_forward_compatible_version()
-  else:
-    # See comments next to the usage of hlo.get_minimum_version() in
-    # jax_export.py for an explanation how it works.
-    target_version = hlo.get_minimum_version()
-  mlir_module_serialized = xla_client._xla.mlir.serialize_portable_artifact(
-    mlir_str, target_version)
-  return mlir_module_serialized, xla_call_module_version
+  def test_multi_platform(self):
+    if config.enable_x64.value:
+      self.skipTest("TODO: enable when we can handle i64 platform_index_argument")
+    # Checks that we dispatch from TF to the proper JAX platform lowering.
 
-class XlaCallModuleTest(tf_test_util.JaxToTfTestCase):
-  """Unit tests for XlaCallModule. Will move these eventually to TF."""
-  def test_simple(self):
+    # We add a different value to it: cpu=2., tpu=3., cuda=.4, rocm=5.
+    _testing_multi_platform_to_add = dict(cpu=2., tpu=3., cuda=4., rocm=5.)
 
     def f_jax(x):
-      return jnp.sin(x)
+      return x + lax.platform_dependent(
+        tpu=lambda: _testing_multi_platform_to_add["tpu"],
+        cuda=lambda: _testing_multi_platform_to_add["cuda"],
+        rocm=lambda: _testing_multi_platform_to_add["rocm"],
+        default=lambda: _testing_multi_platform_to_add["cpu"]
+      )
 
-    x = np.ones((2, 3), dtype=np.float32)
-
-    jax_res = f_jax(x)
-    module, version = get_serialized_computation(f_jax, x)
-    res = tfxla.call_module([x],
-                            version=version,
-                            module=module,
-                            Tout=[jax_res.dtype],
-                            Sout=[jax_res.shape])
-    self.assertAllClose(tf.nest.map_structure(lambda t: t.numpy(), res),
-                        [jax_res])
-
-  def test_while(self):
-    # With nested computation
-    def f_jax(count, x):
-      return lax.while_loop(lambda carry: carry[0] < count, lambda carry:
-                            (carry[0] + 1, carry[1] + 1.), (0, x))[1]
-
-    count = np.int32(5)
-    x = np.ones((2, 3), dtype=np.float32)
-
-    jax_res = f_jax(count, x)
-    module, version = get_serialized_computation(f_jax, count, x)
-    res = tfxla.call_module([count, x],
-                            version=version,
-                            module=module,
-                            Tout=[jax_res.dtype],
-                            Sout=[jax_res.shape])
-    self.assertAllClose(tf.nest.map_structure(lambda t: t.numpy(), res),
-                        [jax_res])
-
-  def test_multiple_args_results(self):
-
-    def f_jax(x1, x2):
-      return (jnp.sin(x1), jnp.cos(x2))
-
-    x1 = np.ones((2, 3), dtype=np.float32)
-    x2 = np.ones((3, 4), dtype=np.float32)
-
-    jax_res = f_jax(x1, x2)
-    module, version = get_serialized_computation(f_jax, x1, x2)
-    def f_tf(x1_tf, x2_tf):
-      return tfxla.call_module([x1_tf, x2_tf],
-                               version=version,
-                               module=module,
-                               Tout=[jax_res[0].dtype, jax_res[1].dtype],
-                               Sout=[jax_res[0].shape, jax_res[1].shape])
-
-    res = tf.function(f_tf, jit_compile=True, autograph=False)(x1, x2)
-    self.assertAllClose(tf.nest.map_structure(lambda t: t.numpy(), res),
-                        jax_res)
-
-  @jtu.with_mesh([("x", 2)])
-  def test_pjit_basic1D(self):
-
-    def func_jax(x, y):
-      return x + y
-
-    shape = (8, 10)
-    x = np.arange(math.prod(shape), dtype=np.float32).reshape(shape)
-    in_axis_resources = (P("x"), P("x"))
-    out_axis_resources = None
-    res_jax = pjit.pjit(
-        func_jax,
-        in_shardings=in_axis_resources,
-        out_shardings=out_axis_resources,
-    )(x, x)
-    module, version = get_serialized_computation(
-        func_jax,
-        x,
-        x,
-        use_pjit=True,
-        in_shardings=in_axis_resources,
-        out_shardings=out_axis_resources)
-
-    def f_tf(x_tf, y_tf):
-      return tfxla.call_module([x_tf, y_tf],
-                               version=version,
-                               module=module,
-                               Tout=[x.dtype],
-                               Sout=[x.shape])
-
-    res_tf = tf.function(f_tf, jit_compile=True, autograph=False)(x, x)[0]
-    self.assertAllClose(res_tf.numpy(), res_jax)
+    x = np.float32(.42)
+    f_tf = jax2tf.convert(
+      f_jax,
+      native_serialization=True,
+      native_serialization_platforms=("cpu", "cuda", "tpu"))
+    for tf_device in self.__class__.tf_devices:
+      logging.info(
+        f"Running on tf_device = {tf_device} of device_type = {tf_device.device_type}")
+      with tf.device(tf_device):
+        res = f_tf(x)
+      tf_device_jax_platform = dict(
+        CPU="cpu", GPU="cuda", TPU="tpu"
+      )[tf_device.device_type]
+      self.assertAllClose(
+        res,
+        x + _testing_multi_platform_to_add[tf_device_jax_platform])
 
 
 @jtu.with_config(jax_enable_custom_prng=True)
@@ -1795,6 +1739,15 @@ class Jax2tfWithCustomPRNGTest(tf_test_util.JaxToTfTestCase):
     tf_result = jax2tf.convert(func)()
     jax_result = func()
     self.assertEqual(tf_result, jax_result)
+
+class Jax2TfVersioningTest(tf_test_util.JaxToTfTestCase):
+  # Use a separate test case with the default jax_serialization_version
+  def setUp(self):
+    self.use_max_serialization_version = False
+    super().setUp()
+
+  def test_simple(self):
+    self.ConvertAndCompare(jnp.sin, 0.7)
 
 
 if __name__ == "__main__":

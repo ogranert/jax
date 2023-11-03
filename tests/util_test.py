@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import operator
-import unittest
 
 from absl.testing import absltest
 
@@ -24,7 +23,6 @@ from jax._src import util
 from jax import config
 from jax._src.util import weakref_lru_cache
 config.parse_flags_with_absl()
-FLAGS = config.FLAGS
 
 try:
   from jax._src.lib import utils as jaxlib_utils
@@ -122,8 +120,6 @@ class SafeMapTest(jtu.JaxTestCase):
         util.safe_map(make_tuple, range(4), range(4, 8)),
     )
 
-  @unittest.skipIf(not hasattr(jaxlib_utils, 'safe_map'),
-                   "requires jaxlib 0.4.9")
   def test_safe_map_errors(self):
     with self.assertRaisesRegex(
         TypeError, "safe_map requires at least 2 arguments"
@@ -174,8 +170,6 @@ class SafeZipTest(jtu.JaxTestCase):
         util.safe_zip(range(4), range(4, 8)),
     )
 
-  @unittest.skipIf(not hasattr(jaxlib_utils, 'safe_zip'),
-                   "requires jaxlib 0.4.9")
   def test_safe_zip_errors(self):
     with self.assertRaisesRegex(
         TypeError, "safe_zip requires at least 1 argument"

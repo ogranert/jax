@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+from collections.abc import Sequence
 from functools import partial
 import math
-from typing import Union, Sequence
+from typing import Union
 
 import numpy as np
 
@@ -82,6 +82,8 @@ def fft_abstract_eval(x, fft_type, fft_lengths):
     raise ValueError(f"FFT input shape {x.shape} must have at least as many "
                     f"input dimensions as fft_lengths {fft_lengths}.")
   if fft_type == xla_client.FftType.RFFT:
+    if x.dtype not in (np.float32, np.float64):
+      raise ValueError(f"RFFT input must be float32 or float64, got {x.dtype}")
     if x.shape[-len(fft_lengths):] != fft_lengths:
       raise ValueError(f"RFFT input shape {x.shape} minor dimensions must "
                       f"be equal to fft_lengths {fft_lengths}")
@@ -89,6 +91,9 @@ def fft_abstract_eval(x, fft_type, fft_lengths):
              + (fft_lengths[-1] // 2 + 1,))
     dtype = _complex_dtype(x.dtype)
   elif fft_type == xla_client.FftType.IRFFT:
+    if not np.issubdtype(x.dtype, np.complexfloating):
+      raise ValueError("IRFFT input must be complex64 or complex128, got "
+                       f"{x.dtype}")
     if x.shape[-len(fft_lengths):-1] != fft_lengths[:-1]:
       raise ValueError(f"IRFFT input shape {x.shape} minor dimensions must "
                       "be equal to all except the last fft_length, got "
@@ -96,6 +101,9 @@ def fft_abstract_eval(x, fft_type, fft_lengths):
     shape = x.shape[:-len(fft_lengths)] + fft_lengths
     dtype = _real_dtype(x.dtype)
   else:
+    if not np.issubdtype(x.dtype, np.complexfloating):
+      raise ValueError("FFT input must be complex64 or complex128, got "
+                       f"{x.dtype}")
     if x.shape[-len(fft_lengths):] != fft_lengths:
       raise ValueError(f"FFT input shape {x.shape} minor dimensions must "
                       f"be equal to fft_lengths {fft_lengths}")
@@ -146,8 +154,7 @@ def _fft_lowering_cpu(ctx, x, *, fft_type, fft_lengths):
       assert np.issubdtype(dtype, np.complexfloating), dtype
       out_dtype = dtype
 
-    zero = mlir.ir_constant(np.array(0, dtype=out_dtype),
-                            canonicalize_types=False)
+    zero = mlir.ir_constant(np.array(0, dtype=out_dtype))
     return [
         mlir.broadcast_in_dim(ctx, zero, out_aval, broadcast_dimensions=[])]
 
@@ -172,7 +179,7 @@ def _fft_lowering_cpu(ctx, x, *, fft_type, fft_lengths):
   size_fft_length_prod = np.prod(fft_lengths) if fft_lengths else 1
   size_fft_lengths, = mlir.eval_dynamic_shape_as_vals(ctx, (size_fft_length_prod,))
   size_fft_lengths = hlo.ConvertOp(double_type, size_fft_lengths)
-  one = mlir.ir_constant(np.float64(1.), canonicalize_types=False)
+  one = mlir.ir_constant(np.float64(1.))
   scale = one if forward else hlo.DivOp(one, size_fft_lengths)
   scale = hlo.ReshapeOp(
       mlir.ir.RankedTensorType.get((1,), mlir.ir.F64Type.get()),

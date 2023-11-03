@@ -98,7 +98,7 @@ class CloudpickleTest(jtu.JaxTestCase):
 
 class PickleTest(jtu.JaxTestCase):
 
-  def testPickleOfDeviceArray(self):
+  def testPickleOfArray(self):
     x = jnp.arange(10.0)
     s = pickle.dumps(x)
     y = pickle.loads(s)
@@ -106,7 +106,7 @@ class PickleTest(jtu.JaxTestCase):
     self.assertIsInstance(y, type(x))
     self.assertEqual(x.aval, y.aval)
 
-  def testPickleOfDeviceArrayWeakType(self):
+  def testPickleOfArrayWeakType(self):
     x = jnp.array(4.0)
     self.assertEqual(x.aval.weak_type, True)
     s = pickle.dumps(x)
@@ -122,8 +122,9 @@ class PickleTest(jtu.JaxTestCase):
       s  = pickle.dumps(k1)
       k2 = pickle.loads(s)
       self.assertEqual(k1.dtype, k2.dtype)
-      self.assertArraysEqual(jax.random.key_data(k1),
-                             jax.random.key_data(k2))
+      with jax.legacy_prng_key('allow'):
+        self.assertArraysEqual(jax.random.key_data(k1),
+                              jax.random.key_data(k2))
 
   @parameterized.parameters(
       (jax.sharding.PartitionSpec(),),

@@ -133,17 +133,15 @@ def process_allgather(in_tree: Any, tiled: bool = False) -> Any:
       hosts.
     tiled: Whether to stack or concat the output. Defaults to False i.e. stack
       into a new positional axis at index 0.
-      This does not affect GDA inputs as the GDA output will always be
-      concatenated.
-      Scalar inputs will always be stacked.
 
   Returns:
-    Pytress of arrays where the data is gathered from all hosts.
-      * If the input is a GDA, then the data is fully replicated.
-      * If the input is non-GDA, then the output shape is dependent on the
-        `tiled` argument. If its False, then the output will be stacked else
-        concatenated.
-      * If the input is non-GDA and scalar, then the output will be stacked.
+    Pytrees of numpy arrays.
+      * If the input is a non-fully addressable jax.Array, then the data is
+        fully replicated.
+      * If the input is numpy array or fully addressable jax.Array, then the
+        output shape is dependent on the `tiled` argument.
+        If its False, then the output will be stacked else concatenated.
+      * If the input is a scalar, then the output will be stacked.
   """
 
   def _pjit(inp):
@@ -169,8 +167,7 @@ def reached_preemption_sync_point(step_id: int) -> bool:
   uses the next step id (i.e., max + 1) as the safe step to save a checkpoint.
   All hosts should continue training more steps until this method returns True,
   indicating that the `step_id` is equal to the safe step and the hosts should
-  start saving a checkpoint. This feature requires enabling
-  `jax.config.jax_coordination_service`.
+  start saving a checkpoint.
 
   To use this API, all hosts must start training from the same step and call at
   every training step. Example usage:
@@ -207,17 +204,17 @@ def reached_preemption_sync_point(step_id: int) -> bool:
   return sync_manager.reached_sync_point(step_id)
 
 
-@lru_cache()
+@lru_cache
 def _flatten_pspecs(name, in_tree, pspecs_thunk):
   return pjit_lib.flatten_axis_resources(
       name, in_tree, pspecs_thunk(), tupled_args=True)
 
-@lru_cache()
+@lru_cache
 def _local_to_global_aval(local_aval, mesh, pspec):
   return pxla.mesh_local_to_global(mesh, pxla.get_array_mapping(pspec),
                                    local_aval)
 
-@lru_cache()
+@lru_cache
 def _global_to_local_aval(global_aval, mesh, pspec):
   return pxla.mesh_global_to_local(mesh, pxla.get_array_mapping(pspec),
                                    global_aval)

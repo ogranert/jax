@@ -12,15 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+import os
 from setuptools import setup
 from setuptools.dist import Distribution
-import os
 
 __version__ = None
 project_name = 'jaxlib'
 
-with open('jaxlib/version.py') as f:
-  exec(f.read(), globals())
+def load_version_module(pkg_path):
+  spec = importlib.util.spec_from_file_location(
+    'version', os.path.join(pkg_path, 'version.py'))
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+  return module
+
+_version_module = load_version_module(project_name)
+__version__ = _version_module._get_version_for_build()
+_cmdclass = _version_module._get_cmdclass(project_name)
 
 with open('README.md') as f:
   _long_description = f.read()
@@ -43,6 +52,7 @@ class BinaryDistribution(Distribution):
 setup(
     name=project_name,
     version=__version__,
+    cmdclass=_cmdclass,
     description='XLA library for JAX',
     long_description=_long_description,
     long_description_content_type='text/markdown',
@@ -50,7 +60,12 @@ setup(
     author_email='jax-dev@google.com',
     packages=['jaxlib', 'jaxlib.xla_extension'],
     python_requires='>=3.9',
-    install_requires=['scipy>=1.7', 'numpy>=1.22', 'ml_dtypes>=0.2.0'],
+    install_requires=[
+        'scipy>=1.9',
+        "scipy>=1.11.1; python_version>='3.12'",
+        'numpy>=1.22',
+        'ml_dtypes>=0.2.0',
+    ],
     extras_require={
       'cuda11_pip': [
         "nvidia-cublas-cu11>=11.11",
@@ -88,6 +103,9 @@ setup(
             'cpu/*',
             'cuda/*',
             'cuda/nvvm/libdevice/libdevice*',
+            'mosaic/*.py',
+            'mosaic/python/*.py',
+            'mosaic/python/*.so',
             'mlir/*.py',
             'mlir/dialects/*.py',
             'mlir/_mlir_libs/*.dll',

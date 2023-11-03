@@ -85,6 +85,7 @@ namespace; they are listed below.
     bartlett
     bincount
     bitwise_and
+    bitwise_count
     bitwise_not
     bitwise_or
     bitwise_xor
@@ -155,6 +156,7 @@ namespace; they are listed below.
     extract
     eye
     fabs
+    fill_diagonal
     finfo
     fix
     flatnonzero
@@ -178,6 +180,7 @@ namespace; they are listed below.
     fromfile
     fromfunction
     fromiter
+    frompyfunc
     fromstring
     from_dlpack
     full
@@ -231,7 +234,6 @@ namespace; they are listed below.
     isrealobj
     isscalar
     issubdtype
-    issubsctype
     iterable
     ix_
     kaiser
@@ -340,7 +342,6 @@ namespace; they are listed below.
     rot90
     round
     round_
-    row_stack
     s_
     save
     savez
@@ -388,6 +389,7 @@ namespace; they are listed below.
     triu_indices_from
     true_divide
     trunc
+    ufunc
     uint
     uint16
     uint32

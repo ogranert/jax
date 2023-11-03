@@ -16,20 +16,22 @@
 import contextlib
 import unittest
 from absl.testing import absltest
-import numpy as np
-
 import jax
-import jax.numpy as jnp
+from jax import config
 from jax._src import core
 from jax._src import test_util as jtu
-from jax._src.config import flags
+from jax._src.lib import xla_client as xc
+from jax._src.lib import xla_extension_version
+from jax.experimental import topologies
 from jax.experimental.pjit import pjit
 from jax.experimental.serialize_executable import (
-    serialize, deserialize_and_load)
-from jax.experimental import topologies
+    deserialize_and_load,
+    serialize,
+)
+import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
+import numpy as np
 
-from jax import config
 config.parse_flags_with_absl()
 
 prev_xla_flags = None
@@ -41,11 +43,8 @@ with contextlib.suppress(ImportError):
 
 class JaxAotTest(jtu.JaxTestCase):
 
-  @jtu.skip_on_devices('cpu', 'gpu')
+  @jtu.run_on_devices('tpu')
   def test_pickle_pjit_lower(self):
-    if jtu.is_se_tpu():
-      raise unittest.SkipTest('StreamExecutor not supported.')
-
     def fun(x):
       return x * x
 
@@ -73,7 +72,7 @@ class JaxAotTest(jtu.JaxTestCase):
     except NotImplementedError:
       raise unittest.SkipTest('PJRT Topology not supported')
 
-    if flags.FLAGS.jax_test_with_persistent_compilation_cache:
+    if jtu.TEST_WITH_PERSISTENT_COMPILATION_CACHE.value:
       raise unittest.SkipTest('Compilation caching not yet supported.')
 
     @jax.jit
@@ -99,6 +98,20 @@ class JaxAotTest(jtu.JaxTestCase):
     aot_mesh = topologies.make_mesh(aot_topo, mesh_shape, ('x', 'y'))
     self.assertEqual(
         lower_and_load(ref_mesh).as_text(), lower_and_load(aot_mesh).as_text()
+    )
+
+  @unittest.skipIf(xla_extension_version < 175, 'Test requires jaxlib 0.4.15')
+  def test_get_topology_from_devices(self):
+    try:
+      aot_topo = topologies.get_topology_desc(
+          platform=jax.devices()[0].platform
+      )
+    except NotImplementedError:
+      raise unittest.SkipTest('PJRT Topology not supported')
+
+    topo = xc.get_topology_for_devices(aot_topo.devices)
+    self.assertEqual(
+        topo.platform_version, aot_topo.devices[0].client.platform_version
     )
 
 

@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import builtins
+from collections.abc import Sequence
 from functools import partial
 import operator
-from typing import Any, NamedTuple, Optional, Sequence, Union
+from typing import NamedTuple, Optional, Union
 
 import numpy as np
 
@@ -27,13 +27,8 @@ from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
 from jax._src.lax import lax
 from jax._src.lib.mlir.dialects import hlo
+from jax._src.typing import Array, DTypeLike
 
-
-_max = builtins.max
-
-Array = Any
-DType = Any
-Shape = core.Shape
 
 class ConvDimensionNumbers(NamedTuple):
   """Describes batch, spatial, and feature dimensions of a convolution.
@@ -61,7 +56,7 @@ def conv_general_dilated(
   dimension_numbers: ConvGeneralDilatedDimensionNumbers  = None,
   feature_group_count: int = 1, batch_group_count: int = 1,
   precision: lax.PrecisionLike = None,
-  preferred_element_type: Optional[DType] = None) -> Array:
+  preferred_element_type: Optional[DTypeLike] = None) -> Array:
   """General n-dimensional convolution operator, with optional dilation.
 
   Wraps XLA's `Conv
@@ -173,7 +168,7 @@ def conv_general_dilated(
 
 def conv(lhs: Array, rhs: Array, window_strides: Sequence[int],
          padding: str, precision: lax.PrecisionLike = None,
-         preferred_element_type: Optional[DType] = None) -> Array:
+         preferred_element_type: Optional[DTypeLike] = None) -> Array:
   """Convenience wrapper around `conv_general_dilated`.
 
   Args:
@@ -203,7 +198,7 @@ def conv_with_general_padding(lhs: Array, rhs: Array,
                               lhs_dilation: Optional[Sequence[int]],
                               rhs_dilation: Optional[Sequence[int]],
                               precision: lax.PrecisionLike = None,
-                              preferred_element_type: Optional[DType] = None) -> Array:
+                              preferred_element_type: Optional[DTypeLike] = None) -> Array:
   """Convenience wrapper around `conv_general_dilated`.
 
   Args:
@@ -255,7 +250,7 @@ def _conv_transpose_padding(k, s, padding):
     else:
       pad_a = int(np.ceil(pad_len / 2))
   elif padding == 'VALID':
-    pad_len = k + s - 2 + _max(k - s, 0)
+    pad_len = k + s - 2 + max(k - s, 0)
     pad_a = k - 1
   else:
     raise ValueError('Padding mode must be `SAME` or `VALID`.')
@@ -276,7 +271,7 @@ def conv_transpose(lhs: Array, rhs: Array, strides: Sequence[int],
                    dimension_numbers: ConvGeneralDilatedDimensionNumbers = None,
                    transpose_kernel: bool = False,
                    precision: lax.PrecisionLike = None,
-                   preferred_element_type: Optional[DType] = None) -> Array:
+                   preferred_element_type: Optional[DTypeLike] = None) -> Array:
   """Convenience wrapper for calculating the N-d convolution "transpose".
 
   This function directly calculates a fractionally strided conv rather than
@@ -342,7 +337,7 @@ def conv_transpose(lhs: Array, rhs: Array, strides: Sequence[int],
   if transpose_kernel:
     # flip spatial dims and swap input / output channel axes
     rhs = _flip_axes(rhs, np.array(dn.rhs_spec)[2:])
-    rhs = np.swapaxes(rhs, dn.rhs_spec[0], dn.rhs_spec[1])
+    rhs = rhs.swapaxes(dn.rhs_spec[0], dn.rhs_spec[1])
   return conv_general_dilated(lhs, rhs, one, pads, strides, rhs_dilation, dn,
                               precision=precision,
                               preferred_element_type=preferred_element_type)
@@ -797,9 +792,7 @@ def conv_shape_tuple(lhs_shape, rhs_shape, strides, pads, batch_group_count=1):
   if np.any(lhs_padded < 0):
     raise ValueError("Negative padding is larger than the size of the corresponding dimension: "
                      f"got padding={pads} for lhs_shape[2:]={lhs_shape[2:]}")
-  out_space = core.stride_shape(lhs_padded, rhs_shape[2:], strides)
-  out_space = [d if core.greater_equal_dim(d, 0) else 0
-               for d in out_space]
+  out_space = tuple(map(core.stride_dim, lhs_padded, rhs_shape[2:], strides))
   if batch_group_count > 1:
     assert lhs_shape[0] % batch_group_count == 0
     out_shape_0 = lhs_shape[0] // batch_group_count
@@ -930,8 +923,7 @@ def _conv_general_vjp_rhs_padding(
   rhs_dilated_shape = lax._dilate_shape(window_dimensions, rhs_dilation)
   out_dilated_shape = lax._dilate_shape(out_shape, window_strides)
   pads_lo, _ = util.unzip2(padding)
-  pads_from_lhs = core.diff_shape(out_dilated_shape, lhs_dilated_shape)
-  pads_from_rhs = core.diff_shape(core.diff_shape(rhs_dilated_shape, pads_lo),
-                                  (1,) * len(pads_lo))
-  pads_hi = core.sum_shapes(pads_from_lhs, pads_from_rhs)
+  pads_from_lhs = map(operator.sub, out_dilated_shape, lhs_dilated_shape)
+  pads_from_rhs = tuple(rd - pd - 1 for rd, pd in zip(rhs_dilated_shape, pads_lo))
+  pads_hi = tuple(map(operator.add, pads_from_lhs, pads_from_rhs))
   return list(zip(pads_lo, pads_hi))

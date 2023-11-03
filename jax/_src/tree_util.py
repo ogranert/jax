@@ -14,15 +14,14 @@
 from __future__ import annotations
 
 import collections
+from collections.abc import Hashable, Iterable
 from dataclasses import dataclass
 import difflib
 import functools
 from functools import partial
 import operator as op
 import textwrap
-from typing import (Any, Callable, Hashable, Iterable, NamedTuple,
-                    Optional, TypeVar, Union, overload)
-import warnings
+from typing import Any, Callable, NamedTuple, Type, TypeVar, Union, overload
 
 from jax._src import traceback_util
 from jax._src.lib import pytree
@@ -34,13 +33,35 @@ traceback_util.register_exclusion(__file__)
 
 T = TypeVar("T")
 U = TypeVar("U", bound=type[Any])
+H = TypeVar("H", bound=Hashable)
 
 Leaf = Any
 PyTreeDef = pytree.PyTreeDef
 
+default_registry = pytree.default_registry()
+# Set __module__ and __name__, which allow this registry to be pickled by
+# reference.
+default_registry.__module__ = __name__
+default_registry.__name__ = "default_registry"
+
+# A special, internal pytree registry that includes everything in
+# `default_registry`, plus internal Python-defined types that we want
+# to teach the fast dispatch path ("C++ dispatch") how to flatten and
+# unflatten. A key example is PRNG key arrays, which are currently a
+# Python-defined class (in `jax._src.prng`). These ought to be a leaf
+# node everywhere in the system (e.g. in Jaxpr), but we want to unpack
+# and repack them across the fast dispatch boundary. If we were to
+# skip registering such types here, the fast dispatch path would not
+# know how to handle them as arguments. It would instead always
+# indicate a "cache miss" and dispatch on the slow path.
+dispatch_registry = pytree.PyTreeRegistry(
+    enable_none=True, enable_tuple=True, enable_namedtuple=True,
+    enable_list=True, enable_dict=True)
+dispatch_registry.__module__ = __name__
+dispatch_registry.__name__ = "dispatch_registry"
 
 def tree_flatten(tree: Any,
-                 is_leaf: Optional[Callable[[Any], bool]] = None
+                 is_leaf: Callable[[Any], bool] | None = None
                  ) -> tuple[list[Leaf], PyTreeDef]:
   """Flattens a pytree.
 
@@ -54,11 +75,12 @@ def tree_flatten(tree: Any,
       flattening step. It should return a boolean, with true stopping the
       traversal and the whole subtree being treated as a leaf, and false
       indicating the flattening should traverse the current object.
+
   Returns:
     A pair where the first element is a list of leaf values and the second
     element is a treedef representing the structure of the flattened tree.
   """
-  return pytree.flatten(tree, is_leaf)
+  return default_registry.flatten(tree, is_leaf)
 
 
 def tree_unflatten(treedef: PyTreeDef, leaves: Iterable[Leaf]) -> Any:
@@ -68,8 +90,8 @@ def tree_unflatten(treedef: PyTreeDef, leaves: Iterable[Leaf]) -> Any:
 
   Args:
     treedef: the treedef to reconstruct
-    leaves: the iterable of leaves to use for reconstruction. The iterable
-      must match the leaves of the treedef.
+    leaves: the iterable of leaves to use for reconstruction. The iterable must
+      match the leaves of the treedef.
 
   Returns:
     The reconstructed pytree, containing the ``leaves`` placed in the structure
@@ -77,32 +99,40 @@ def tree_unflatten(treedef: PyTreeDef, leaves: Iterable[Leaf]) -> Any:
   """
   return treedef.unflatten(leaves)
 
+
 def tree_leaves(tree: Any,
-                is_leaf: Optional[Callable[[Any], bool]] = None
+                is_leaf: Callable[[Any], bool] | None = None
                 ) -> list[Leaf]:
   """Gets the leaves of a pytree."""
-  return pytree.flatten(tree, is_leaf)[0]
+  return default_registry.flatten(tree, is_leaf)[0]
+
 
 def tree_structure(tree: Any,
-                   is_leaf: Optional[Callable[[Any], bool]] = None) -> PyTreeDef:
+                   is_leaf: None | (Callable[[Any],
+                                              bool]) = None) -> PyTreeDef:
   """Gets the treedef for a pytree."""
-  return pytree.flatten(tree, is_leaf)[1]
+  return default_registry.flatten(tree, is_leaf)[1]
+
 
 def treedef_tuple(treedefs: Iterable[PyTreeDef]) -> PyTreeDef:
   """Makes a tuple treedef from an iterable of child treedefs."""
-  return pytree.tuple(list(treedefs))
+  return pytree.tuple(default_registry, list(treedefs))  # type: ignore
+
 
 def treedef_children(treedef: PyTreeDef) -> list[PyTreeDef]:
   return treedef.children()
 
+
 def treedef_is_leaf(treedef: PyTreeDef) -> bool:
   return treedef.num_nodes == 1
+
 
 def treedef_is_strict_leaf(treedef: PyTreeDef) -> bool:
   return treedef.num_nodes == 1 and treedef.num_leaves == 1
 
+
 def all_leaves(iterable: Iterable[Any],
-               is_leaf: Optional[Callable[[Any], bool]] = None) -> bool:
+               is_leaf: Callable[[Any], bool] | None = None) -> bool:
   """Tests whether all elements in the given iterable are all leaves.
 
   >>> tree = {"a": [1, 2, 3]}
@@ -120,7 +150,7 @@ def all_leaves(iterable: Iterable[Any],
     A boolean indicating if all elements in the input are leaves.
   """
   if is_leaf is None:
-    return pytree.all_leaves(iterable)
+    return pytree.all_leaves(default_registry, iterable)
   else:
     lst = list(iterable)
     return lst == tree_leaves(lst, is_leaf)
@@ -140,16 +170,17 @@ def register_pytree_node(nodetype: type[T],
     nodetype: a Python type to treat as an internal pytree node.
     flatten_func: a function to be used during flattening, taking a value of
       type ``nodetype`` and returning a pair, with (1) an iterable for the
-      children to be flattened recursively, and (2) some hashable auxiliary
-      data to be stored in the treedef and to be passed to the
-      ``unflatten_func``.
+      children to be flattened recursively, and (2) some hashable auxiliary data
+      to be stored in the treedef and to be passed to the ``unflatten_func``.
     unflatten_func: a function taking two arguments: the auxiliary data that was
       returned by ``flatten_func`` and stored in the treedef, and the
       unflattened children. The function should return an instance of
       ``nodetype``.
   """
-  pytree.register_node(nodetype, flatten_func, unflatten_func)
+  default_registry.register_node(nodetype, flatten_func, unflatten_func)
+  dispatch_registry.register_node(nodetype, flatten_func, unflatten_func)
   _registry[nodetype] = _RegistryEntry(flatten_func, unflatten_func)
+
 
 def register_pytree_node_class(cls: U) -> U:
   """Extends the set of types that are considered internal nodes in pytrees.
@@ -168,11 +199,14 @@ def register_pytree_node_class(cls: U) -> U:
       def tree_unflatten(cls, aux_data, children):
         return cls(*children)
   """
-  register_pytree_node(cls, op.methodcaller('tree_flatten'), cls.tree_unflatten)
+  register_pytree_node(cls, op.methodcaller("tree_flatten"), cls.tree_unflatten)
   return cls
 
-def tree_map(f: Callable[..., Any], tree: Any, *rest: Any,
-             is_leaf: Optional[Callable[[Any], bool]] = None) -> Any:
+
+def tree_map(f: Callable[..., Any],
+             tree: Any,
+             *rest: Any,
+             is_leaf: Callable[[Any], bool] | None = None) -> Any:
   """Maps a multi-input function over pytree args to produce a new pytree.
 
   Args:
@@ -183,9 +217,9 @@ def tree_map(f: Callable[..., Any], tree: Any, *rest: Any,
     rest: a tuple of pytrees, each of which has the same structure as ``tree``
       or has ``tree`` as a prefix.
     is_leaf: an optionally specified function that will be called at each
-      flattening step. It should return a boolean, which indicates whether
-      the flattening should traverse the current object, or if it should be
-      stopped immediately, with the whole subtree being treated as a leaf.
+      flattening step. It should return a boolean, which indicates whether the
+      flattening should traverse the current object, or if it should be stopped
+      immediately, with the whole subtree being treated as a leaf.
 
   Returns:
     A new pytree with the same structure as ``tree`` but with the value at each
@@ -209,13 +243,15 @@ def tree_map(f: Callable[..., Any], tree: Any, *rest: Any,
   all_leaves = [leaves] + [treedef.flatten_up_to(r) for r in rest]
   return treedef.unflatten(f(*xs) for xs in zip(*all_leaves))
 
+
 def build_tree(treedef: PyTreeDef, xs: Any) -> Any:
   return treedef.from_iterable_tree(xs)
 
-def tree_transpose(outer_treedef: PyTreeDef,
-                   inner_treedef: PyTreeDef,
+
+def tree_transpose(outer_treedef: PyTreeDef, inner_treedef: PyTreeDef,
                    pytree_to_transpose: Any) -> Any:
   """Transform a tree having tree structure (outer, inner) into one having structure
+
   (inner, outer).
   """
   flat, treedef = tree_flatten(pytree_to_transpose)
@@ -225,10 +261,13 @@ def tree_transpose(outer_treedef: PyTreeDef,
     expected_treedef = outer_treedef.compose(inner_treedef)
     raise TypeError(f"Mismatch\n{treedef}\n != \n{expected_treedef}")
   iter_flat = iter(flat)
-  lol = [[next(iter_flat) for _ in range(inner_size)] for __ in range(outer_size)]
+  lol = [
+      [next(iter_flat) for _ in range(inner_size)] for __ in range(outer_size)
+  ]
   transposed_lol = zip(*lol)
   subtrees = map(partial(tree_unflatten, outer_treedef), transposed_lol)
   return tree_unflatten(inner_treedef, subtrees)
+
 
 # TODO(mattjj): remove the Python-side registry when the C++-side registry is
 # sufficiently queryable that we can express _replace_nones. That may mean once
@@ -241,6 +280,7 @@ _registry = {
                          lambda keys, xs: dict(zip(keys, xs))),
     type(None): _RegistryEntry(lambda z: ((), None), lambda _, xs: None),
 }
+
 def _replace_nones(sentinel, tree):
   """Replaces ``None`` in ``tree`` with ``sentinel``."""
   if tree is None:
@@ -251,7 +291,7 @@ def _replace_nones(sentinel, tree):
       children, metadata = handler.to_iter(tree)
       proc_children = [_replace_nones(sentinel, child) for child in children]
       return handler.from_iter(metadata, proc_children)
-    elif isinstance(tree, tuple) and hasattr(tree, '_fields'):
+    elif isinstance(tree, tuple) and hasattr(tree, "_fields"):
       # handle namedtuple as a special case, based on heuristic
       children = iter(tree)
       proc_children = [_replace_nones(sentinel, child) for child in children]
@@ -259,26 +299,30 @@ def _replace_nones(sentinel, tree):
     else:
       return tree
 
+
 no_initializer = object()
+
 
 @overload
 def tree_reduce(function: Callable[[T, Any], T],
                 tree: Any,
                 *,
-                is_leaf: Optional[Callable[[Any], bool]] = None) -> T:
+                is_leaf: Callable[[Any], bool] | None = None) -> T:
     ...
+
 
 @overload
 def tree_reduce(function: Callable[[T, Any], T],
                 tree: Any,
                 initializer: T,
-                is_leaf: Optional[Callable[[Any], bool]] = None) -> T:
+                is_leaf: Callable[[Any], bool] | None = None) -> T:
     ...
+
 
 def tree_reduce(function: Callable[[T, Any], T],
                 tree: Any,
                 initializer: Any = no_initializer,
-                is_leaf: Optional[Callable[[Any], bool]] = None) -> T:
+                is_leaf: Callable[[Any], bool] | None = None) -> T:
   if initializer is no_initializer:
     return functools.reduce(function, tree_leaves(tree, is_leaf=is_leaf))
   else:
@@ -286,6 +330,7 @@ def tree_reduce(function: Callable[[T, Any], T],
 
 def tree_all(tree: Any) -> bool:
   return all(tree_leaves(tree))
+
 
 register_pytree_node(
   collections.OrderedDict,
@@ -300,6 +345,7 @@ register_pytree_node(
 
 class _HashableCallableShim:
   """Object that delegates __call__, __hash__, and __eq__ to another object."""
+
   def __init__(self, fun):
     self.fun = fun
 
@@ -315,7 +361,7 @@ class _HashableCallableShim:
     return self.fun == other
 
   def __repr__(self):
-    return f'_HashableCallableShim({repr(self.fun)})'
+    return f'_HashableCallableShim({self.fun!r})'
 
 
 class Partial(functools.partial):
@@ -353,7 +399,8 @@ class Partial(functools.partial):
   >>> call_func(Partial(jnp.add), 1, 2)
   Array(3, dtype=int32, weak_type=True)
 
-  Had we passed ``jnp.add`` to ``call_func`` directly, it would have resulted in a
+  Had we passed ``jnp.add`` to ``call_func`` directly, it would have resulted in
+  a
   ``TypeError``.
 
   Note that if the result of ``Partial`` is used in the context where the
@@ -366,6 +413,7 @@ class Partial(functools.partial):
   >>> call_func(print_zero)  # doctest:+ELLIPSIS
   Traced<ShapedArray(int32[], weak_type=True)>with<DynamicJaxprTrace...>
   """
+
   def __new__(klass, func, *args, **kw):
     # In Python 3.10+, if func is itself a functools.partial instance,
     # functools.partial.__new__ would merge the arguments of this Partial
@@ -392,7 +440,7 @@ register_pytree_node(
 
 
 def broadcast_prefix(prefix_tree: Any, full_tree: Any,
-                     is_leaf: Optional[Callable[[Any], bool]] = None
+                     is_leaf: Callable[[Any], bool] | None = None
                      ) -> list[Any]:
   # If prefix_tree is not a tree prefix of full_tree, this code can raise a
   # ValueError; use prefix_errors to find disagreements and raise more precise
@@ -428,12 +476,12 @@ def flatten_one_level(pytree: Any) -> tuple[list[Any], Hashable]:
     raise ValueError(f"can't tree-flatten type: {type(pytree)}")
 
 def prefix_errors(prefix_tree: Any, full_tree: Any,
-                  is_leaf: Optional[Callable[[Any], bool]] = None,
+                  is_leaf: Callable[[Any], bool] | None = None,
                   ) -> list[Callable[[str], ValueError]]:
   return list(_prefix_error((), prefix_tree, full_tree, is_leaf))
 
 def equality_errors(
-    tree1: Any, tree2: Any, is_leaf: Optional[Callable[[Any], bool]] = None,
+    tree1: Any, tree2: Any, is_leaf: Callable[[Any], bool] | None = None,
 ) -> Iterable[tuple[KeyPath, str, str, str]]:
   """Helper to describe structural differences between two pytrees.
 
@@ -509,16 +557,15 @@ def _equality_errors(path, t1, t2, is_leaf):
     yield from _equality_errors((*path, k), c1, c2, is_leaf)
 
 
-# TODO(ivyzheng): Remove old APIs when all users migrated.
-
 class _DeprecatedKeyPathEntry(NamedTuple):
   key: Any
+
   def pprint(self) -> str:
     assert False  # must override
 
 class GetitemKeyPathEntry(_DeprecatedKeyPathEntry):
   def pprint(self) -> str:
-    return f'[{repr(self.key)}]'
+    return f'[{self.key!r}]'
   def __str__(self):
     return self.pprint()
 
@@ -528,24 +575,17 @@ class AttributeKeyPathEntry(_DeprecatedKeyPathEntry):
   def __str__(self):
     return self.pprint()
 
-class FlattenedKeyPathEntry(_DeprecatedKeyPathEntry):  # fallback
-  def pprint(self) -> str:
-    return f'[<flat index {self.key}>]'
-  def __str__(self):
-    return self.pprint()
-
-
 @dataclass(frozen=True)
 class SequenceKey():
   idx: int
   def __str__(self):
-    return f'[{repr(self.idx)}]'
+    return f'[{self.idx!r}]'
 
 @dataclass(frozen=True)
 class DictKey():
   key: Hashable
   def __str__(self):
-    return f'[{repr(self.key)}]'
+    return f'[{self.key!r}]'
 
 @dataclass(frozen=True)
 class GetAttrKey():
@@ -590,15 +630,6 @@ def register_keypaths(
 
   Only works if the type was already registered with ``register_pytree_node``.
   """
-  warnings.warn(
-      (
-          "jax.tree_util.register_keypaths is deprecated, and will be removed"
-          " in a future release. Please use `register_pytree_with_keys()`"
-          " instead."
-      ),
-      category=FutureWarning,
-      stacklevel=2,
-  )
   _register_keypaths(ty, handler)
 
 
@@ -639,9 +670,9 @@ def register_pytree_with_keys(
         [T], tuple[Iterable[tuple[KeyEntry, Any]], _AuxData]
     ],
     unflatten_func: Callable[[_AuxData, Iterable[Any]], T],
-    flatten_func: Optional[
+    flatten_func: None | (
         Callable[[T], tuple[Iterable[Any], _AuxData]]
-    ] = None,
+    ) = None,
 ):
   """Extends the set of types that are considered internal nodes in pytrees.
 
@@ -706,8 +737,32 @@ def register_pytree_with_keys_class(cls: U) -> U:
   return cls
 
 
+def register_static(cls: Type[H]) -> Type[H]:
+  """Registers `cls` as a pytree with no leaves.
+
+  Instances are treated as static by `jax.jit`, `jax.pmap`, etc. This can be an
+  alternative to labeling inputs as static using `jax.jit`'s `static_argnums`
+  and `static_argnames` kwargs, `jax.pmap`'s `static_broadcasted_argnums`, etc.
+
+  `cls` must be hashable, as defined in
+  https://docs.python.org/3/glossary.html#term-hashable.
+
+  `register_static` can be applied to subclasses of builtin hashable classes
+  such as `str`, like this:
+  ```
+  @tree_util.register_static
+  class StaticStr(str):
+    pass
+  ```
+  """
+  flatten = lambda obj: ((), obj)
+  unflatten = lambda obj, empty_iter_children: obj
+  register_pytree_with_keys(cls, flatten, unflatten)
+  return cls
+
+
 def tree_flatten_with_path(
-    tree: Any, is_leaf: Optional[Callable[[Any], bool]] = None
+    tree: Any, is_leaf: Callable[[Any], bool] | None = None
 ) -> tuple[list[tuple[KeyPath, Any]], PyTreeDef]:
   """Flattens a pytree like ``tree_flatten``, but also returns each leaf's key path.
 
@@ -724,7 +779,7 @@ def tree_flatten_with_path(
 
 
 def tree_leaves_with_path(
-    tree: Any, is_leaf: Optional[Callable[[Any], bool]] = None
+    tree: Any, is_leaf: Callable[[Any], bool] | None = None
 ) -> list[tuple[KeyPath, Any]]:
   """Gets the leaves of a pytree like ``tree_leaves`` and returns each leaf's key path.
 
@@ -738,7 +793,7 @@ def tree_leaves_with_path(
 
 
 def generate_key_paths(
-    tree: Any, is_leaf: Optional[Callable[[Any], bool]] = None
+    tree: Any, is_leaf: Callable[[Any], bool] | None = None
 ) -> list[tuple[KeyPath, Any]]:
   return list(_generate_key_paths_((), tree, is_leaf))
 _generate_key_paths = generate_key_paths  # alias for backward compat
@@ -748,7 +803,7 @@ _generate_key_paths = generate_key_paths  # alias for backward compat
 def _generate_key_paths_(
     key_path: KeyPath,
     tree: Any,
-    is_leaf: Optional[Callable[[Any], bool]] = None,
+    is_leaf: Callable[[Any], bool] | None = None,
 ) -> Iterable[tuple[KeyPath, Any]]:
   if is_leaf and is_leaf(tree):
     yield key_path, tree
@@ -775,7 +830,7 @@ def _generate_key_paths_(
 
 def tree_map_with_path(f: Callable[..., Any],
                        tree: Any, *rest: Any,
-                       is_leaf: Optional[Callable[[Any], bool]] = None) -> Any:
+                       is_leaf: Callable[[Any], bool] | None = None) -> Any:
   """Maps a multi-input function over pytree key path and args to produce a new pytree.
 
   This is a more powerful alternative of ``tree_map`` that can take the key path
@@ -815,11 +870,15 @@ def _child_keys(pytree: Any) -> KeyPath:
     return tuple(FlattenedIndexKey(i) for i in range(num_children))
 
 
-def _prefix_error(key_path: KeyPath, prefix_tree: Any, full_tree: Any,
-                  is_leaf: Optional[Callable[[Any], bool]] = None,
-                  ) -> Iterable[Callable[[str], ValueError]]:
+def _prefix_error(
+    key_path: KeyPath,
+    prefix_tree: Any,
+    full_tree: Any,
+    is_leaf: Callable[[Any], bool] | None = None,
+) -> Iterable[Callable[[str], ValueError]]:
   # A leaf is a valid prefix of any tree:
-  if treedef_is_strict_leaf(tree_structure(prefix_tree, is_leaf=is_leaf)): return
+  if treedef_is_strict_leaf(tree_structure(prefix_tree, is_leaf=is_leaf)):
+    return
 
   # The subtrees may disagree because their roots are of different types:
   if type(prefix_tree) != type(full_tree):
@@ -881,8 +940,9 @@ def _prefix_error(key_path: KeyPath, prefix_tree: Any, full_tree: Any,
     prefix_tree_meta_str = str(prefix_tree_meta)
     full_tree_meta_str = str(full_tree_meta)
     metadata_diff = textwrap.indent(
-        '\n'.join(difflib.ndiff(prefix_tree_meta_str.splitlines(),
-                                full_tree_meta_str.splitlines())),
+        "\n".join(
+            difflib.ndiff(prefix_tree_meta_str.splitlines(),
+                          full_tree_meta_str.splitlines())),
         prefix="    ")
     yield lambda name: ValueError(
       "pytree structure error: different pytree metadata at key path\n"
@@ -905,22 +965,3 @@ def _prefix_error(key_path: KeyPath, prefix_tree: Any, full_tree: Any,
      f"{prefix_tree_keys} and {full_tree_keys}")
   for k, t1, t2 in zip(prefix_tree_keys, prefix_tree_children, full_tree_children):
     yield from _prefix_error((*key_path, k), t1, t2)
-
-
-# TODO(jakevdp) remove these deprecated wrappers & their imports in jax/__init__.py
-def _deprecate(f):
-  @functools.wraps(f)
-  def wrapped(*args, **kwargs):
-    warnings.warn(f"jax.{f.__name__} is deprecated, and will be removed in a future release. "
-                  f"Use jax.tree_util.{f.__name__} instead.",
-                  category=FutureWarning, stacklevel=2)
-    return f(*args, **kwargs)
-  return wrapped
-
-def __getattr__(name):
-  prefix = "_deprecated_"
-  if name.startswith(prefix):
-    name = name[len(prefix):]
-    return _deprecate(globals()[name])
-  else:
-    raise AttributeError(f"module {__name__} has no attribute {name!r}")

@@ -20,10 +20,12 @@ import functools
 import jax
 import jax.numpy as jnp
 
+from jax.experimental import sparse
 from jax.interpreters import mlir
 from jax.interpreters import xla
 
 from jax._src import core
+from jax._src.interpreters import ad
 from jax._src.lib import gpu_solver
 
 import numpy as np
@@ -197,7 +199,7 @@ def _lobpcg_standard_callable(
     # I tried many variants of hard and soft locking [3]. All of them seemed
     # to worsen performance relative to no locking.
     #
-    # Further, I found a more expermental convergence formula compared to what
+    # Further, I found a more experimental convergence formula compared to what
     # is suggested in the literature, loosely based on floating-point
     # expectations.
     #
@@ -449,7 +451,7 @@ def _rayleigh_ritz_orth(A, S):
 
   SAS = _mm(S.T, A(S))
 
-  # Solve the projected subsytem.
+  # Solve the projected subsystem.
   # If we could tell to eigh to stop after first k, we would.
   return _eigh_ascending(SAS)
 
@@ -542,16 +544,54 @@ def _spsolve_cpu_lowering(ctx, data, indices, indptr, b, tol, reorder):
     A = csr_matrix((data, indices, indptr), shape=(b.size, b.size))
     return (linalg.spsolve(A, b).astype(b.dtype),)
 
-  result, _, keepalive = mlir.emit_python_callback(
+  result, _, _ = mlir.emit_python_callback(
       ctx, _callback, None, args, ctx.avals_in, ctx.avals_out,
       has_side_effect=False)
-  ctx.module_context.add_keepalive(keepalive)
   return result
+
+
+def _spsolve_jvp_lhs(data_dot, data, indices, indptr, b, **kwds):
+    # d/dM M^-1 b = M^-1 M_dot M^-1 b
+    p = spsolve(data, indices, indptr, b, **kwds)
+    q = sparse.csr_matvec_p.bind(data_dot, indices, indptr, p,
+                                 shape=(indptr.size - 1, len(b)),
+                                 transpose=False)
+    return -spsolve(data, indices, indptr, q, **kwds)
+
+
+def _spsolve_jvp_rhs(b_dot, data, indices, indptr, b, **kwds):
+    # d/db M^-1 b = M^-1 b_dot
+    return spsolve(data, indices, indptr, b_dot, **kwds)
+
+
+def _csr_transpose(data, indices, indptr):
+  # Transpose of a square CSR matrix
+  m = indptr.size - 1
+  row = jnp.cumsum(jnp.zeros_like(indices).at[indptr].add(1)) - 1
+  row_T, indices_T, data_T = jax.lax.sort((indices, row, data), num_keys=2)
+  indptr_T = jnp.zeros_like(indptr).at[1:].set(
+      jnp.cumsum(jnp.bincount(row_T, length=m)).astype(indptr.dtype))
+  return data_T, indices_T, indptr_T
+
+
+def _spsolve_transpose(ct, data, indices, indptr, b, **kwds):
+  assert not ad.is_undefined_primal(indices)
+  assert not ad.is_undefined_primal(indptr)
+  if ad.is_undefined_primal(b):
+    # TODO(jakevdp): can we do this without an explicit transpose?
+    data_T, indices_T, indptr_T = _csr_transpose(data, indices, indptr)
+    ct_out = spsolve(data_T, indices_T, indptr_T, ct, **kwds)
+    return data, indices, indptr, ct_out
+  else:
+    # Should never reach here, because JVP is linear wrt data.
+    raise NotImplementedError("spsolve transpose with respect to data")
 
 
 spsolve_p = core.Primitive('spsolve')
 spsolve_p.def_impl(functools.partial(xla.apply_primitive, spsolve_p))
 spsolve_p.def_abstract_eval(_spsolve_abstract_eval)
+ad.defjvp(spsolve_p, _spsolve_jvp_lhs, None, None, _spsolve_jvp_rhs)
+ad.primitive_transposes[spsolve_p] = _spsolve_transpose
 mlir.register_lowering(spsolve_p, _spsolve_gpu_lowering, platform='cuda')
 mlir.register_lowering(spsolve_p, _spsolve_cpu_lowering, platform='cpu')
 

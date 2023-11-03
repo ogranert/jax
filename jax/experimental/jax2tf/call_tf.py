@@ -22,8 +22,9 @@ For examples and details, see
 https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#calling-tensorflow-functions-from-jax.
 
 """
+from collections.abc import Sequence
 import functools
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional
 
 from absl import logging
 import jax
@@ -56,16 +57,18 @@ TfConcreteFunction = Any
 TfVal = jax2tf_internal.TfVal
 
 # The platforms for which to use DLPack to avoid copying (only works on GPU
-# and CPU at the moment, and only for DeviceArray). For CPU we don't need
+# and CPU at the moment, and only for Array). For CPU we don't need
 # DLPack, if we are careful.
 _DLPACK_PLATFORMS = ("gpu",)
 
+class UnspecifiedOutputShapeDtype:
+  pass
 
 def call_tf(
     callable_tf: Callable,
     has_side_effects=True,
     ordered=False,
-    output_shape_dtype=None,
+    output_shape_dtype=UnspecifiedOutputShapeDtype(),
     call_tf_graph=False,
 ) -> Callable:
   """Calls a TensorFlow function from JAX, with support for reverse autodiff.
@@ -134,7 +137,7 @@ def call_tf(
       return tf.TensorSpec(a_tf_shape, a_tf_dtype)
     args_flat_sig_tf = tuple(map(make_tensorspec, args_flat_jax))
 
-    if output_shape_dtype is not None:
+    if not isinstance(output_shape_dtype, UnspecifiedOutputShapeDtype):
       output_shape_dtype_flat, output_shape_dtype_tree = tree_util.tree_flatten(output_shape_dtype)
       output_avals = tuple(core.ShapedArray(st.shape, st.dtype) for st in output_shape_dtype_flat)
     else:
@@ -191,8 +194,6 @@ def call_tf(
 
     # Prepare a tf.function ahead of time, to cache the concrete functions. This
     # won't be used in op-by-op execution mode.
-    # `jit_compile` is not enabled when `call_tf_graph` is True, since the
-    # custom call function won't be compilable.
     function_flat_tf = tf.function(
         callable_flat_tf, autograph=False, jit_compile=not call_tf_graph)
 
@@ -334,7 +335,7 @@ def _call_tf_impl(*args_jax_flat, callable_flat_tf, **_):
         arg_jax.dtype in dlpack.SUPPORTED_DTYPES):
       arg_dlpack = jax.dlpack.to_dlpack(arg_jax, take_ownership=False)
       return tf.experimental.dlpack.from_dlpack(arg_dlpack)
-    # The following avoids copies to the host on CPU, always for DeviceArray
+    # The following avoids copies to the host on CPU, always for Array
     # and even for ndarray if they are sufficiently aligned.
     # TODO(necula): on TPU this copies to the host!
     return tf.constant(np.asarray(arg_jax))
@@ -394,6 +395,7 @@ effects.control_flow_allowed_effects.add_type(CallTfOrderedEffect)
 effects.remat_allowed_effects.add_type(CallTfOrderedEffect)
 effects.custom_derivatives_allowed_effects.add_type(CallTfOrderedEffect)
 effects.ordered_effects.add_type(CallTfOrderedEffect)
+effects.shardable_ordered_effects.add_type(CallTfOrderedEffect)
 
 
 def _call_tf_abstract_eval(
@@ -419,23 +421,16 @@ def _call_tf_abstract_eval(
   # there is a small cost of calling it more often than needed.
   concrete_function_flat_tf = _get_concrete_function_tf(function_flat_tf,
                                                         args_flat_sig_tf)
-  # TODO(b/278298710): when `call_tf_graph=True` for non-compilable tf function,
-  # Tensorflow shape inference is not supported and the concrete function has
-  # no structured output shapes attributes sometimes.
-  # So users always need provide output_shape_dtypes. However, in some case if
-  # In the case that the tf.function has no return value, the `output_shape_dtype` should be  `None`
-  if len(concrete_function_flat_tf.outputs) == 0:
-    return tuple(), effects
 
-  if call_tf_graph and output_avals is None:
-    raise ValueError(
-        "call_tf with `call_tf_graph=True` must provide output_shape_dtype"
-        " arg.")
+  # In the case that the tf.function has no return value
+  if len(concrete_function_flat_tf.outputs) == 0:
+    return (), effects
+
   if output_avals is not None:
     return output_avals, effects
 
   def is_fully_known_shape(s):
-    return s.rank is not None and all([d is not None for d in s])
+    return s.rank is not None and all(d is not None for d in s)
 
   if all(is_fully_known_shape(s)
         for s in concrete_function_flat_tf.output_shapes):
@@ -500,7 +495,7 @@ def _call_tf_lowering(
         captured_inputs.append(inp)
 
   captured_ops = tuple(
-      mlir.ir_constant(np.asarray(inp), canonicalize_types=False)
+      mlir.ir_constant(np.asarray(inp))
       for inp in captured_inputs
   )
 
@@ -634,14 +629,16 @@ def emit_tf_embedded_graph_custom_call(
     raise ValueError(
         "call_tf_graph=True only support exporting by jax2tf.convert currently."
     )
+  # TODO(necula): It is dangerous to modify global state when lowering because
+  # there are a number of lowering caches that only cache the StableHLO.
+  # See call_tf_test.py:test_multi_platform_call_tf_graph.
   called_index = add_to_call_tf_concrete_function_list(
       concrete_function_flat_tf, call_tf_concrete_function_list)
-  call_target_name = "tf.call_tf_function"
   tf_backend_config = {
       "has_token_input_output": ir.BoolAttr.get(ordered),
       "called_index": mlir.i64_attr(called_index),
   }
-  result_avals = output_avals if output_avals is not None else tuple()
+  result_avals = ctx.avals_out if ctx.avals_out is not None else ()
 
   operands = list(operands)
   result_types = list(
@@ -654,7 +651,7 @@ def emit_tf_embedded_graph_custom_call(
   custom_call = hlo.CustomCallOp(
       result_types,
       operands,
-      call_target_name=ir.StringAttr.get(call_target_name),
+      call_target_name=ir.StringAttr.get("tf.call_tf_function"),
       has_side_effect=ir.BoolAttr.get(has_side_effects),
       api_version=mlir.i32_attr(2),
       called_computations=ir.ArrayAttr.get([]),
@@ -674,8 +671,9 @@ def emit_tf_embedded_graph_custom_call(
 
 
 def add_to_call_tf_concrete_function_list(concrete_tf_fn: Any, call_tf_concrete_function_list: list[Any]) -> int:
-  func_name = concrete_tf_fn.function_def.signature.name
-  assert func_name not in [f.function_def.signature.name for f in call_tf_concrete_function_list]
-  called_index = len(call_tf_concrete_function_list)
-  call_tf_concrete_function_list.append(concrete_tf_fn)
+  try:
+    called_index = call_tf_concrete_function_list.index(concrete_tf_fn)
+  except ValueError:
+    called_index = len(call_tf_concrete_function_list)
+    call_tf_concrete_function_list.append(concrete_tf_fn)
   return called_index

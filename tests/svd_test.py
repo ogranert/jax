@@ -16,18 +16,18 @@
 import functools
 
 import jax
-from jax import config
 import jax.numpy as jnp
 import numpy as np
 import scipy.linalg as osp_linalg
-from jax._src.lax import svd
+from jax._src import config
 from jax._src import test_util as jtu
+from jax._src.lax import svd
 
 from absl.testing import absltest
 
 
 config.parse_flags_with_absl()
-_JAX_ENABLE_X64 = config.x64_enabled
+_JAX_ENABLE_X64 = config.enable_x64.value
 
 # Input matrix data type for SvdTest.
 _SVD_TEST_DTYPE = np.float64 if _JAX_ENABLE_X64 else np.float32
@@ -217,7 +217,6 @@ class SvdTest(jtu.JaxTestCase):
      for m, n, r, c in zip([2, 4, 8], [4, 4, 6], [1, 0, 1], [1, 0, 1])],
     dtype=jtu.dtypes.floating,
   )
-  @jtu.skip_on_devices("rocm")
   def testSvdOnTinyElement(self, m, n, r, c, dtype):
     """Tests SVD on matrix of zeros and close-to-zero entries."""
     a = jnp.zeros((m, n), dtype=dtype)

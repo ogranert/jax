@@ -15,8 +15,8 @@
 """Tests for mesh utils."""
 
 import collections
+from collections.abc import Sequence
 import dataclasses
-from typing import Sequence
 
 import numpy as np
 
@@ -28,7 +28,7 @@ from jax.sharding import Mesh
 from jax._src import test_util
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class MockTpuDevice:
   """Mock TPU device for testing."""
   id: int

@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Iterable, Sequence
 import inspect
 import operator
 from functools import partial
-from typing import Any, Callable, Iterable, Optional, Sequence, Union
+from typing import Any, Callable, Optional, Union
 import warnings
 
 import numpy as np
@@ -122,7 +123,7 @@ def flatten_fun_nokwargs2(in_tree, *args_flat):
   pair = yield py_args, {}
   if not isinstance(pair, (list, tuple)) or len(pair) != 2:
     raise TypeError("expected function with aux output to return a two-element "
-                    f"tuple, but got type {type(pair)} with value {repr(pair)}")
+                    f"tuple, but got type {type(pair)} with value {pair!r}")
   ans, aux = pair
   ans_flat, ans_tree = tree_flatten(ans)
   aux_flat, aux_tree = tree_flatten(aux)
@@ -332,13 +333,26 @@ def _argnames_partial(fixed_kwargs: WrapKwArgs, *args, **dyn_kwargs):
   yield ans
 
 
-def donation_vector(donate_argnums, args, kwargs) -> tuple[bool, ...]:
-  """Returns a tuple with a boolean value for each leaf in args."""
+def donation_vector(donate_argnums, donate_argnames, args, kwargs) -> tuple[bool, ...]:
+  """Returns a tuple with a boolean value for each leaf in args and kwargs.
+
+  What if a user specifies donate_argnums but calls the function with kwargs
+  or vice-versa? In that case, in `resolve_argnums` using the signature of the
+  function, the counterpart (donate_argnames or donate_argnums respectively) is
+  calculated so when this function is called both donate_argnums and
+  donate_argnames are available. This allows JAX to donate kwargs when only
+  donate_argnums is specified and vice-versa.
+
+  When both donate_argnums and donate_argnames are specified, only the args and
+  kwargs specified are donated.
+  """
   res: list[bool] = []
   for i, arg in enumerate(args):
     donate = bool(i in donate_argnums)
     res.extend((donate,) * tree_structure(arg).num_leaves)
-  res.extend((False,) * tree_structure(kwargs).num_leaves)
+  for key, val in kwargs.items():
+    donate = key in donate_argnames
+    res.extend((donate,) * tree_structure(val).num_leaves)
   return tuple(res)
 
 def rebase_donate_argnums(donate_argnums, static_argnums) -> tuple[int, ...]:
@@ -446,16 +460,6 @@ def _flat_out_axes(leaves, treedef, *args, **kwargs):
     raise ValueError(msg) from None
   yield ans, spec_flat
 
-def _isgeneratorfunction(fun):
-  # TODO 3.9+: remove
-  # re-implemented here because of https://bugs.python.org/issue33261
-  while inspect.ismethod(fun):
-    fun = fun.__func__
-  while isinstance(fun, partial):
-    fun = fun.func
-  return inspect.isfunction(fun) and bool(fun.__code__.co_flags & inspect.CO_GENERATOR)
-
-
 def check_callable(fun):
   # In Python 3.10+, the only thing stopping us from supporting staticmethods
   # is that we can't take weak references to them, which the C++ JIT requires.
@@ -463,7 +467,7 @@ def check_callable(fun):
     raise TypeError(f"staticmethod arguments are not supported, got {fun}")
   if not callable(fun):
     raise TypeError(f"Expected a callable value, got {fun}")
-  if _isgeneratorfunction(fun):
+  if inspect.isgeneratorfunction(fun):
     raise TypeError(f"Expected a function, got a generator function: {fun}")
 
 _POSITIONAL_OR_KEYWORD = inspect.Parameter.POSITIONAL_OR_KEYWORD
@@ -480,7 +484,6 @@ def infer_argnums_and_argnames(
   if argnums is not None and argnames is not None:
     argnums = _ensure_index_tuple(argnums)
     argnames = _ensure_str_tuple(argnames)
-
     return argnums, argnames
 
   parameters = sig.parameters
@@ -502,14 +505,11 @@ def infer_argnums_and_argnames(
 
 
 def resolve_argnums(
-    fun, donate_argnums, static_argnums, static_argnames
-) -> tuple[tuple[int, ...], tuple[int, ...], tuple[str, ...]]:
-  # Coerce input
-  donate_argnums = _ensure_index_tuple(donate_argnums)
-
+    fun, donate_argnums, donate_argnames, static_argnums, static_argnames
+) -> tuple[tuple[int, ...], tuple[str, ...], tuple[int, ...], tuple[str, ...]]:
   try:
     sig = inspect.signature(fun)
-  except ValueError:
+  except ValueError as e:
     # Some built-in functions don't support signature.
     # See: https://github.com/python/cpython/issues/73485
     # In this case no validation is done
@@ -517,19 +517,40 @@ def resolve_argnums(
         static_argnums)
     static_argnames = () if static_argnames is None else _ensure_str_tuple(
         static_argnames)
+    donate_argnums = () if donate_argnums is None else _ensure_index_tuple(
+        donate_argnums)
+    if donate_argnames is not None:
+      raise ValueError(f"Getting the signature of function {fun} failed. "
+                       "Pass donate_argnums instead of donate_argnames.") from e
+    assert donate_argnames is None
+    donate_argnames = ()
   else:
     # Infer argnums and argnames according to docstring
+    # If nums is None and names is not None, then nums are inferred from the
+    # names and vice-versa.
     static_argnums, static_argnames = infer_argnums_and_argnames(
         sig, static_argnums, static_argnames)
+    donate_argnums, donate_argnames = infer_argnums_and_argnames(
+        sig, donate_argnums, donate_argnames)
 
     # Validation
     validate_argnums(sig, static_argnums, "static_argnums")
-    validate_argnums(sig, donate_argnums, "donate_argnums")
     validate_argnames(sig, static_argnames, "static_argnames")
+    validate_argnums(sig, donate_argnums, "donate_argnums")
+    validate_argnames(sig, donate_argnames, "donate_argnames")
 
   # Compensate for static argnums absorbing args
+  assert_no_intersection(static_argnames, donate_argnames)
   donate_argnums = rebase_donate_argnums(donate_argnums, static_argnums)
-  return donate_argnums, static_argnums, static_argnames
+  return donate_argnums, donate_argnames, static_argnums, static_argnames
+
+
+def assert_no_intersection(static_argnames, donate_argnames):
+  out = set(static_argnames).intersection(set(donate_argnames))
+  if out:
+    raise ValueError(
+        "static_argnames and donate_argnames cannot intersect. Argument names "
+        f"{out} appear in both static_argnames and donate_argnames")
 
 
 def _dtype(x):
@@ -548,7 +569,7 @@ def _shaped_abstractify_slow(x):
   weak_type = getattr(x, 'weak_type', False)
   named_shape = getattr(x, 'named_shape', {})
   if hasattr(x, 'dtype'):
-    dtype = dtypes.canonicalize_dtype(x.dtype, allow_opaque_dtype=True)
+    dtype = dtypes.canonicalize_dtype(x.dtype, allow_extended_dtype=True)
   else:
     raise TypeError(
         f"Cannot interpret value of type {type(x)} as an abstract array; it "
@@ -573,14 +594,14 @@ def _numpy_array_abstractify(x: np.ndarray) -> ShapedArray:
   dtype = x.dtype
   dtypes.check_valid_dtype(dtype)
   return ShapedArray(x.shape,
-      dtypes.canonicalize_dtype(dtype, allow_opaque_dtype=True))
+      dtypes.canonicalize_dtype(dtype, allow_extended_dtype=True))
 _shaped_abstractify_handlers[np.ndarray] = _numpy_array_abstractify
 
 def _np_scalar_abstractify(x: np.generic) -> ShapedArray:
   dtype = np.dtype(x)
   dtypes.check_valid_dtype(dtype)
   return ShapedArray(np.shape(x),
-      dtypes.canonicalize_dtype(dtype, allow_opaque_dtype=True))
+      dtypes.canonicalize_dtype(dtype, allow_extended_dtype=True))
 _shaped_abstractify_handlers.update((t, _np_scalar_abstractify)
                                     for t in numpy_scalar_types)
 

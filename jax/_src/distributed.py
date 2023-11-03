@@ -13,14 +13,15 @@
 # limitations under the License.
 
 import atexit
+from collections.abc import Sequence
 import logging
 import os
-
-from typing import Any, Optional, Union, Sequence
+from typing import Any, Optional, Union
 
 from jax._src import clusters
-from jax._src.config import config
+from jax._src import config
 from jax._src.lib import xla_extension
+from jax._src.lib import xla_extension_version
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,8 @@ class State:
                  coordinator_address: Optional[str] = None,
                  num_processes: Optional[int] = None,
                  process_id: Optional[int] = None,
-                 local_device_ids: Optional[Union[int, Sequence[int]]] = None):
+                 local_device_ids: Optional[Union[int, Sequence[int]]] = None,
+                 initialization_timeout: int = 300):
     coordinator_address = (coordinator_address or
                            os.environ.get('JAX_COORDINATOR_ADDRESS', None))
     if isinstance(local_device_ids, int):
@@ -70,23 +72,29 @@ class State:
       if self.service is not None:
         raise RuntimeError('distributed.initialize should only be called once.')
       logger.info('Starting JAX distributed service on %s', coordinator_address)
-      self.service = xla_extension.get_distributed_runtime_service(
-          coordinator_address, num_processes, config.jax_coordination_service)
+      if xla_extension_version >= 179:
+        self.service = xla_extension.get_distributed_runtime_service(
+            coordinator_address, num_processes)
+      else:
+        self.service = xla_extension.get_distributed_runtime_service(
+            coordinator_address, num_processes, True)
 
     self.num_processes = num_processes
 
     if self.client is not None:
       raise RuntimeError('distributed.initialize should only be called once.')
 
-    # Set init_timeout to 5 min to leave time for all the processes to connect
-    self.client = xla_extension.get_distributed_runtime_client(
-        coordinator_address, process_id, config.jax_coordination_service,
-        init_timeout=300)
+    if xla_extension_version >= 179:
+      self.client = xla_extension.get_distributed_runtime_client(
+          coordinator_address, process_id, init_timeout=initialization_timeout)
+    else:
+      self.client = xla_extension.get_distributed_runtime_client(
+          coordinator_address, process_id, True,
+          init_timeout=initialization_timeout)
     logger.info('Connecting to JAX distributed service on %s', coordinator_address)
     self.client.connect()
 
-    if config.jax_coordination_service:
-      self.initialize_preemption_sync_manager()
+    self.initialize_preemption_sync_manager()
 
   def shutdown(self):
     if self.client:
@@ -112,7 +120,8 @@ global_state = State()
 def initialize(coordinator_address: Optional[str] = None,
                num_processes: Optional[int] = None,
                process_id: Optional[int] = None,
-               local_device_ids: Optional[Union[int, Sequence[int]]] = None):
+               local_device_ids: Optional[Union[int, Sequence[int]]] = None,
+               initialization_timeout: int = 300):
   """Initializes the JAX distributed system.
 
   Calling :func:`~jax.distributed.initialize` prepares JAX for execution on
@@ -147,13 +156,16 @@ def initialize(coordinator_address: Optional[str] = None,
     local_device_ids: Restricts the visible devices of the current process to ``local_device_ids``.
       If ``None``, defaults to all local devices being visible to the process except when processes
       are launched via Slurm and Open MPI on GPUs. In that case, it will default to a single device per process.
+    initialization_timeout: Time period (in seconds) for which connection will
+      be retried. If the initialization takes more than the timeout specified,
+      the initialization will error. Defaults to 300 secs i.e. 5 mins.
 
   Raises:
     RuntimeError: If :func:`~jax.distributed.initialize` is called more than once.
 
   Example:
 
-  Suppose there are two GPU processs, and process 0 is the designated coordinator
+  Suppose there are two GPU processes, and process 0 is the designated coordinator
   with address ``10.0.0.1:1234``. To initialize the GPU cluster, run the
   following commands before anything else.
 
@@ -165,7 +177,8 @@ def initialize(coordinator_address: Optional[str] = None,
 
   >>> jax.distributed.initialize(coordinator_address='10.0.0.1:1234', num_processes=2, process_id=1)  # doctest: +SKIP
   """
-  global_state.initialize(coordinator_address, num_processes, process_id, local_device_ids)
+  global_state.initialize(coordinator_address, num_processes, process_id,
+                          local_device_ids, initialization_timeout)
   atexit.register(shutdown)
 
 

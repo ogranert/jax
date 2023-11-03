@@ -15,6 +15,7 @@
 from contextlib import contextmanager
 from functools import partial
 import itertools as it
+import unittest
 from typing import Any, Optional, Callable, Union, TypeVar
 
 import numpy as np
@@ -29,6 +30,7 @@ from jax._src import dtypes
 from jax._src import test_util as jtu
 from jax import lax
 from jax._src.lax import parallel
+from jax._src.lib import version as jaxlib_version
 from jax import random
 from jax import jit, grad, jvp, vjp, make_jaxpr, jacfwd, jacrev, hessian
 from jax import vmap
@@ -220,6 +222,8 @@ class BatchingTest(jtu.JaxTestCase):
 
       self.assertAllClose(ans[i], expected_ans, check_dtypes=False)
 
+  # Replace the default TF32 with float32 in order to make it pass on A100
+  @jax.default_matmul_precision("float32")
   def testDotGeneral(self):
     R = self.rng().randn
 
@@ -401,6 +405,7 @@ class BatchingTest(jtu.JaxTestCase):
     expected[np.arange(10), idx] = y
     self.assertAllClose(ans, expected, check_dtypes=False)
 
+  @jax.legacy_prng_key('allow')
   def testRandom(self):
     seeds = vmap(random.PRNGKey)(np.arange(10))
     ans = vmap(partial(random.normal, shape=(3, 2)))(seeds)
@@ -640,6 +645,35 @@ class BatchingTest(jtu.JaxTestCase):
     expected = np.stack(
       [lax.linalg.triangular_solve(a[:, i], b[..., 0]) for i in range(10)])
     self.assertAllClose(ans, expected, atol=1e-5, rtol=1e-5)
+
+  @unittest.skipIf(jaxlib_version < (0, 4, 15),
+                   "Test requires jaxlib 0.4.15")
+  def testLaxLinalgTridiagonalSolve(self):
+    dl = self.rng().randn(4, 10).astype(np.float32)
+    d = self.rng().randn(4, 10).astype(np.float32) + 1.
+    du = self.rng().randn(4, 10).astype(np.float32)
+    b = self.rng().randn(4, 5, 10).astype(np.float32)
+
+    ans = vmap(lax.linalg.tridiagonal_solve, in_axes=(1, 1, 1, 2))(dl, d, du, b)
+    expected = np.stack(
+        [lax.linalg.tridiagonal_solve(
+            dl[:, i], d[:, i], du[:, i], b[..., i]) for i in range(10)])
+    self.assertAllClose(ans, expected, atol=1e-5, rtol=1e-5)
+
+    ans = vmap(lax.linalg.tridiagonal_solve, in_axes=(None, None, None, 2))(
+        dl[:, 0], d[:, 0], du[:, 0], b)
+    expected = np.stack(
+        [lax.linalg.tridiagonal_solve(
+            dl[:, 0], d[:, 0], du[:, 0], b[..., i]) for i in range(10)])
+    self.assertAllClose(ans, expected)
+
+    ans = vmap(lax.linalg.tridiagonal_solve, in_axes=(1, 1, 1, None))(
+        dl, d, du, b[..., 0])
+    expected = np.stack(
+        [lax.linalg.tridiagonal_solve(
+            dl[:, i], d[:, i], du[:, i], b[..., 0]) for i in range(10)])
+    self.assertAllClose(ans, expected, atol=1e-5, rtol=1e-5)
+
 
   @parameterized.named_parameters(
       {"testcase_name": "_shape={}_axis={}_idxs={}_dnums={}_slice_sizes={}".format(
@@ -917,6 +951,7 @@ class BatchingTest(jtu.JaxTestCase):
 
     _ = hessian(f)(R)  # don't crash on UnshapedArray
 
+  @jax.legacy_prng_key('allow')
   def testIssue489(self):
     # https://github.com/google/jax/issues/489
     def f(key):

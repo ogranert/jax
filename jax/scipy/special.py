@@ -16,6 +16,7 @@
 # See PEP 484 & https://github.com/google/jax/issues/7570
 
 from jax._src.scipy.special import (
+  bernoulli as bernoulli,
   betainc as betainc,
   betaln as betaln,
   bessel_jn as bessel_jn,
@@ -50,4 +51,6 @@ from jax._src.scipy.special import (
   xlogy as xlogy,
   xlog1py as xlog1py,
   zeta as zeta,
+  kl_div as kl_div,
+  rel_entr as rel_entr,
 )

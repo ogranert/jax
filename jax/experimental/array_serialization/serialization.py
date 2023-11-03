@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GlobalDeviceArray serialization and deserialization."""
+"""Array serialization and deserialization."""
 
 import abc
 import asyncio
+from collections.abc import Awaitable, Sequence
 import itertools
 import logging
 from functools import partial
@@ -22,7 +23,7 @@ import os
 import re
 import time
 import threading
-from typing import Awaitable, Any, Callable, Optional, Sequence, Union
+from typing import Any, Callable, Optional, Union
 
 import jax
 from jax._src import distributed
@@ -30,6 +31,7 @@ from jax._src import array
 from jax._src import sharding
 from jax._src import sharding_impls
 from jax._src import typing
+from jax._src.lib import xla_extension as xe
 import jax.numpy as jnp
 import numpy as np
 import tensorstore as ts
@@ -40,6 +42,21 @@ _REMOVED_VALUE = 'Value removed'
 _CHECKPOINT_SUCCESS = 'checkpoint_write_success'
 _module_unique_count = itertools.count()
 _DEFAULT_DRIVER = 'file'
+_DISTRIBUTED_SYSTEM_MSG = (
+    'Please initialize the distributed system via '
+    '`jax.distributed.initialize()` at the start of your program.')
+
+class BarrierTimeoutException(Exception):
+  pass
+
+_BARRIER_TIMED_OUT_MSG = (
+    "Suggestions for possible fixes:\n"
+    "* Check the logs to see if one or more processes failed.\n"
+    "* Make sure the training and checkpointing endpoints are close geographically.\n"
+    "* Try setting these environment variables: "
+    "`TENSORSTORE_CURL_LOW_SPEED_TIME_SECONDS=60` "
+    "`TENSORSTORE_CURL_LOW_SPEED_LIMIT_BYTES=256` which will force a http retry\n"
+    "* Try increasing the timeout you pass to GlobalAsyncCheckpointManager.")
 
 logger = logging.getLogger(__name__)
 
@@ -144,8 +161,11 @@ async def async_serialize(
 ):
   if (isinstance(arr_inp, array.ArrayImpl) and jax.process_count() > 1 and
       arr_inp.is_fully_addressable):
-    raise ValueError('Passing fully addressable Arrays to a multiprocess '
-                     'serialization is not allowed.')
+    raise ValueError(
+        f'Passing fully addressable arrays to a multiprocess '
+        f'serialization is not allowed, as this may lead to a race condition '
+        f'between processes. Serialization have failed for the array with '
+        f'the path "{tensorstore_spec["kvstore"]["path"]}".')
   # 'metadata' may not be present at the top level (for example, if we are using
   # a 'cast' driver).
   if not _spec_has_metadata(tensorstore_spec):
@@ -280,7 +300,7 @@ async def async_deserialize(
       # transfer instead of loading data. In the future, if memory pressure
       # becomes a problem, we can instead instrument  bytelimiter to
       # keep track of all in-flight tensors and only block_until_ready, if byte
-      # limiter hits the limit to get reduced memory usage, without loosing
+      # limiter hits the limit to get reduced memory usage, without losing
       # performance in common use cases.
       await byte_limiter.release_bytes(requested_bytes)
     return result
@@ -388,9 +408,7 @@ class AsyncManager:
     self._exception = None
 
     if jax.process_count() > 1 and distributed.global_state.client is None:
-      raise ValueError('Please initialize the distributed system via '
-                       '`jax.distributed.initialize()` at the start of your '
-                       'program.')
+      raise ValueError(_DISTRIBUTED_SYSTEM_MSG)
     if jax.process_count() > 1:
       self._client = distributed.global_state.client
     self._count = None
@@ -451,6 +469,10 @@ class AsyncManager:
       # Clears self._exception so it is only raised once.
       exception = self._exception
       self._exception = None
+      if (isinstance(exception, xe.XlaRuntimeError) and
+          'DEADLINE_EXCEEDED: Barrier timed out' in str(exception)):
+        raise BarrierTimeoutException(
+            '\n'.join([str(exception), _BARRIER_TIMED_OUT_MSG]))
       raise exception  # pylint: disable=raising-bad-type
 
   def wait_until_finished(self):
@@ -478,7 +500,7 @@ class GlobalAsyncCheckpointManager(AsyncManager, GlobalAsyncCheckpointManagerBas
   """Responsible for serializing GDAs via TensorStore."""
 
   def serialize(self, arrays, tensorstore_specs, *, on_commit_callback):
-    """Serializes GlobalDeviceArrays or Arrays via TensorStore asynchronously.
+    """Serializes Arrays or Arrays via TensorStore asynchronously.
 
     TensorStore writes to a storage layer in 2 steps:
     *  Reading/copying from the source after which the source can be modified.
@@ -490,7 +512,7 @@ class GlobalAsyncCheckpointManager(AsyncManager, GlobalAsyncCheckpointManagerBas
     finish in a separate thread allowing other computation to proceed.
 
     Args:
-      arrays: GlobalDeviceArrays or Arrays that should be serialized.
+      arrays: Arrays or Arrays that should be serialized.
       tensorstore_specs: TensorStore specs that are used to serialize GDAs or
         Arrays.
       on_commit_callback: This callback will be executed after all processes
@@ -519,6 +541,11 @@ class GlobalAsyncCheckpointManager(AsyncManager, GlobalAsyncCheckpointManagerBas
     # has finished writing.
     self._start_async_commit(on_commit_callback)
 
+  def serialize_with_paths(self, arrays: Sequence[jax.Array],
+                           paths: Sequence[str], *, on_commit_callback):
+    tspecs = jax.tree_map(get_tensorstore_spec, paths)
+    self.serialize(arrays, tspecs, on_commit_callback=on_commit_callback)
+
   def deserialize(self, shardings: Sequence[sharding.Sharding],
                   tensorstore_specs: Sequence[dict[str, Any]],
                   global_shapes: Optional[Sequence[array.Shape]] = None,
@@ -527,3 +554,13 @@ class GlobalAsyncCheckpointManager(AsyncManager, GlobalAsyncCheckpointManagerBas
     self.wait_until_finished()
     return run_deserialization(shardings, tensorstore_specs,
                                global_shapes, dtypes, concurrent_gb)
+
+  def deserialize_with_paths(
+      self, shardings: Sequence[sharding.Sharding],
+      paths: Sequence[str],
+      global_shapes: Optional[Sequence[array.Shape]] = None,
+      dtypes: Optional[Sequence[typing.DTypeLike]] = None,
+      concurrent_gb: int = 32):
+    tspecs = jax.tree_map(get_tensorstore_spec, paths)
+    return self.deserialize(shardings, tspecs, global_shapes, dtypes,
+                            concurrent_gb)

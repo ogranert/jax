@@ -21,13 +21,13 @@ import scipy.special as osp_special
 
 import jax.numpy as jnp
 from jax import jit
+from jax import jvp
 from jax import vmap
 from jax import lax
 
 from jax._src import core
 from jax._src import custom_derivatives
 from jax._src import dtypes
-from jax._src.interpreters import ad
 from jax._src.lax.lax import _const as _lax_const
 from jax._src.numpy.util import promote_args_inexact, promote_dtypes_inexact
 from jax._src.numpy.util import _wraps
@@ -67,9 +67,6 @@ The JAX version only accepts real-valued inputs.""")
 def digamma(x: ArrayLike) -> Array:
   x, = promote_args_inexact("digamma", x)
   return lax.digamma(x)
-ad.defjvp(
-    lax.digamma_p,
-    lambda g, x: lax.mul(g, polygamma(1, x)))  # type: ignore[has-type]
 
 
 @_wraps(osp_special.gammainc, module='scipy.special', update_doc=False)
@@ -127,9 +124,7 @@ def xlogy(x: ArrayLike, y: ArrayLike) -> Array:
   # Note: xlogy(0, 0) should return 0 according to the function documentation.
   x, y = promote_args_inexact("xlogy", x, y)
   x_ok = x != 0.
-  safe_x = jnp.where(x_ok, x, 1.)
-  safe_y = jnp.where(x_ok, y, 1.)
-  return jnp.where(x_ok, lax.mul(safe_x, lax.log(safe_y)), jnp.zeros_like(x))
+  return jnp.where(x_ok, lax.mul(x, lax.log(y)), jnp.zeros_like(x))
 
 def _xlogy_jvp(primals, tangents):
   (x, y) = primals
@@ -145,9 +140,7 @@ def xlog1py(x: ArrayLike, y: ArrayLike) -> Array:
   # Note: xlog1py(0, -1) should return 0 according to the function documentation.
   x, y = promote_args_inexact("xlog1py", x, y)
   x_ok = x != 0.
-  safe_x = jnp.where(x_ok, x, 1.)
-  safe_y = jnp.where(x_ok, y, 1.)
-  return jnp.where(x_ok, lax.mul(safe_x, lax.log1p(safe_y)), jnp.zeros_like(x))
+  return jnp.where(x_ok, lax.mul(x, lax.log1p(y)), jnp.zeros_like(x))
 
 def _xlog1py_jvp(primals, tangents):
   (x, y) = primals
@@ -175,7 +168,6 @@ def entr(x: ArrayLike) -> Array:
                     lax.full_like(x, -np.inf),
                     lax.neg(_xlogx(x)))
 
-
 @_wraps(osp_special.multigammaln, update_doc=False)
 def multigammaln(a: ArrayLike, d: ArrayLike) -> Array:
   d = core.concrete_or_error(int, d, "d argument of multigammaln")
@@ -190,6 +182,50 @@ def multigammaln(a: ArrayLike, d: ArrayLike) -> Array:
                 axis=-1)
   return res + constant
 
+
+@_wraps(osp_special.kl_div, module="scipy.special")
+def kl_div(
+    p: ArrayLike,
+    q: ArrayLike,
+) -> Array:
+    p, q = promote_args_inexact("kl_div", p, q)
+    zero = _lax_const(p, 0.0)
+    both_gt_zero_mask = lax.bitwise_and(lax.gt(p, zero), lax.gt(q, zero))
+    one_zero_mask = lax.bitwise_and(lax.eq(p, zero), lax.ge(q, zero))
+
+    safe_p = jnp.where(both_gt_zero_mask, p, 1)
+    safe_q = jnp.where(both_gt_zero_mask, q, 1)
+
+    log_val = lax.sub(
+        lax.add(
+            lax.sub(_xlogx(safe_p), xlogy(safe_p, safe_q)),
+            safe_q,
+        ),
+        safe_p,
+    )
+    result = jnp.where(
+        both_gt_zero_mask, log_val, jnp.where(one_zero_mask, q, np.inf)
+    )
+    return result
+
+
+@_wraps(osp_special.rel_entr, module="scipy.special")
+def rel_entr(
+    p: ArrayLike,
+    q: ArrayLike,
+) -> Array:
+    p, q = promote_args_inexact("rel_entr", p, q)
+    zero = _lax_const(p, 0.0)
+    both_gt_zero_mask = lax.bitwise_and(lax.gt(p, zero), lax.gt(q, zero))
+    one_zero_mask = lax.bitwise_and(lax.eq(p, zero), lax.ge(q, zero))
+
+    safe_p = jnp.where(both_gt_zero_mask, p, 1)
+    safe_q = jnp.where(both_gt_zero_mask, q, 1)
+    log_val = lax.sub(_xlogx(safe_p), xlogy(safe_p, safe_q))
+    result = jnp.where(
+        both_gt_zero_mask, log_val, jnp.where(one_zero_mask, q, jnp.inf)
+    )
+    return result
 
 # coefs of (2k)! / B_{2k} where B are bernoulli numbers
 # those numbers are obtained using https://www.wolframalpha.com
@@ -213,9 +249,22 @@ _BERNOULLI_COEFS = [
 ]
 
 
+@custom_derivatives.custom_jvp
 @_wraps(osp_special.zeta, module='scipy.special')
 def zeta(x: ArrayLike, q: Optional[ArrayLike] = None) -> Array:
-  assert q is not None, "Riemann zeta function is not implemented yet."
+  if q is None:
+    raise NotImplementedError(
+      "Riemann zeta function not implemented; pass q != None to compute the Hurwitz Zeta function.")
+  x, q = promote_args_inexact("zeta", x, q)
+  return lax.zeta(x, q)
+
+
+# There is no general closed-form derivative for the zeta function, so we compute
+# derivatives via a series expansion
+def _zeta_series_expansion(x: ArrayLike, q: Optional[ArrayLike] = None) -> Array:
+  if q is None:
+    raise NotImplementedError(
+      "Riemann zeta function not implemented; pass q != None to compute the Hurwitz Zeta function.")
   # Reference: Johansson, Fredrik.
   # "Rigorous high-precision computation of the Hurwitz zeta function and its derivatives."
   # Numerical Algorithms 69.2 (2015): 253-270.
@@ -241,22 +290,14 @@ def zeta(x: ArrayLike, q: Optional[ArrayLike] = None) -> Array:
   T = T0 * (dtype(0.5) + T1.sum(-1))
   return S + I + T
 
+zeta.defjvp(partial(jvp, _zeta_series_expansion))  # type: ignore[arg-type]
+
 
 @_wraps(osp_special.polygamma, module='scipy.special', update_doc=False)
 def polygamma(n: ArrayLike, x: ArrayLike) -> Array:
   assert jnp.issubdtype(lax.dtype(n), jnp.integer)
   n_arr, x_arr = promote_args_inexact("polygamma", n, x)
-  shape = lax.broadcast_shapes(n_arr.shape, x_arr.shape)
-  return _polygamma(jnp.broadcast_to(n_arr, shape), jnp.broadcast_to(x_arr, shape))
-
-
-@custom_derivatives.custom_jvp
-def _polygamma(n: ArrayLike, x: ArrayLike) -> Array:
-  dtype = lax.dtype(n).type
-  n_plus = n + dtype(1)
-  sign = dtype(1) - (n_plus % dtype(2)) * dtype(2)
-  return jnp.where(n == 0, digamma(x), sign * jnp.exp(gammaln(n_plus)) * zeta(n_plus, x))
-_polygamma.defjvps(None, lambda g, ans, n, x: lax.mul(g, _polygamma(n + 1, x)))
+  return lax.polygamma(n_arr, x_arr)
 
 
 # Normal distributions
@@ -585,8 +626,8 @@ def log_ndtr(x: ArrayLike, series_order: int = 3) -> Array:
   if series_order > 30:
     raise ValueError("series_order must be <= 30.")
 
-  x = jnp.asarray(x)
-  dtype = lax.dtype(x)
+  x_arr = jnp.asarray(x)
+  dtype = lax.dtype(x_arr)
 
   if dtype == jnp.float64:
     lower_segment: np.ndarray = _LOGNDTR_FLOAT64_LOWER
@@ -612,12 +653,13 @@ def log_ndtr(x: ArrayLike, series_order: int = 3) -> Array:
   #   regardless of whether dy is finite. Note that the minimum is a NOP if
   #   the branch is chosen.
   return jnp.where(
-      lax.gt(x, upper_segment),
-      -_ndtr(-x),  # log(1-x) ~= -x, x << 1
-      jnp.where(lax.gt(x, lower_segment),
-                       lax.log(_ndtr(lax.max(x, lower_segment))),
-                       _log_ndtr_lower(lax.min(x, lower_segment),
+      lax.gt(x_arr, upper_segment),
+      -_ndtr(-x_arr),  # log(1-x) ~= -x, x << 1
+      jnp.where(lax.gt(x_arr, lower_segment),
+                       lax.log(_ndtr(lax.max(x_arr, lower_segment))),
+                       _log_ndtr_lower(lax.min(x_arr, lower_segment),
                                        series_order)))
+
 def _log_ndtr_jvp(series_order, primals, tangents):
   (x,), (t,) = primals, tangents
   ans = log_ndtr(x, series_order=series_order)
@@ -823,7 +865,7 @@ def _gen_derivatives(p: Array,
 
   Args:
     p: The 3D array containing the values of associated Legendre functions; the
-      dimensions are in the sequence of order (m), degree (l), and evalution
+      dimensions are in the sequence of order (m), degree (l), and evaluation
       points.
     x: A vector of type `float32` or `float64` containing the sampled points.
     is_normalized: True if the associated Legendre functions are normalized.
@@ -920,7 +962,7 @@ def _gen_associated_legendre(l_max: int,
   harmonic of degree `l` and order `m` can be written as
   `Y_l^m(θ, φ) = N_l^m * P_l^m(cos(θ)) * exp(i m φ)`, where `N_l^m` is the
   normalization factor and θ and φ are the colatitude and longitude,
-  repectively. `N_l^m` is chosen in the way that the spherical harmonics form
+  respectively. `N_l^m` is chosen in the way that the spherical harmonics form
   a set of orthonormal basis function of L^2(S^2). For the computational
   efficiency of spherical harmonics transform, the normalization factor is
   used in the computation of the ALFs. In addition, normalizing `P_l^m`
@@ -957,7 +999,7 @@ def _gen_associated_legendre(l_max: int,
   Returns:
     The 3D array of shape `(l_max + 1, l_max + 1, len(x))` containing the values
     of the ALFs at `x`; the dimensions in the sequence of order, degree, and
-    evalution points.
+    evaluation points.
   """
   p = jnp.zeros((l_max + 1, l_max + 1, x.shape[0]), dtype=x.dtype)
 
@@ -1064,7 +1106,7 @@ def lpmn_values(m: int, n: int, z: Array, is_normalized: bool) -> Array:
   spherical harmonic of degree `l` and order `m` can be written as
   :math:`Y_l^m(\theta, \phi) = N_l^m * P_l^m(\cos \theta) * \exp(i m \phi)`,
   where :math:`N_l^m` is the normalization factor and θ and φ are the
-  colatitude and longitude, repectively. :math:`N_l^m` is chosen in the
+  colatitude and longitude, respectively. :math:`N_l^m` is chosen in the
   way that the spherical harmonics form a set of orthonormal basis function
   of :math:`L^2(S^2)`. Normalizing :math:`P_l^m` avoids overflow/underflow
   and achieves better numerical stability.
@@ -1150,7 +1192,7 @@ def sph_harm(m: Array,
   :math:`Y_n^m(\theta, \phi) = N_n^m * P_n^m(\cos \phi) * \exp(i m \theta)`,
   where :math:`N_n^m = \sqrt{\frac{\left(2n+1\right) \left(n-m\right)!}
   {4 \pi \left(n+m\right)!}}` is the normalization factor and :math:`\phi` and
-  :math:`\theta` are the colatitude and longitude, repectively. :math:`N_n^m` is
+  :math:`\theta` are the colatitude and longitude, respectively. :math:`N_n^m` is
   chosen in the way that the spherical harmonics form a set of orthonormal basis
   functions of :math:`L^2(S^2)`.
 
@@ -1558,7 +1600,7 @@ def expn_jvp(n, primals, tangents):
 @_wraps(osp_special.exp1, module="scipy.special")
 def exp1(x: ArrayLike, module='scipy.special') -> Array:
   x, = promote_args_inexact("exp1", x)
-  # Casting becuase custom_jvp generic does not work correctly with mypy.
+  # Casting because custom_jvp generic does not work correctly with mypy.
   return cast(Array, expn(1, x))
 
 
@@ -1654,3 +1696,20 @@ def spence(x: Array) -> Array:
     raise TypeError(
       f"x.dtype={dtype} is not supported, see docstring for supported types.")
   return _spence(x)
+
+
+@_wraps(osp_special.bernoulli, module='scipy.special')
+def bernoulli(n: int) -> Array:
+  # Generate Bernoulli numbers using the Chowla and Hartung algorithm.
+  n = core.concrete_or_error(operator.index, n, "Argument n of bernoulli")
+  if n < 0:
+    raise ValueError("n must be a non-negative integer.")
+  b3 = jnp.array([1, -1/2, 1/6])
+  if n < 3:
+    return b3[:n + 1]
+  bn = jnp.zeros(n + 1).at[:3].set(b3)
+  m = jnp.arange(4, n + 1, 2, dtype=bn.dtype)
+  q1 = (1. / jnp.pi ** 2) * jnp.cumprod(-(m - 1) * m / 4 / jnp.pi ** 2)
+  k = jnp.arange(2, 50, dtype=bn.dtype)  # Choose 50 because 2 ** -50 < 1E-15
+  q2 = jnp.sum(k[:, None] ** -m[None, :], axis=0)
+  return bn.at[4::2].set(q1 * (1 + q2))

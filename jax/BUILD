@@ -17,15 +17,20 @@
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load(
     "//jaxlib:jax.bzl",
+    "jax_extend_internal_users",
     "jax_extra_deps",
     "jax_internal_packages",
     "jax_test_util_visibility",
     "jax_visibility",
+    "mosaic_internal_users",
+    "pallas_gpu_internal_users",
+    "pallas_tpu_internal_users",
     "py_deps",
     "py_library_providing_imports_info",
     "pytype_library",
     "pytype_strict_library",
 )
+load("@rules_python//python:defs.bzl", "py_library")
 
 package(
     default_applicable_licenses = [],
@@ -57,6 +62,36 @@ package_group(
     packages = [
         "//...",
     ] + jax_internal_packages,
+)
+
+package_group(
+    name = "jax_extend_users",
+    packages = [
+        # Intentionally avoid jax dependencies on jax.extend.
+        # See https://jax.readthedocs.io/en/latest/jep/15856-jex.html
+        "//third_party/py/jax/tests/...",
+    ] + jax_extend_internal_users,
+)
+
+package_group(
+    name = "mosaic_users",
+    packages = [
+        "//...",
+    ] + mosaic_internal_users,
+)
+
+package_group(
+    name = "pallas_gpu_users",
+    packages = [
+        "//...",
+    ] + pallas_gpu_internal_users,
+)
+
+package_group(
+    name = "pallas_tpu_users",
+    packages = [
+        "//...",
+    ] + pallas_tpu_internal_users,
 )
 
 # JAX-private test utilities.
@@ -118,6 +153,7 @@ py_library_providing_imports_info(
         [
             "*.py",
             "_src/debugger/**/*.py",
+            "_src/extend/**/*.py",
             "_src/image/**/*.py",
             "_src/lax/**/*.py",
             "_src/nn/**/*.py",
@@ -153,7 +189,10 @@ py_library_providing_imports_info(
     ],
     lib_rule = pytype_library,
     pytype_srcs = glob(
-        ["_src/**/*.pyi"],
+        [
+            "numpy/*.pyi",
+            "_src/**/*.pyi",
+        ],
         exclude = [
             "_src/basearray.pyi",
         ],
@@ -166,6 +205,7 @@ py_library_providing_imports_info(
         ":basearray",
         ":cloud_tpu_init",
         ":compilation_cache_internal",
+        ":compiler",
         ":config",
         ":core",
         ":custom_api_util",
@@ -173,6 +213,7 @@ py_library_providing_imports_info(
         ":dtypes",
         ":effects",
         ":environment_info",
+        ":jaxpr_util",
         ":lazy_loader",
         ":mesh",
         ":mlir",
@@ -256,12 +297,23 @@ pytype_strict_library(
     srcs = ["_src/compilation_cache.py"],
     visibility = [":internal"] + jax_visibility("compilation_cache"),
     deps = [
+        ":cache_key",
         ":compilation_cache_interface",
         ":config",
         ":gfile_cache",
         ":path",
         "//jax/_src/lib",
     ] + py_deps("numpy") + py_deps("zstandard"),
+)
+
+pytype_strict_library(
+    name = "cache_key",
+    srcs = ["_src/cache_key.py"],
+    visibility = [":internal"] + jax_visibility("compilation_cache"),
+    deps = [
+        ":config",
+        "//jax/_src/lib",
+    ] + py_deps("numpy"),
 )
 
 pytype_strict_library(
@@ -274,8 +326,28 @@ pytype_strict_library(
     name = "config",
     srcs = ["_src/config.py"],
     deps = [
+        ":logging_config",
         "//jax/_src/lib",
     ],
+)
+
+pytype_strict_library(
+    name = "logging_config",
+    srcs = ["_src/logging_config.py"],
+)
+
+pytype_strict_library(
+    name = "compiler",
+    srcs = ["_src/compiler.py"],
+    deps = [
+        ":compilation_cache_internal",
+        ":config",
+        ":monitoring",
+        ":path",
+        ":profiler",
+        ":traceback_util",
+        "//jax/_src/lib",
+    ] + py_deps("numpy"),
 )
 
 pytype_strict_library(
@@ -318,6 +390,7 @@ pytype_strict_library(
         ":config",
         ":traceback_util",
         ":typing",
+        ":util",
     ] + py_deps("ml_dtypes") + py_deps("numpy"),
 )
 
@@ -346,15 +419,6 @@ pytype_strict_library(
 )
 
 pytype_library(
-    name = "iree",
-    srcs = ["_src/iree.py"],
-    deps = [
-        ":config",
-        "//jax/_src/lib",
-    ] + py_deps("numpy"),
-)
-
-pytype_library(
     name = "lax_reference",
     srcs = ["_src/lax_reference.py"],
     visibility = [":internal"] + jax_visibility("lax_reference"),
@@ -367,6 +431,17 @@ pytype_library(
 pytype_strict_library(
     name = "lazy_loader",
     srcs = ["_src/lazy_loader.py"],
+)
+
+pytype_strict_library(
+    name = "jaxpr_util",
+    srcs = ["_src/jaxpr_util.py"],
+    deps = [
+        ":core",
+        ":source_info_util",
+        ":util",
+        "//jax/_src/lib",
+    ],
 )
 
 pytype_strict_library(
@@ -412,6 +487,66 @@ pytype_strict_library(
     deps = [
         "//jax/_src/lib",
     ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "pallas",
+    srcs = glob(
+        [
+            "experimental/pallas/**/*.py",
+        ],
+        exclude = [
+            "experimental/pallas/gpu.py",
+            "experimental/pallas/tpu.py",
+            "experimental/pallas/ops/tpu/*.py",
+        ],
+    ),
+    visibility = [
+        "//visibility:public",
+    ],
+    deps = [
+        ":jax",
+        ":source_info_util",
+        "//jax/_src/pallas",
+    ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "pallas_tpu",
+    srcs = ["experimental/pallas/tpu.py"],
+    visibility = [
+        ":pallas_tpu_users",
+    ],
+    deps = [
+        ":pallas",  # buildcleaner: keep
+        ":tpu_custom_call",
+        "//jax/_src/pallas/mosaic",
+    ],
+)
+
+pytype_strict_library(
+    name = "pallas_tpu_ops",
+    srcs = glob(["experimental/pallas/ops/tpu/*.py"]),
+    visibility = [
+        ":pallas_tpu_users",
+    ],
+    deps = [
+        ":jax",
+        ":pallas",
+        ":pallas_tpu",
+    ],
+)
+
+pytype_strict_library(
+    name = "pallas_gpu",
+    srcs = ["experimental/pallas/gpu.py"],
+    visibility = [
+        ":pallas_gpu_users",
+    ],
+    deps = [
+        ":pallas",
+        "//jax/_src/pallas/triton",
+    ],
 )
 
 pytype_strict_library(
@@ -487,7 +622,9 @@ pytype_strict_library(
 pytype_strict_library(
     name = "sharding_impls",
     srcs = ["_src/sharding_impls.py"],
+    visibility = [":internal"] + jax_visibility("sharding_impls"),
     deps = [
+        ":config",
         ":mesh",
         ":op_shardings",
         ":partition_spec",
@@ -531,6 +668,7 @@ pytype_strict_library(
         ":core",
         ":effects",
         ":pretty_printer",
+        ":typing",
         ":util",
     ],
 )
@@ -563,6 +701,26 @@ pytype_strict_library(
         "_src/typing.py",
     ],
     deps = [":basearray"] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "tpu_custom_call",
+    srcs = ["_src/tpu_custom_call.py"],
+    visibility = [":internal"],
+    deps = [
+        ":config",
+        ":core",
+        ":jax",
+        "//jax/_src/lib",
+    ] + select({
+        ":enable_jaxlib_build": [
+            "//jaxlib/mlir:ir",
+            "//jaxlib/mlir:mhlo_dialect",
+            "//jaxlib/mlir:pass_manager",
+            "//jaxlib/mlir:stablehlo_dialect",
+        ],
+        "//conditions:default": [],
+    }) + py_deps("numpy") + py_deps("absl/flags"),
 )
 
 pytype_strict_library(
@@ -612,11 +770,10 @@ pytype_strict_library(
     deps = [
         ":cloud_tpu_init",
         ":config",
-        ":iree",
         ":traceback_util",
         ":util",
         "//jax/_src/lib",
-    ] + py_deps("numpy"),
+    ],
 )
 
 # Public JAX libraries below this point.
@@ -738,8 +895,27 @@ pytype_library(
     srcs = ["experimental/mesh_utils.py"],
     visibility = ["//visibility:public"],
     deps = [
-        ":experimental",
-        ":jax",
+        ":xla_bridge",
+    ],
+)
+
+pytype_library(
+    name = "extend",
+    srcs = glob(["extend/**/*.py"]),
+    visibility = [":jax_extend_users"],
+    deps = [":jax"],
+)
+
+pytype_library(
+    name = "mosaic",
+    srcs = [
+        "experimental/mosaic/__init__.py",
+        "experimental/mosaic/dialects.py",
+    ],
+    visibility = [":mosaic_users"],
+    deps = [
+        ":tpu_custom_call",
+        "//jax/_src/lib",
     ],
 )
 

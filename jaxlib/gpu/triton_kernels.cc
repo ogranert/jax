@@ -1,7 +1,5 @@
 #include "jaxlib/gpu/triton_kernels.h"
 
-#include <zlib.h>
-
 #include <algorithm>
 #include <cstdint>
 #include <memory>
@@ -23,25 +21,26 @@
 #include "absl/synchronization/mutex.h"
 #include "jaxlib/gpu/gpu_kernel_helpers.h"
 #include "jaxlib/gpu/triton.pb.h"
+#include "jaxlib/gpu/triton_utils.h"
 #include "jaxlib/gpu/vendor.h"
 #include "xla/service/custom_call_status.h"
 #include "xla/stream_executor/gpu/asm_compiler.h"
+#include "tsl/platform/env.h"
 
-#define CUDA_RETURN_IF_ERROR(expr) JAX_RETURN_IF_ERROR(JAX_AS_STATUS(expr))
+#define GPU_RETURN_IF_ERROR(expr) JAX_RETURN_IF_ERROR(JAX_AS_STATUS(expr))
 
 
 namespace jax::JAX_GPU_NAMESPACE {
 namespace {
 
-constexpr uint32_t kNumThreadsPerWarp = 32;
 constexpr float kBenchmarkTimeMillis = 10.;
 
-struct CuModuleDeleter {
-  void operator()(CUmodule module) { cuModuleUnload(module); }
+struct gpuModuleDeleter {
+  void operator()(gpuModule_t module) { gpuModuleUnload(module); }
 };
 
-using OwnedCUmodule =
-    std::unique_ptr<std::remove_pointer_t<CUmodule>, CuModuleDeleter>;
+using OwnedGPUmodule =
+    std::unique_ptr<std::remove_pointer_t<gpuModule_t>, gpuModuleDeleter>;
 
 absl::StatusOr<ModuleImage*> GetModuleImage(std::string kernel_name,
                                             uint32_t shared_mem_bytes,
@@ -59,6 +58,13 @@ absl::StatusOr<ModuleImage*> GetModuleImage(std::string kernel_name,
   auto it = module_images.find(key);
   if (it != module_images.end()) return it->second.get();
 
+#ifdef JAX_GPU_HIP //For HIP/ROCM just read the hsaco file
+  std::string result_blob;
+  std::string fname{ptx}; 
+  TF_RETURN_IF_ERROR(
+      tsl::ReadFileToString(tsl::Env::Default(), fname, &result_blob));
+  std::vector<uint8_t> module_image(result_blob.begin(), result_blob.end());
+#else
   // TODO(cjfj): Support `TRITON_PTXAS_PATH` environment variable?
   int cc_major = compute_capability / 10;
   int cc_minor = compute_capability % 10;
@@ -66,6 +72,7 @@ absl::StatusOr<ModuleImage*> GetModuleImage(std::string kernel_name,
       std::vector<uint8_t> module_image,
       stream_executor::CompileGpuAsm(cc_major, cc_minor, ptx.data(),
                                      stream_executor::GpuAsmOpts{}));
+#endif
 
   auto [it2, success] = module_images.insert(
       {std::move(key),
@@ -75,27 +82,27 @@ absl::StatusOr<ModuleImage*> GetModuleImage(std::string kernel_name,
   return it2->second.get();
 }
 
-absl::StatusOr<float> Benchmark(CUstream stream, KernelCall& kernel_call,
+absl::StatusOr<float> Benchmark(gpuStream_t stream, KernelCall& kernel_call,
                                 void** buffers, int num_iterations) {
-  CUevent start, stop;
-  CUDA_RETURN_IF_ERROR(cuEventCreate(&start, /*Flags=*/CU_EVENT_DEFAULT));
-  CUDA_RETURN_IF_ERROR(cuEventCreate(&stop, /*Flags=*/CU_EVENT_DEFAULT));
+  gpuEvent_t start, stop;
+  GPU_RETURN_IF_ERROR(gpuEventCreate(&start, /*Flags=*/GPU_EVENT_DEFAULT));
+  GPU_RETURN_IF_ERROR(gpuEventCreate(&stop, /*Flags=*/GPU_EVENT_DEFAULT));
   JAX_RETURN_IF_ERROR(kernel_call.Launch(stream, buffers));  // Warm-up.
-  CUDA_RETURN_IF_ERROR(cuEventRecord(start, stream));
+  GPU_RETURN_IF_ERROR(gpuEventRecord(start, stream));
   for (int i = 0; i < num_iterations; ++i) {
     JAX_RETURN_IF_ERROR(kernel_call.Launch(stream, buffers));
   }
-  CUDA_RETURN_IF_ERROR(cuEventRecord(stop, stream));
-  CUDA_RETURN_IF_ERROR(cuEventSynchronize(stop));
+  GPU_RETURN_IF_ERROR(gpuEventRecord(stop, stream));
+  GPU_RETURN_IF_ERROR(gpuEventSynchronize(stop));
   float elapsed_ms;
-  CUDA_RETURN_IF_ERROR(cuEventElapsedTime(&elapsed_ms, start, stop));
-  CUDA_RETURN_IF_ERROR(cuEventDestroy(start));
-  CUDA_RETURN_IF_ERROR(cuEventDestroy(stop));
+  GPU_RETURN_IF_ERROR(gpuEventElapsedTime(&elapsed_ms, start, stop));
+  GPU_RETURN_IF_ERROR(gpuEventDestroy(start));
+  GPU_RETURN_IF_ERROR(gpuEventDestroy(stop));
   return elapsed_ms;
 }
 
 absl::StatusOr<KernelCall*> GetKernelCall(absl::string_view opaque,
-                                          CUstream stream, void** buffers) {
+                                          gpuStream_t stream, void** buffers) {
   static absl::Mutex mutex;
   static auto& kernel_calls =
       *new absl::flat_hash_map<std::string, std::unique_ptr<KernelCall>>
@@ -148,23 +155,23 @@ class ModuleImage {
         module_image_(std::move(module_image)),
         shared_mem_bytes_(shared_mem_bytes) {}
 
-  absl::StatusOr<CUfunction> GetFunctionForContext(CUcontext context) {
+  absl::StatusOr<gpuFunction_t> GetFunctionForContext(gpuContext_t context) {
     absl::MutexLock lock(&mutex_);
     auto it = functions_.find(context);
     if (ABSL_PREDICT_TRUE(it != functions_.end())) {
       return it->second;
     }
 
-    CUDA_RETURN_IF_ERROR(cuCtxPushCurrent(context));
-    absl::Cleanup ctx_restorer = [] { cuCtxPopCurrent(nullptr); };
+    GPU_RETURN_IF_ERROR(gpuCtxPushCurrent(context));
+    absl::Cleanup ctx_restorer = [] { gpuCtxPopCurrent(nullptr); };
 
-    CUmodule module;
-    CUDA_RETURN_IF_ERROR(cuModuleLoadData(&module, module_image_.data()));
-    modules_.push_back(OwnedCUmodule(module, CuModuleDeleter()));
+    gpuModule_t module;
+    GPU_RETURN_IF_ERROR(gpuModuleLoadData(&module, module_image_.data()));
+    modules_.push_back(OwnedGPUmodule(module, gpuModuleDeleter()));
 
-    CUfunction function;
-    CUDA_RETURN_IF_ERROR(
-        cuModuleGetFunction(&function, module, kernel_name_.c_str()));
+    gpuFunction_t function;
+    GPU_RETURN_IF_ERROR(
+        gpuModuleGetFunction(&function, module, kernel_name_.c_str()));
     auto [_, success] = functions_.insert({context, function});
     CHECK(success);
 
@@ -176,32 +183,37 @@ class ModuleImage {
     }
 
     // Set up dynamic shared memory.
-    CUdevice device;
-    CUDA_RETURN_IF_ERROR(cuCtxGetDevice(&device));
+    gpuDevice_t device;
+    GPU_RETURN_IF_ERROR(gpuCtxGetDevice(&device));
 
     int shared_optin;
-    CUDA_RETURN_IF_ERROR(cuDeviceGetAttribute(
-        &shared_optin, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+    GPU_RETURN_IF_ERROR(gpuDeviceGetAttribute(
+        &shared_optin, GPU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
         device));
 
     if (shared_mem_bytes_ > shared_optin) {
-      return absl::InvalidArgumentError(
-          "Shared memory requested exceeds device resources.");
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "Shared memory requested (%d b) exceeds device resources (%d b).",
+          shared_mem_bytes_, shared_optin));
     }
 
     if (shared_optin > kMaxStaticSharedMemBytes) {
-      CUDA_RETURN_IF_ERROR(
-          cuFuncSetCacheConfig(function, CU_FUNC_CACHE_PREFER_SHARED));
+      #ifdef JAX_GPU_CUDA  
+        GPU_RETURN_IF_ERROR(
+          gpuFuncSetCacheConfig(function, CU_FUNC_CACHE_PREFER_SHARED));
+      #endif
       int shared_total;
-      CUDA_RETURN_IF_ERROR(cuDeviceGetAttribute(
+      GPU_RETURN_IF_ERROR(gpuDeviceGetAttribute(
           &shared_total,
-          CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, device));
+          GPU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, device));
       int shared_static;
-      CUDA_RETURN_IF_ERROR(cuFuncGetAttribute(
-          &shared_static, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function));
-      CUDA_RETURN_IF_ERROR(cuFuncSetAttribute(
-          function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+      GPU_RETURN_IF_ERROR(gpuFuncGetAttribute(
+          &shared_static, GPU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function));
+      #ifdef JAX_GPU_CUDA
+        GPU_RETURN_IF_ERROR(cuFuncSetAttribute(
+          function, GPU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
           shared_optin - shared_static));
+      #endif
     }
     return function;
   }
@@ -212,8 +224,8 @@ class ModuleImage {
   uint32_t shared_mem_bytes_;
 
   absl::Mutex mutex_;
-  std::vector<OwnedCUmodule> modules_ ABSL_GUARDED_BY(mutex_);
-  absl::flat_hash_map<CUcontext, CUfunction> functions_ ABSL_GUARDED_BY(mutex_);
+  std::vector<OwnedGPUmodule> modules_ ABSL_GUARDED_BY(mutex_);
+  absl::flat_hash_map<gpuContext_t, gpuFunction_t> functions_ ABSL_GUARDED_BY(mutex_);
 };
 
 Kernel::Kernel(std::string kernel_name, uint32_t num_warps,
@@ -226,18 +238,25 @@ Kernel::Kernel(std::string kernel_name, uint32_t num_warps,
       ttir_(std::move(ttir)),
       compute_capability_(compute_capability) {}
 
-absl::Status Kernel::Launch(CUstream stream, uint32_t grid[3], void** params) {
+absl::Status Kernel::Launch(gpuStream_t stream, uint32_t grid[3], void** params) {
   if (ABSL_PREDICT_FALSE(module_image_ == nullptr)) {
     JAX_ASSIGN_OR_RETURN(module_image_,
                          GetModuleImage(kernel_name_, shared_mem_bytes_, ptx_,
                                         compute_capability_));
   }
 
-  CUcontext context;
-  CUDA_RETURN_IF_ERROR(cuStreamGetCtx(stream, &context));
-  JAX_ASSIGN_OR_RETURN(CUfunction kernel,
+  gpuContext_t context; 
+  #ifdef JAX_GPU_HIP
+    int device_id = gpuGetStreamDeviceId(stream);
+    gpuDevice_t device;
+    GPU_RETURN_IF_ERROR(gpuDeviceGet(&device, device_id));
+    GPU_RETURN_IF_ERROR(gpuDevicePrimaryCtxRetain(&context, device));
+  #else //JAX_GPU_CUDA
+    GPU_RETURN_IF_ERROR(gpuStreamGetCtx(stream, &context)); 
+  #endif
+  JAX_ASSIGN_OR_RETURN(gpuFunction_t kernel,
                        module_image_->GetFunctionForContext(context));
-  return JAX_AS_STATUS(cuLaunchKernel(
+  return JAX_AS_STATUS(gpuLaunchKernel(
       kernel, grid[0], grid[1], grid[2], block_dim_x_,
       /*blockDimY=*/1, /*blockDimZ=*/1, shared_mem_bytes_, stream, params,
       /*extra=*/nullptr));
@@ -285,6 +304,12 @@ KernelCall::Parameter::FromProto(
     case TritonKernelCall_Parameter::kU64:
       param.value = proto.u64();
       break;
+    case TritonKernelCall_Parameter::kF32:
+      param.value = proto.f32();
+      break;
+    case TritonKernelCall_Parameter::kF64:
+      param.value = proto.f64();
+      break;
     default:
       return absl::InvalidArgumentError("Unknown scalar parameter type.");
   }
@@ -306,9 +331,13 @@ jax_triton::TritonKernelCall_Parameter KernelCall::Parameter::ToProto() const {
     proto.set_u32(std::get<uint32_t>(value));
   } else if (std::holds_alternative<int64_t>(value)) {
     proto.set_i64(std::get<int64_t>(value));
-  } else {
-    CHECK(std::holds_alternative<uint64_t>(value));
+  } else if (std::holds_alternative<uint64_t>(value)) {
     proto.set_u64(std::get<uint64_t>(value));
+  } else if (std::holds_alternative<float>(value)) {
+    proto.set_f32(std::get<float>(value));
+  } else {
+    CHECK(std::holds_alternative<double>(value));
+    proto.set_f64(std::get<double>(value));
   }
   return proto;
 }
@@ -319,7 +348,7 @@ KernelCall::KernelCall(Kernel kernel, uint32_t grid_0, uint32_t grid_1,
       grid_{grid_0, grid_1, grid_2},
       parameters_(std::move(parameters)) {}
 
-absl::Status KernelCall::Launch(CUstream stream, void** buffers) {
+absl::Status KernelCall::Launch(gpuStream_t stream, void** buffers) {
   std::vector<void*> params;
   params.reserve(parameters_.size());
   for (size_t i = 0; i < parameters_.size(); ++i) {
@@ -327,18 +356,18 @@ absl::Status KernelCall::Launch(CUstream stream, void** buffers) {
     if (std::holds_alternative<Parameter::Array>(param.value)) {
       const auto& array = std::get<Parameter::Array>(param.value);
       void*& ptr = *(buffers++);
-      auto cu_ptr = reinterpret_cast<CUdeviceptr>(ptr);
+      auto cu_ptr = reinterpret_cast<gpuDevicePtr_t>(ptr);
 
       if (ABSL_PREDICT_FALSE((array.ptr_divisibility != 0) &&
-                             (cu_ptr % array.ptr_divisibility != 0))) {
+                             ((size_t)cu_ptr % array.ptr_divisibility != 0))) {
         return absl::InvalidArgumentError(
-            absl::StrFormat("Parameter %zu (%p) is not divisible by %d.", i,
-                            ptr, array.ptr_divisibility));
+            absl::StrFormat("Parameter %zu (%zu) is not divisible by %d.", i,
+                            (size_t)ptr, array.ptr_divisibility));
       }
 
       if (array.bytes_to_zero > 0) {
-        CUDA_RETURN_IF_ERROR(
-            cuMemsetD8Async(cu_ptr, 0, array.bytes_to_zero, stream));
+        GPU_RETURN_IF_ERROR(
+            gpuMemsetD8Async(cu_ptr, 0, array.bytes_to_zero, stream));
       }
       params.push_back(&ptr);
     } else {
@@ -423,12 +452,12 @@ jax_triton::TritonAutotunedKernelCall AutotunedKernelCall::ToProto() const {
 }
 
 /*static*/ absl::StatusOr<KernelCall> AutotunedKernelCall::Autotune(
-    AutotunedKernelCall kernel_call, CUstream stream, void** buffers) {
+    AutotunedKernelCall kernel_call, gpuStream_t stream, void** buffers) {
   // Ensure a valid context for driver calls that don't take the stream.
-  CUcontext context;
-  CUDA_RETURN_IF_ERROR(cuStreamGetCtx(stream, &context));
-  CUDA_RETURN_IF_ERROR(cuCtxPushCurrent(context));
-  absl::Cleanup ctx_restorer = [] { cuCtxPopCurrent(nullptr); };
+  //gpuContext_t context;
+  //GPU_RETURN_IF_ERROR(gpuStreamGetCtx(stream, &context));
+  //GPU_RETURN_IF_ERROR(gpuCtxPushCurrent(context));
+  //absl::Cleanup ctx_restorer = [] { gpuCtxPopCurrent(nullptr); };
 
   // If an input aliases with an output, it will get overwritten during the
   // kernel execution. If the kernel is called repeatedly, as we do during
@@ -438,8 +467,8 @@ jax_triton::TritonAutotunedKernelCall AutotunedKernelCall::ToProto() const {
   for (auto [input_idx, output_idx, size] : kernel_call.input_output_aliases_) {
     if (buffers[input_idx] == buffers[output_idx]) {
       std::vector<uint8_t> input_copy(size);
-      CUDA_RETURN_IF_ERROR(cuMemcpyDtoHAsync(
-          input_copy.data(), reinterpret_cast<CUdeviceptr>(buffers[input_idx]),
+      GPU_RETURN_IF_ERROR(gpuMemcpyDtoHAsync(
+          input_copy.data(), reinterpret_cast<gpuDevicePtr_t>(buffers[input_idx]),
           size, stream));
       input_copies[input_idx] = std::move(input_copy);
     }
@@ -485,17 +514,17 @@ jax_triton::TritonAutotunedKernelCall AutotunedKernelCall::ToProto() const {
 
   // Restore aliased inputs to their original values.
   for (auto [input_idx, _, size] : kernel_call.input_output_aliases_) {
-    CUDA_RETURN_IF_ERROR(
-        cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(buffers[input_idx]),
+    GPU_RETURN_IF_ERROR(
+        gpuMemcpyHtoDAsync(reinterpret_cast<gpuDevicePtr_t>(buffers[input_idx]),
                           input_copies[input_idx].data(), size, stream));
   }
   // Synchronize stream to ensure copies are complete before the host copy
   // is deleted.
-  CUDA_RETURN_IF_ERROR(cuStreamSynchronize(stream));
+  GPU_RETURN_IF_ERROR(gpuStreamSynchronize(stream));
   return std::move(kernel_call.configs_[0].kernel_call);
 }
 
-void TritonKernelCall(CUstream stream, void** buffers, const char* opaque,
+void TritonKernelCall(gpuStream_t stream, void** buffers, const char* opaque,
                       size_t opaque_len, XlaCustomCallStatus* status) {
   absl::Status result = [=] {
     JAX_ASSIGN_OR_RETURN(
@@ -507,27 +536,6 @@ void TritonKernelCall(CUstream stream, void** buffers, const char* opaque,
     absl::string_view msg = result.message();
     XlaCustomCallStatusSetFailure(status, msg.data(), msg.length());
   }
-}
-
-absl::StatusOr<std::string> ZlibUncompress(absl::string_view compressed) {
-  std::string data;
-  uLongf dest_len = 5 * compressed.size();
-  while (true) {
-    data.resize(dest_len);
-    int ret = uncompress(reinterpret_cast<Bytef*>(data.data()), &dest_len,
-                         reinterpret_cast<const Bytef*>(compressed.data()),
-                         compressed.size());
-    if (ret == Z_OK) {
-      // `uncompress` overwrites `dest_len` with the uncompressed size.
-      data.resize(dest_len);
-      break;
-    } else if (ret == Z_BUF_ERROR) {
-      dest_len *= 2;  // The string buffer wasn't large enough.
-    } else {
-      return absl::InvalidArgumentError("Failed to uncompress opaque data.");
-    }
-  }
-  return data;
 }
 
 }  // namespace jax::JAX_GPU_NAMESPACE

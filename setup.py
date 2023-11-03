@@ -13,25 +13,34 @@
 # limitations under the License.
 
 from distutils import spawn
-import subprocess
+import importlib
 import os
+import subprocess
 import sys
 
 from setuptools import setup, find_packages
 
-_current_jaxlib_version = '0.4.13'
+project_name = 'jax'
+
+_current_jaxlib_version = '0.4.20'
 # The following should be updated with each new jaxlib release.
-_latest_jaxlib_version_on_pypi = '0.4.13'
+_latest_jaxlib_version_on_pypi = '0.4.20'
 _available_cuda11_cudnn_versions = ['86']
 _default_cuda11_cudnn_version = '86'
 _default_cuda12_cudnn_version = '89'
-_libtpu_version = '0.1.dev20230622'
+_libtpu_version = '0.1.dev20231102'
 
-_dct = {}
-with open('jax/version.py', encoding='utf-8') as f:
-  exec(f.read(), _dct)
-__version__ = _dct['__version__']
-_minimum_jaxlib_version = _dct['_minimum_jaxlib_version']
+def load_version_module(pkg_path):
+  spec = importlib.util.spec_from_file_location(
+    'version', os.path.join(pkg_path, 'version.py'))
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+  return module
+
+_version_module = load_version_module(project_name)
+__version__ = _version_module._get_version_for_build()
+_cmdclass = _version_module._get_cmdclass(project_name)
+_minimum_jaxlib_version = _version_module._minimum_jaxlib_version
 
 with open('README.md', encoding='utf-8') as f:
   _long_description = f.read()
@@ -52,8 +61,9 @@ generate_proto("jax/experimental/australis/executable.proto")
 generate_proto("jax/experimental/australis/petri.proto")
 
 setup(
-    name='jax',
+    name=project_name,
     version=__version__,
+    cmdclass=_cmdclass,
     description='Differentiate, compile, and transform Numpy code.',
     long_description=_long_description,
     long_description_content_type='text/markdown',
@@ -65,8 +75,11 @@ setup(
     install_requires=[
         'ml_dtypes>=0.2.0',
         'numpy>=1.22',
+        "numpy>=1.23.2; python_version>='3.11'",
+        "numpy>=1.26.0; python_version>='3.12'",
         'opt_einsum',
-        'scipy>=1.7',
+        'scipy>=1.9',
+        "scipy>=1.11.1; python_version>='3.12'",
         # Required by xla_bridge.discover_pjrt_plugins for forwards compat with
         # Python versions < 3.10. Can be dropped when 3.10 is the minimum
         # required Python version.
@@ -85,8 +98,11 @@ setup(
 
         # Cloud TPU VM jaxlib can be installed via:
         # $ pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-        'tpu': [f'jaxlib=={_current_jaxlib_version}',
-                f'libtpu-nightly=={_libtpu_version}'],
+        'tpu': [
+          f'jaxlib=={_current_jaxlib_version}',
+          f'libtpu-nightly=={_libtpu_version}',
+          'requests',  # necessary for jax.distributed.initialize
+        ],
 
         # $ pip install jax[australis]
         'australis': ['protobuf>=3.13,<4'],
@@ -106,18 +122,29 @@ setup(
           "nvidia-cufft-cu11>=10.9",
           "nvidia-cusolver-cu11>=11.4",
           "nvidia-cusparse-cu11>=11.7",
+          "nvidia-nccl-cu11>=2.18.3",
         ],
 
         'cuda12_pip': [
           f"jaxlib=={_current_jaxlib_version}+cuda12.cudnn{_default_cuda12_cudnn_version}",
-          "nvidia-cublas-cu12",
-          "nvidia-cuda-cupti-cu12",
-          "nvidia-cuda-nvcc-cu12",
-          "nvidia-cuda-runtime-cu12",
+          "nvidia-cublas-cu12>=12.2.5.6",
+          "nvidia-cuda-cupti-cu12>=12.2.142",
+          "nvidia-cuda-nvcc-cu12>=12.2.140",
+          "nvidia-cuda-runtime-cu12>=12.2.140",
           "nvidia-cudnn-cu12>=8.9",
-          "nvidia-cufft-cu12",
-          "nvidia-cusolver-cu12",
-          "nvidia-cusparse-cu12",
+          "nvidia-cufft-cu12>=11.0.8.103",
+          "nvidia-cusolver-cu12>=11.5.2",
+          "nvidia-cusparse-cu12>=12.1.2.141",
+          "nvidia-nccl-cu12>=2.18.3",
+
+          # nvjitlink is not a direct dependency of JAX, but it is a transitive
+          # dependency via, for example, cuSOLVER. NVIDIA's cuSOLVER packages
+          # do not have a version constraint on their dependencies, so the
+          # package doesn't get upgraded even though not doing that can cause
+          # problems (https://github.com/google/jax/issues/18027#issuecomment-1756305196)
+          # Until NVIDIA add version constraints, add an version constraint
+          # here.
+          "nvidia-nvjitlink-cu12>=12.2",
         ],
 
         # Target that does not depend on the CUDA pip wheels, for those who want

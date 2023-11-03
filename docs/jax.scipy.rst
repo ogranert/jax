@@ -14,6 +14,16 @@ jax.scipy.fft
    idct
    idctn
 
+jax.scipy.integrate
+-------------------
+
+.. automodule:: jax.scipy.integrate
+
+.. autosummary::
+  :toctree: _autosummary
+
+   trapezoid
+
 jax.scipy.linalg
 ----------------
 
@@ -120,6 +130,7 @@ jax.scipy.special
 .. autosummary::
   :toctree: _autosummary
 
+   bernoulli
    betainc
    betaln
    digamma
@@ -153,6 +164,8 @@ jax.scipy.special
    xlog1py
    xlogy
    zeta
+   kl_div
+   rel_entr
 
 
 jax.scipy.stats
@@ -190,10 +203,21 @@ jax.scipy.stats.beta
    cdf
    logcdf
    sf
+   logsf
 
 jax.scipy.stats.betabinom
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: jax.scipy.stats.betabinom
+
+.. autosummary::
+  :toctree: _autosummary
+
+   logpmf
+   pmf
+
+jax.scipy.stats.binom
+~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: jax.scipy.stats.binom
 
 .. autosummary::
   :toctree: _autosummary
@@ -213,6 +237,7 @@ jax.scipy.stats.cauchy
    cdf
    logcdf
    sf
+   logsf
    isf
    ppf
 
@@ -228,6 +253,7 @@ jax.scipy.stats.chi2
    cdf
    logcdf
    sf
+   logsf
 
 
 jax.scipy.stats.dirichlet
@@ -260,6 +286,7 @@ jax.scipy.stats.gamma
    cdf
    logcdf
    sf
+   logsf
 
 jax.scipy.stats.gennorm
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -304,6 +331,15 @@ jax.scipy.stats.logistic
    ppf
    sf
 
+jax.scipy.stats.multinomial
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: jax.scipy.stats.multinomial
+.. autosummary::
+  :toctree: _autosummary
+
+   logpmf
+   pmf
+
 jax.scipy.stats.multivariate_normal
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: jax.scipy.stats.multivariate_normal
@@ -313,18 +349,29 @@ jax.scipy.stats.multivariate_normal
    logpdf
    pdf
 
+jax.scipy.stats.nbinom
+~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: jax.scipy.stats.nbinom
+
+.. autosummary::
+  :toctree: _autosummary
+
+   logpmf
+   pmf
+
 jax.scipy.stats.norm
 ~~~~~~~~~~~~~~~~~~~~
 .. automodule:: jax.scipy.stats.norm
 .. autosummary::
   :toctree: _autosummary
 
-   cdf
-   logcdf
    logpdf
    pdf
+   cdf
+   logcdf
    ppf
    sf
+   logsf
    isf
 
 jax.scipy.stats.pareto
@@ -394,6 +441,15 @@ jax.scipy.stats.gaussian_kde
 jax.scipy.stats.vonmises
 ~~~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: jax.scipy.stats.vonmises
+.. autosummary::
+  :toctree: _autosummary
+
+   logpdf
+   pdf
+
+jax.scipy.stats.wrapcauchy
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: jax.scipy.stats.wrapcauchy
 .. autosummary::
   :toctree: _autosummary
 

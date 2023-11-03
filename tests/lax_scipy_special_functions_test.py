@@ -28,7 +28,6 @@ from jax.scipy import special as lsp_special
 
 from jax import config
 config.parse_flags_with_absl()
-FLAGS = config.FLAGS
 
 
 all_shapes = [(), (4,), (3, 4), (3, 1), (1, 4), (2, 1, 4)]
@@ -127,9 +126,7 @@ JAX_SPECIAL_FUNCTION_RECORDS = [
     op_record(
         "xlog1py", 2, float_dtypes, jtu.rand_default, True
     ),
-    # TODO: enable gradient test for zeta by restricting the domain of
-    # of inputs to some reasonable intervals
-    op_record("zeta", 2, float_dtypes, jtu.rand_positive, False),
+    op_record("zeta", 2, float_dtypes, jtu.rand_positive, True),
     # TODO: float64 produces aborts on gpu, potentially related to use of jnp.piecewise
     op_record(
         "expi", 1, [np.float32],
@@ -137,6 +134,11 @@ JAX_SPECIAL_FUNCTION_RECORDS = [
     op_record("exp1", 1, [np.float32], jtu.rand_positive, True),
     op_record(
         "expn", 2, (int_dtypes, [np.float32]), jtu.rand_positive, True, (0,)),
+    op_record("kl_div", 2, float_dtypes, jtu.rand_positive, True),
+    op_record(
+        "rel_entr", 2, float_dtypes, jtu.rand_positive, True,
+    ),
+
 ]
 
 
@@ -179,8 +181,19 @@ class LaxScipySpcialFunctionsTest(jtu.JaxTestCase):
       assert list(nondiff_argnums) == sorted(set(nondiff_argnums))
       diff_args = [x for i, x in enumerate(args) if i not in nondiff_argnums]
       jtu.check_grads(partial_lax_op, diff_args, order=1,
-                      atol=jtu.if_device_under_test("tpu", .1, 1e-3),
+                      atol=.1 if jtu.test_device_matches(["tpu"]) else 1e-3,
                       rtol=.1, eps=1e-3)
+
+  @jtu.sample_product(
+      n=[0, 1, 2, 3, 10, 50]
+  )
+  def testScipySpecialFunBernoulli(self, n):
+    dtype = jax.numpy.zeros(0).dtype  # default float dtype.
+    scipy_op = lambda: osp_special.bernoulli(n).astype(dtype)
+    lax_op = functools.partial(lsp_special.bernoulli, n)
+    args_maker = lambda: []
+    self._CheckAgainstNumpy(scipy_op, lax_op, args_maker, atol=0, rtol=1E-5)
+    self._CompileAndCheck(lax_op, args_maker, atol=0, rtol=1E-5)
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ import jax
 from jax import config, jit, lax
 import jax.numpy as jnp
 import jax._src.test_util as jtu
-from jax.experimental.sparse import BCOO, sparsify, todense, SparseTracer
+from jax.experimental.sparse import BCOO, BCSR, sparsify, todense, SparseTracer
 from jax.experimental.sparse.transform import (
   arrays_to_spvalues, spvalues_to_arrays, sparsify_raw, SparsifyValue, SparsifyEnv)
 from jax.experimental.sparse.util import CuSparseEfficiencyWarning
@@ -162,27 +162,29 @@ class SparsifyTest(jtu.JaxTestCase):
 
     self.assertAllClose(result_sparse.todense(), result_dense)
 
+  @jax.numpy_dtype_promotion('standard')
   def testSparseMatmul(self):
-    X = jnp.arange(16.0).reshape(4, 4)
+    X = jnp.arange(16.0, dtype='float32').reshape(4, 4)
     Xsp = BCOO.fromdense(X)
-    Y = jnp.ones(4)
+    Y = jnp.ones(4, dtype='int32')
     Ysp = BCOO.fromdense(Y)
 
-    func = self.sparsify(operator.matmul)
+    # Note: deliberately testing with mixed precision
+    assert Xsp.dtype != Ysp.dtype
 
     # dot_general
-    result_sparse = func(Xsp, Y)
-    result_dense = operator.matmul(X, Y)
+    result_sparse =  self.sparsify(lax.dot)(Xsp, Y)
+    result_dense = lax.dot(X, Y)
     self.assertAllClose(result_sparse, result_dense)
 
     # rdot_general
-    result_sparse = func(Y, Xsp)
-    result_dense = operator.matmul(Y, X)
+    result_sparse =  self.sparsify(lax.dot)(Y, Xsp)
+    result_dense = lax.dot(Y, X)
     self.assertAllClose(result_sparse, result_dense)
 
-  # spdot_general
-    result_sparse = self.sparsify(operator.matmul)(Xsp, Ysp)
-    result_dense = operator.matmul(X, Y)
+    # spdot_general
+    result_sparse = self.sparsify(lax.dot)(Xsp, Ysp)
+    result_dense = lax.dot(X, Y)
     self.assertAllClose(result_sparse.todense(), result_dense)
 
   def testSparseAdd(self):
@@ -221,7 +223,6 @@ class SparsifyTest(jtu.JaxTestCase):
     msg = "Addition between a sparse array X and a dense array Y is not implemented"
     with self.assertRaisesRegex(NotImplementedError, msg):
       self.sparsify(operator.add)(x, 1.)
-
 
   @jtu.sample_product(
     [dict(shape=shape, n_batch=n_batch, n_dense=n_dense)
@@ -562,12 +563,23 @@ class SparsifyTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(TypeError, "sparsified true_fun and false_fun output.*"):
       func(x_bcoo, y)
 
-  def testToDense(self):
-    M = jnp.arange(4)
-    Msp = BCOO.fromdense(M)
+  @parameterized.named_parameters(
+      {"testcase_name": f"_{fmt}", "fmt": fmt}
+      for fmt in ["BCSR", "BCOO"]
+  )
+  def testToDense(self, fmt):
+    M = jnp.arange(4).reshape(2, 2)
+    if fmt == "BCOO":
+      Msp = BCOO.fromdense(M)
+    elif fmt == "BCSR":
+      Msp = BCSR.fromdense(M)
+    else:
+      raise ValueError(f"Unrecognized {fmt=}")
+
     @self.sparsify
     def func(M):
       return todense(M) + 1
+
     self.assertArraysEqual(func(M), M + 1)
     self.assertArraysEqual(func(Msp), M + 1)
     self.assertArraysEqual(jit(func)(M), M + 1)

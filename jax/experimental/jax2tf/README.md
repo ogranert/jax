@@ -18,27 +18,23 @@ These APIs can be combined, e.g., to reload in JAX a program that
 has been serialized from JAX to a TensorFlow SavedModel, or to save to
 TensorFlow SavedModel a JAX program that uses a TensorFlow library.
 
-Tip: As of version 0.4.7 (March 2023), there is a new option
-`native_serialization` to use JAX's native lowering to StableHLO to obtain
-one StableHLO module for the entire JAX function instead of lowering each
-JAX primitive to a TensorFlow op.
-
-The preferred mode of JAX-TensorFlow interoperation is by way of
-**native serialization** in which the target function is lowered to StableHLO
+Tip: As of version 0.4.14 (July 2023) the default mode of JAX-TensorFlow
+interoperation is by way of **native serialization** in which the target
+function is lowered to StableHLO
 using standard native JAX or TensorFlow APIs, and then the StableHLO module
 is invoked from the other framework.
-To enable this mode, set `native_serialization=True` (soon to be the default).
-This has several advantages:
+The native serialization mode has several advantages:
 
    * supports virtually all operations supported by native execution, e.g.,
      `xmap`, `shard_map`, `pmap`, parallel collective operations, and all
      primitives at all data types.
-   * uses standard native code paths in each framework, and thus it is easier
+   * uses standard native JAX code paths for lowering, and thus it is easier
      to trust that the semantics and performance stays faithful to the native
-     semantics, across platforms. Has optional checking that the code runs on
-     the platform for which it was serialized.
+     semantics, across platforms.
    * the metadata associated with the operations, e.g., source location, is
      identical to what native execution uses.
+   * includes safety checking that the serialized code is executed on
+     the platform for which it was serialized.
 
 At the moment when using JAX native serialization the whole
 JAX compilation unit is wrapped with a single thin TensorFlow op,
@@ -61,7 +57,8 @@ The reasons we wrap the StableHLO in a TensorFlow op are:
 
 For backwards compatibility purposes, and for special uses,
 the JAX-TensorFlow interoperation APIs can be used also
-in a **graph serialization** mode (the only mode available before version 0.4.7),
+in a **graph serialization** mode (the only mode available before version 0.4.7,
+and the default mode before JAX version 0.4.15),
 without going through StableHLO.
 
   * For calling JAX functions from TensorFlow,
@@ -89,6 +86,13 @@ without going through StableHLO.
     then the target TensorFlow function is executed in eager mode. This can
     be useful if the target TensorFlow function is not lowerable to HLO, e.g.,
     is using strings.
+
+To disable native serialization, you can do the following, in decreasing
+priority order:
+
+  * set `native_serialization=False`, or
+  * use the configuration flag `--jax2tf_default_native_serialization=false`, or
+  * use the environment variable `JAX2TF_DEFAULT_NATIVE_SERIALIZATION=false`.
 
 We describe below some general concepts and capabilities, first for
 `jax2tf.convert` and [later](#calling-tensorflow-functions-from-jax)
@@ -147,7 +151,7 @@ and to avoid warnings and outright errors.
 
 You can serialize JAX program into a TensorFlow SavedModel, for use
 with tooling that understands SavedModel. Both in native and non-native
-serialization you can count on 6 months of backwards compatiblity (you
+serialization you can count on 6 months of backwards compatibility (you
 can load a function serialized today with tooling that will be built
 up to 6 months in the future), and 3 weeks of limited forwards compatibility
 (you can load a function serialized today with tooling that was built
@@ -547,11 +551,9 @@ cannot be used anymore as dimension parameters and will raise a JAX error.
 
 ### Errors in presence of shape polymorphism
 
-If you write your program assuming that all shapes are tuples of integers,
-and then try to trace it with shape polymorphism you can run into a number
-of errors.
-
-The program:
+Most JAX code assumes that the shapes of JAX arrays are tuples of integers,
+but with shape polymorphism some dimensions may be symbolic expressions.
+This can lead to a number of errors. For example, the program:
 
 ```python
 four_ones = np.ones((4,))
@@ -596,6 +598,66 @@ implicitly converted to JAX arrays.
 The solution is to avoid `np.array`, `float`, or JAX arrays in operations whose
 results are used as shapes, e.g., instead of `np.arange(n) * x.shape[0]` write
 `[i * x.shape[0] for i in range(n)]`.
+
+### Dimension variables must be solvable from the input shapes
+
+JAX will generate code to derive the values of the dimension variables
+from the input shapes. This works only if the symbolic dimensions in the input shapes are linear.
+For example, the following `polymorphic_shapes` will result in errors:
+
+```python
+polymorphic_shapes = ["a * a"]  # Not a linear polynomial
+polymorphic_shapes = ["a + b"]  # Too few equations to derive both `a` and `b`
+```
+
+The error message for the last specification above would be:
+
+```
+Cannot solve for values of dimension variables {'a', 'b'}. "
+We can only solve linear uni-variate constraints. "
+Using the following polymorphic shapes specifications: args[0].shape = (a + b,).
+Unprocessed specifications: 'a + b' for dimension size args[0].shape[0]. "
+Please see https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#dimension-variables-must-be-solvable-from-the-input-shapes for more details.
+```
+
+### Shape assertion errors
+
+JAX assumes that dimension variables range over strictly positive integers.
+Starting with serialization version 7 these assumptions are
+checked against the shapes of the actual arguments
+when the lowered code is invoked.
+For example, given the `polymorphic_shapes="(b, b, 2*d)"`
+specification, we will generate code to check the following constraints when
+invoked with actual argument `arg`:
+
+  * `arg.shape[0] >= 1`
+  * `arg.shape[1] == arg.shape[0]`
+  * `arg.shape[2] % 2 == 0`
+  * `arg.shape[2] // 2 >= 1`
+
+An example error for the third constraint above, e.g., when invoked with
+shape `(3, 3, 5)`, would be:
+
+```
+Input shapes do not match the polymorphic shapes specification.
+Division had remainder 1 when computing the value of 'd'.
+Using the following polymorphic shapes specifications: args[0].shape = (b, b, 2*d).
+Obtained dimension variables: 'b' = 3 from specification 'b' for dimension args[0].shape[0] (= 3).
+Please see https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#shape-assertion-errors for more details.
+```
+
+When using native serialization these are checked by the `tf.XlaCallModule`
+op (starting with serialization
+[version 7](https://github.com/search?q=repo%3Agoogle%2Fjax+path%3Aconfig.py+jax_serialization_version&type=code)),
+and you will get `tf.errors.InvalidArgument` errors.
+You can disable this checking by including `DisabledSafetyCheck.shape_assertions()`
+in the `disabled_checks` parameter to `jax2tf.convert`, or by setting
+the environment variable
+`TF_XLA_FLAGS=--tf_xla_call_module_disabled_checks=shape_assertions`.
+When using graph serialization these are checked using `tf.debugging.assert`,
+which will also result in `tf.errors.InvalidArgument`.
+Note that due to limitations in TensorFlow, these errors are suppressed when using
+`jit_compile=True` and when running on TPU.
 
 ### Comparison of symbolic dimensions is partially supported
 
@@ -696,25 +758,83 @@ jax2tf.convert(lambda x: jnp.reshape(x, (2, -1)),
                polymorphic_shapes=["(2*b, ...)"])(np.ones((4, 5, 7)))
 ```
 
-### Dimension variables must be solvable from the input shapes
+## Native serialization versions
 
-`jax2tf` will generate code to derive the values of the dimension variables
-from the input shapes. This works only if the symbolic dimensions in the input shapes are linear.
-For example, the following `polymorphic_shapes` will result in errors:
+We use a serialization version number to help evolve the serialization
+mechanism while allowing serialized artifacts to be used by consumers built
+at different code versions.
 
-```python
-polymorphic_shapes = ["a * a"]  # Not a linear polynomial
-polymorphic_shapes = ["a + b"]  # Too few equations to derive both `a` and `b`
+If consumers use the `tf.XlaCallModule` op, e.g. when using the TensorFlow
+SavedModel, then they support a range of serialization versions.
+See [tf.XlaCallModule code](https://github.com/search?q=repo%3Atensorflow%2Ftensorflow+path%3Axla_call_module+%22int+kVersionMaximumSupported%22&type=code).
+There is also an API to get the maximum version number supported by your
+installed version of TensorFlow:
+
+```
+from tensorflow.compiler.tf2xla.python import xla as tfxla
+tfxla.call_module_maximum_supported_version()
 ```
 
-If you are using native serialization, the restrictions are stronger: every dimension
-variable must occur as the value of some dimension of some input, e.g.,
-the following will work:
+For **backward compatibility**, we want to allow a freshly built consumer
+to load artifacts that have been serialized in the past 6 months
+(by a serializer using the latest version supported at the time). Thus,
+the minimum supported version number should match the maximum supported
+version number from 6 months in the past.
 
-```python
-polymorphic_shapes = ["a, 2*a, b"]
-polymorphic_shapes = ["a * a, a"]
-```
+The serialization version used by JAX is determined by the
+`--jax_serialization_version` flag, or if missing, the
+`JAX_SERIALIZATION_VERSION` environment variable. The default value is
+specified in the [`config.py` file](https://github.com/search?q=repo%3Agoogle%2Fjax+path%3Aconfig.py+JAX_SERIALIZATION_VERSION&type=code).
+
+For **forward compatibility**, we want freshly serialized artifacts to be
+loadable by consumers that have been built in the last 1 month.
+Thus, we bump the default serialization version
+number about 1 month after the `tf.XlaCallModule` is upgraded to a
+given version number.
+
+You can use `--jax_serialization_version` to adjust the serialization version
+to your deployed consumer. We reserve the right to remove support for
+generating or consuming old serialization versions older than 6 months.
+
+## Serialization version numbers
+
+We list here a history of the serialization version numbers:
+
+  * Version 1 used MHLO & CHLO to serialize the code, not supported anymore.
+  * Version 2 supports StableHLO & CHLO. Used from October 2022. Not supported
+    anymore.
+  * Version 3 supports platform checking and multiple platforms.
+    Used from February 2023. Not supported anymore.
+  * Version 4 supports StableHLO with compatibility guarantees.
+    This is the earliest version at the time of the JAX native serialization
+    launch.
+    Used in JAX from March 15, 2023 (cl/516885716). Starting with
+    March 28th, 2023 we stopped using `dim_args_spec` (cl/520033493).
+    The support for this version was dropped on
+    October 17th, 2023 (cl/573858283).
+  * Version 5 adds support for `call_tf_graph`. This is currently used
+    for some specialized use cases. Used in JAX from May 3rd, 2023
+    (cl/529106145).
+  * Version 6 adds support for the `disabled_checks` attribute. This version
+    mandates a non-empty `platforms` attribute. Supported by XlaCallModule
+    since June 7th, 2023 and available in JAX since
+    June 13th, 2023 (JAX 0.4.13).
+  * Version 7 adds support for `stablehlo.shape_assertion` operations and
+    for `shape_assertions` specified in `disabled_checks`.
+    See [Errors in presence of shape polymorphism](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#errors-in-presence-of-shape-polymorphism). Supported by XlaCallModule
+    since July 12th, 2023 (cl/547482522),
+    available in JAX serialization since July 20th, 2023 (JAX 0.4.14),
+    and the default since August 12th, 2023 (JAX 0.4.15).
+  * Version 8 adds support for the `jax.uses_shape_polymorphism` module
+    attribute and enables the shape refinement pass only when the
+    attribute is present. Supported by XlaCallModule since July 21st, 2023
+    (cl/549973693), available in JAX since July 26th, 2023 (JAX 0.4.14),
+    and the default since October 21st, 2023 (JAX 0.4.20).
+  * Version 9 adds support for effects.
+    See the docstring for `export.Exported` for the precise calling convention.
+    In this serialization version we also tag the platform index and the
+    dimension variables arguments with `jax.global_constant` attributes.
+    Available in JAX since October 20th, 2023 (JAX 0.4.20).
 
 ## Known issues
 
@@ -1053,7 +1173,7 @@ There is work underway to enable more tools to consume StableHLO.
 
 Applies to native serialization only.
 
-When you use native serialization, JAX will record the plaform for
+When you use native serialization, JAX will record the platform for
 which the module was serialized, and you will get an error if you
 try to execute the `XlaCallModule` TensorFlow op on another platform.
 
@@ -1068,7 +1188,7 @@ The current platform CPU is not among the platforms required by the module [CUDA
 ```
 
 where `CPU` is the TensorFlow platform where the op is being executed
-and `CUDA` is the plaform for which the module was serialized by JAX.
+and `CUDA` is the platform for which the module was serialized by JAX.
 This probably means that JAX and TensorFlow may see different devices
 as the default device (JAX defaults to GPU and TensorFlow to CPU
 in the example error above).
@@ -1604,7 +1724,7 @@ for stderr, `${SOME_DIR}` to store the dumps in the specified directory.
 ## TensorFlow versions supported
 
 The ``jax2tf.convert`` and `call_tf` require fairly recent versions of TensorFlow.
-As of today, the tests are run using `tf_nightly==2.13.0.dev20230311`.
+As of today, the tests are run using `tf_nightly==2.14.0.dev20230720`.
 
 ## Running on GPU
 

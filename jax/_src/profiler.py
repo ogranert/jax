@@ -30,6 +30,7 @@ traceback_util.register_exclusion(__file__)
 
 from jax._src import xla_bridge
 from jax._src.lib import xla_client
+from jax._src.lib import xla_extension_version
 
 _profiler_server: Optional[xla_client.profiler.ProfilerServer] = None
 
@@ -76,6 +77,13 @@ class _ProfileState:
     self.create_perfetto_trace = False
     self.lock = threading.Lock()
 
+  def reset(self):
+    _profile_state.profile_session = None
+    _profile_state.create_perfetto_link = False
+    _profile_state.create_perfetto_trace = False
+    _profile_state.log_dir = None
+
+
 _profile_state = _ProfileState()
 
 
@@ -104,7 +112,7 @@ def start_trace(log_dir, create_perfetto_link: bool = False,
       Perfetto trace viewer UI (https://ui.perfetto.dev). The file will also be
       generated if ``create_perfetto_link`` is true. This could be useful if you
       want to generate a Perfetto-compatible trace without blocking the
-      processs.
+      process.
   """
   with _profile_state.lock:
     if _profile_state.profile_session is not None:
@@ -193,15 +201,33 @@ def stop_trace():
   with _profile_state.lock:
     if _profile_state.profile_session is None:
       raise RuntimeError("No profile started")
-    _profile_state.profile_session.stop_and_export(_profile_state.log_dir)
+    if xla_extension_version > 205:
+      sess = _profile_state.profile_session
+      sess.export(sess.stop(), _profile_state.log_dir)
+    else:
+      _profile_state.profile_session.stop_and_export(_profile_state.log_dir)  # pytype: disable=attribute-error
     if _profile_state.create_perfetto_trace:
       abs_filename = _write_perfetto_trace_file(_profile_state.log_dir)
       if _profile_state.create_perfetto_link:
         _host_perfetto_trace_file(abs_filename)
-    _profile_state.profile_session = None
-    _profile_state.create_perfetto_link = False
-    _profile_state.create_perfetto_trace = False
-    _profile_state.log_dir = None
+    _profile_state.reset()
+
+
+def stop_and_get_fdo_profile() -> bytes:
+  """Stops the currently-running profiler trace and export fdo_profile.
+
+  Currently, this is only supported for GPU.
+  Raises a RuntimeError if a trace hasn't been started.
+  """
+  if xla_extension_version < 206:
+    raise NotImplementedError("stop and get fdo profile is not supported.")
+  with _profile_state.lock:
+    if _profile_state.profile_session is None:
+      raise RuntimeError("No profile started")
+    xspace = _profile_state.profile_session.stop()
+    fdo_profile = xla_client.profiler.get_fdo_profile(xspace)
+    _profile_state.reset()
+    return fdo_profile
 
 
 @contextmanager
@@ -228,7 +254,7 @@ def trace(log_dir, create_perfetto_link=False, create_perfetto_trace=False):
       Perfetto trace viewer UI (https://ui.perfetto.dev). The file will also be
       generated if ``create_perfetto_link`` is true. This could be useful if you
       want to generate a Perfetto-compatible trace without blocking the
-      processs.
+      process.
   """
   start_trace(log_dir, create_perfetto_link, create_perfetto_trace)
   try:
@@ -316,12 +342,11 @@ def annotate_function(func: Callable, name: Optional[str] = None,
   return wrapper
 
 
-
 def device_memory_profile(backend: Optional[str] = None) -> bytes:
   """Captures a JAX device memory profile as ``pprof``-format protocol buffer.
 
   A device memory profile is a snapshot of the state of memory, that describes the JAX
-  :class:`jax.DeviceArray` and executable objects present in memory and their
+  :class:`~jax.Array` and executable objects present in memory and their
   allocation sites.
 
   For more information how to use the device memory profiler, see

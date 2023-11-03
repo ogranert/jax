@@ -13,10 +13,11 @@
 # limitations under the License.
 """Module for JAX debugging primitives and related functionality."""
 
+from collections.abc import Sequence
 import functools
 import string
 import sys
-from typing import Any,  Callable, Optional, Sequence, Union
+from typing import Any, Callable, Optional, Union
 import weakref
 
 import numpy as np
@@ -39,8 +40,7 @@ from jax._src.lib import xla_client as xc
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import hlo
 from jax._src.sharding import Sharding
-from jax._src.sharding_impls import (GSPMDSharding, NamedSharding,
-                                     parse_flatten_op_sharding)
+from jax._src.sharding_impls import NamedSharding, parse_flatten_op_sharding
 
 # pytype: disable=import-error
 try:
@@ -152,14 +152,13 @@ def debug_callback_lowering(ctx, *args, effect, callback, **params):
             *flat_args, effect=effect, callback=callback, **params))
   if effects.ordered_effects.contains(effect):
     token = ctx.tokens_in.get(effect)[0]
-    result, token, keepalive = mlir.emit_python_callback(
+    result, token, _ = mlir.emit_python_callback(
         ctx, _callback, token, list(args), ctx.avals_in, ctx.avals_out, True)
     ctx.set_tokens_out(mlir.TokenSet({effect: (token,)}))
   else:
-    result, token, keepalive = mlir.emit_python_callback(
+    result, token, _ = mlir.emit_python_callback(
         ctx, _callback, None, list(args), ctx.avals_in, ctx.avals_out, True,
         sharding=sharding)
-  ctx.module_context.add_keepalive(keepalive)
   return result
 mlir.register_lowering(debug_callback_p, debug_callback_lowering,
                        platform="cpu")
@@ -205,14 +204,14 @@ def debug_callback(callback: Callable[..., Any], *args: Any,
 
   For more explanation, see `External Callbacks`_.
 
-  `debug_callback` enables you to pass in a Python function that can be called
-  inside of a staged JAX program. A `debug_callback` follows existing JAX
+  ``jax.debug.callback`` enables you to pass in a Python function that can be called
+  inside of a staged JAX program. A ``jax.debug.callback`` follows existing JAX
   transformation *pure* operational semantics, which are therefore unaware of
   side-effects. This means the effect could be dropped, duplicated, or
   potentially reordered in the presence of higher-order primitives and
   transformations.
 
-  We want this behavior because we'd like `debug_callback` to be "innocuous",
+  We want this behavior because we'd like ``jax.debug.callback`` to be "innocuous",
   i.e. we want these primitives to change the JAX computation as little as
   possible while revealing as much about them as possible, such as which parts
   of the computation are duplicated or dropped.
@@ -273,8 +272,8 @@ def debug_print(fmt: str, *args, ordered: bool = False, **kwargs) -> None:
       input arguments.
     *args: A list of positional arguments to be formatted.
     ordered: A keyword only argument used to indicate whether or not the
-      staged out computation will enforce ordering of this ``debug_print``
-      w.r.t. other ordered ``debug_print`` calls.
+      staged out computation will enforce ordering of this ``jax.debug.print``
+      w.r.t. other ordered ``jax.debug.print`` calls.
     **kwargs: Additional keyword arguments to be formatted.
   """
   # Check that we provide the correct arguments to be formatted
@@ -336,7 +335,8 @@ def _inspect_sharding_lowering_rule(ctx: mlir.LoweringRuleContext, value, *,
   # partitioner calls back with the `HloSharding.
   def _hlo_sharding_callback(hlo_sharding: xc.HloSharding):
     if mesh.empty:
-      return callback(GSPMDSharding(devices, hlo_sharding))
+      return callback(
+          sharding_impls._op_sharding_to_pos_sharding(hlo_sharding, devices))
     pspec = parse_flatten_op_sharding(hlo_sharding, mesh)[0].get_partition_spec()
     return callback(NamedSharding(mesh, pspec))
 
@@ -385,7 +385,7 @@ def inspect_sharding_partition(shapes, arg_shardings, result_shape,
   jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(fun, in_avals)
   closed_jaxpr = core.ClosedJaxpr(jaxpr, consts)
   trivial_comp = mlir.build_xla_computation_helper(closed_jaxpr,
-      name="tmp_xla_computation", platform=module_context.platform,
+      name="tmp_xla_computation", platforms=module_context.platforms,
       backend_or_name=module_context.backend_or_name,
       axis_context=module_context.axis_context)
   # The trivial computation built here has a dummy tuple as the result,

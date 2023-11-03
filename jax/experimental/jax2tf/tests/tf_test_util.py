@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Sequence
 import contextlib
 import dataclasses
+import functools
 import re
 import os
-
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional
 
 from absl.testing import absltest
 from absl import logging
@@ -28,12 +29,14 @@ from jax import numpy as jnp
 from jax._src import test_util as jtu
 from jax import tree_util
 
-from jax import config
 from jax.experimental import jax2tf
+from jax.experimental.export import export
+from jax._src import config
 from jax._src import xla_bridge
 import numpy as np
 import tensorflow as tf  # type: ignore[import]
 from tensorflow.compiler.xla import xla_data_pb2  # type: ignore[import]
+from tensorflow.compiler.tf2xla.python import xla as tfxla  # type: ignore[import]
 
 DType = Any
 
@@ -151,8 +154,12 @@ def ComputeTfValueAndGrad(tf_f: Callable, tf_args: Sequence,
 
 
 @jtu.with_config(jax_numpy_rank_promotion="allow",
-                 jax_numpy_dtype_promotion='standard')
+                 jax_numpy_dtype_promotion='standard',
+                 jax_legacy_prng_key="allow")
 class JaxToTfTestCase(jtu.JaxTestCase):
+  # We want most tests to use the maximum available version, from the locally
+  # installed tfxla module and export.
+  use_max_serialization_version = True
 
   def setUp(self):
     super().setUp()
@@ -167,6 +174,23 @@ class JaxToTfTestCase(jtu.JaxTestCase):
     self.assertEqual(jtu.device_under_test().upper(),
                      self.tf_default_device.device_type)
 
+    # We run the tests using the maximum version supported, even though
+    # the default serialization version may be held back for a while to
+    # ensure compatibility
+    version = config.jax_serialization_version.value
+    if self.use_max_serialization_version:
+      # Use the largest supported by both export and tfxla.call_module
+      version = min(export.maximum_supported_serialization_version,
+                    tfxla.call_module_maximum_supported_version())
+      self.assertGreaterEqual(version,
+                              export.minimum_supported_serialization_version)
+      self.enter_context(config.jax_serialization_version(version))
+    logging.info(
+      "Using JAX serialization version %s (export.max_version %s, tf.XlaCallModule max version %s)",
+      version,
+      export.maximum_supported_serialization_version,
+      tfxla.call_module_maximum_supported_version())
+
     with contextlib.ExitStack() as stack:
       stack.enter_context(tf.device(self.tf_default_device))
       self.addCleanup(stack.pop_all().close)
@@ -177,7 +201,7 @@ class JaxToTfTestCase(jtu.JaxTestCase):
     def to_numpy_dtype(dt):
       return dt if isinstance(dt, np.dtype) else dt.as_numpy_dtype
 
-    if not config.x64_enabled and canonicalize_dtypes:
+    if not config.enable_x64.value and canonicalize_dtypes:
       self.assertEqual(
           dtypes.canonicalize_dtype(to_numpy_dtype(jtu._dtype(x))),
           dtypes.canonicalize_dtype(to_numpy_dtype(jtu._dtype(y))))
@@ -384,7 +408,7 @@ class JaxToTfTestCase(jtu.JaxTestCase):
     # graph. We count the number of characters in the textual representation
     # of the constant.
     f_tf_graph = tf.function(tf_fun, autograph=False).get_concrete_function(*args).graph.as_graph_def()
-    if config.jax2tf_default_native_serialization:
+    if config.jax2tf_default_native_serialization.value:
       # This way of finding constants may be brittle, if the constant representation
       # contains >. It seems tobe hex-encoded, so this may be safe.
       large_consts = [m for m in re.findall(r"dense<([^>]+)>", str(f_tf_graph)) if len(m) >= at_least]

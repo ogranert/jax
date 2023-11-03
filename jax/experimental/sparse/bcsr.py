@@ -15,17 +15,16 @@
 """BCSR (Bached compressed row) matrix object and associated primitives."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from functools import partial
 import operator
+from typing import Any, NamedTuple
 import warnings
-
-from typing import NamedTuple, Optional, Sequence, Union
 
 import numpy as np
 
 import jax
 import jax.numpy as jnp
-from jax import config
 from jax import lax
 from jax import tree_util
 from jax.experimental.sparse._base import JAXSparse
@@ -37,6 +36,7 @@ from jax.experimental.sparse.util import (
 from jax.util import split_list, safe_zip
 
 from jax._src import api_util
+from jax._src import config
 from jax._src import core
 from jax._src import dispatch
 from jax._src.lax.lax import DotDimensionNumbers, _dot_general_batch_dim_nums
@@ -48,12 +48,12 @@ from jax._src.interpreters import mlir
 from jax._src.typing import Array, ArrayLike, DTypeLike
 
 
-def bcsr_eliminate_zeros(mat: BCSR, nse: Optional[int] = None) -> BCSR:
+def bcsr_eliminate_zeros(mat: BCSR, nse: int | None = None) -> BCSR:
   """Eliminate zeros in BCSR representation."""
   return BCSR.from_bcoo(bcoo.bcoo_eliminate_zeros(mat.to_bcoo(), nse=nse))
 
 
-def bcsr_sum_duplicates(mat: BCSR, nse: Optional[int] = None) -> BCSR:
+def bcsr_sum_duplicates(mat: BCSR, nse: int | None = None) -> BCSR:
   """Sums duplicate indices within a BCSR array, returning an array with sorted indices.
 
   Args:
@@ -78,9 +78,9 @@ def _bcsr_batch_dims_to_front(batched_args, batch_dims, spinfo, batch_size=None)
   if not all(b is None or 0 <= b < n_batch for b in batch_dims):
     raise NotImplementedError("batch_dims must be None or satisfy 0 < dim < n_batch. "
                               f"Got {batch_dims=} for {n_batch=}.")
-  batched_data, batched_indices, batched_indptr = [
+  batched_data, batched_indices, batched_indptr = (
       lax.expand_dims(arg, [0]) if bdim is None else jnp.moveaxis(arg, bdim, 0)
-      for arg, bdim in [(data, data_bdim), (indices, indices_bdim), (indptr, indptr_bdim)]]
+      for arg, bdim in [(data, data_bdim), (indices, indices_bdim), (indptr, indptr_bdim)])
   if batch_size is None:
     batch_size = max(arg.shape[dim] for arg, dim in zip(batched_args, batch_dims) if dim is not None)
   batched_spinfo = SparseInfo((batch_size, *spinfo.shape),
@@ -179,7 +179,7 @@ value to the nse (number of stored elements) argument.
 """
 
 
-def bcsr_fromdense(mat: ArrayLike, *, nse: Optional[int] = None, n_batch: int = 0,
+def bcsr_fromdense(mat: ArrayLike, *, nse: int | None = None, n_batch: int = 0,
                    n_dense:int = 0, index_dtype: DTypeLike = jnp.int32) -> BCSR:
   """Create BCSR-format sparse matrix from a dense matrix.
 
@@ -193,13 +193,13 @@ def bcsr_fromdense(mat: ArrayLike, *, nse: Optional[int] = None, n_batch: int = 
   Returns:
     mat_bcsr: BCSR representation of the matrix.
   """
-  mat = jnp.asarray(mat)
+  mat_array = jnp.asarray(mat)
   if nse is None:
-    nse = _count_stored_elements(mat, n_batch, n_dense)
+    nse = _count_stored_elements(mat_array, n_batch, n_dense)
   nse_int: int = core.concrete_or_error(operator.index, nse, _TRACED_NSE_ERROR)
-  return BCSR(_bcsr_fromdense(mat, nse=nse_int, n_batch=n_batch, n_dense=n_dense,
-                              index_dtype=index_dtype),
-              shape=mat.shape)
+  return BCSR(_bcsr_fromdense(mat_array, nse=nse_int, n_batch=n_batch,
+                              n_dense=n_dense, index_dtype=index_dtype),
+              shape=mat_array.shape)
 
 
 def _bcsr_fromdense(mat: ArrayLike, *, nse: int, n_batch: int = 0, n_dense: int = 0,
@@ -459,7 +459,7 @@ mlir.register_lowering(bcsr_extract_p, mlir.lower_fun(
 bcsr_dot_general_p = core.Primitive('bcsr_dot_general')
 
 
-def bcsr_dot_general(lhs: Union[BCSR, Array], rhs: Array, *,
+def bcsr_dot_general(lhs: BCSR | Array, rhs: Array, *,
                      dimension_numbers: DotDimensionNumbers,
                      precision: None = None,
                      preferred_element_type: None = None) -> Array:
@@ -479,15 +479,17 @@ def bcsr_dot_general(lhs: Union[BCSR, Array], rhs: Array, *,
     are sparse, the result will be sparse, of type BCSR. If either input is
     dense, the result will be dense, of type ndarray.
   """
-  del precision, preferred_element_type  # unused
+  del precision  # unused
   if isinstance(rhs, (np.ndarray, jax.Array)):
     if isinstance(lhs, (np.ndarray, jax.Array)):
-      return lax.dot_general(lhs, rhs, dimension_numbers=dimension_numbers)
+      return lax.dot_general(lhs, rhs, dimension_numbers=dimension_numbers,
+                             preferred_element_type=preferred_element_type)
 
     if isinstance(lhs, BCSR):
       lhs_data, lhs_indices, lhs_indptr = lhs._bufs
       return _bcsr_dot_general(lhs_data, lhs_indices, lhs_indptr, rhs,
                                dimension_numbers=dimension_numbers,
+                               preferred_element_type=preferred_element_type,
                                lhs_spinfo=lhs._info)
 
   raise NotImplementedError("bcsr_dot_general currently implemented for BCSR "
@@ -497,6 +499,7 @@ def bcsr_dot_general(lhs: Union[BCSR, Array], rhs: Array, *,
 def _bcsr_dot_general(lhs_data: jax.Array, lhs_indices: jax.Array,
                       lhs_indptr: jax.Array, rhs: Array, *,
                       dimension_numbers: DotDimensionNumbers,
+                      preferred_element_type: Any,
                       lhs_spinfo: SparseInfo) -> Array:
   (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
   cdims = (api_util._ensure_index_tuple(lhs_contract),
@@ -507,11 +510,12 @@ def _bcsr_dot_general(lhs_data: jax.Array, lhs_indices: jax.Array,
                                  jnp.asarray(lhs_indices),
                                  jnp.asarray(lhs_indptr), jnp.asarray(rhs),
                                  dimension_numbers=(cdims, bdims),
+                                 preferred_element_type=preferred_element_type,
                                  lhs_spinfo=lhs_spinfo)
 
 
 def _bcsr_dot_general_impl(lhs_data, lhs_indices, lhs_indptr, rhs, *,
-                           dimension_numbers, lhs_spinfo):
+                           dimension_numbers, preferred_element_type, lhs_spinfo):
   lhs_data = jnp.asarray(lhs_data)
   lhs_bcsr_indices = jnp.asarray(lhs_indices)
   lhs_bcsr_indptr = jnp.asarray(lhs_indptr)
@@ -520,21 +524,21 @@ def _bcsr_dot_general_impl(lhs_data, lhs_indices, lhs_indptr, rhs, *,
                                    shape=lhs_spinfo.shape)
   return bcoo._bcoo_dot_general_impl(lhs_data, lhs_bcoo_indices, rhs,
                                      dimension_numbers=dimension_numbers,
+                                     preferred_element_type=preferred_element_type,
                                      lhs_spinfo=lhs_spinfo)
 
 
 @bcsr_dot_general_p.def_abstract_eval
 def _bcsr_dot_general_abstract_eval(lhs_data, lhs_indices, lhs_indptr, rhs, *,
-                                    dimension_numbers, lhs_spinfo):
-  if lhs_data.dtype != rhs.dtype:
-    raise ValueError("bcsr_dot_general requires arguments to have matching "
-                     f"dtypes; got lhs.dtype={lhs_data.dtype}, "
-                     f"rhs.dtype={rhs.dtype}")
-
+                                    dimension_numbers, preferred_element_type, lhs_spinfo):
   (lhs_contracting, _), (lhs_batch, _) = dimension_numbers
   props = _validate_bcsr_indices(lhs_indices, lhs_indptr, lhs_spinfo.shape)
-  out_shape = _dot_general_validated_shape(lhs_spinfo.shape, rhs.shape,
-                                           dimension_numbers)
+  out_aval = jax.eval_shape(
+    partial(lax.dot_general,
+            dimension_numbers=dimension_numbers,
+            preferred_element_type=preferred_element_type),
+    jax.ShapeDtypeStruct(lhs_spinfo.shape, lhs_data.dtype),
+    jax.ShapeDtypeStruct(rhs.shape, rhs.dtype))
 
   if lhs_batch and max(lhs_batch) >= props.n_batch:
     raise NotImplementedError(
@@ -545,38 +549,41 @@ def _bcsr_dot_general_abstract_eval(lhs_data, lhs_indices, lhs_indptr, rhs, *,
   if any(d >= props.n_batch + 2 for d in lhs_contracting):
     raise NotImplementedError("bcsr_dot_general: contracting over dense dimensions.")
 
-  return core.ShapedArray(out_shape, lhs_data.dtype)
+  return core.ShapedArray(out_aval.shape, out_aval.dtype)
 
 
 def _bcsr_dot_general_jvp_lhs(lhs_data_dot, lhs_data, lhs_indices, lhs_indptr, rhs, *,
-                              dimension_numbers, lhs_spinfo):
+                              dimension_numbers, preferred_element_type, lhs_spinfo):
   del lhs_data
   return _bcsr_dot_general(lhs_data_dot, lhs_indices, lhs_indptr, rhs,
                            dimension_numbers=dimension_numbers,
+                           preferred_element_type=preferred_element_type,
                            lhs_spinfo=lhs_spinfo)
 
 
 def _bcsr_dot_general_jvp_rhs(rhs_dot, lhs_data, lhs_indices, lhs_indptr, rhs, *,
-                              dimension_numbers, lhs_spinfo):
+                              dimension_numbers, preferred_element_type, lhs_spinfo):
   del rhs
   return _bcsr_dot_general(lhs_data, lhs_indices, lhs_indptr, rhs_dot,
                            dimension_numbers=dimension_numbers,
+                           preferred_element_type=preferred_element_type,
                            lhs_spinfo=lhs_spinfo)
 
 
 def _bcsr_dot_general_transpose(ct, lhs_data, lhs_indices, lhs_indptr, rhs, *,
-                                 dimension_numbers, lhs_spinfo):
+                                 dimension_numbers, preferred_element_type, lhs_spinfo):
   # TODO(jakevdp): implement this in terms of bcsr_dot_general
   lhs_bcoo_indices = _bcsr_to_bcoo(
     lhs_indices, lhs_indptr, shape=lhs_spinfo.shape)
   data_out, _, rhs_out = bcoo._bcoo_dot_general_transpose(
       ct, lhs_data, lhs_bcoo_indices, rhs, dimension_numbers=dimension_numbers,
-      lhs_spinfo=lhs_spinfo)
+      preferred_element_type=preferred_element_type, lhs_spinfo=lhs_spinfo)
   return data_out, lhs_indices, lhs_indptr, rhs_out
 
 
 def _bcsr_dot_general_batch_rule(batched_args, batch_dims, *,
-                                 dimension_numbers, lhs_spinfo):
+                                 dimension_numbers, preferred_element_type,
+                                 lhs_spinfo):
   *lhs_args, rhs = batched_args
   *lhs_dims, rhs_bdim = batch_dims
   *new_lhs_args, new_lhs_spinfo = _bcsr_batch_dims_to_front(
@@ -585,7 +592,8 @@ def _bcsr_dot_general_batch_rule(batched_args, batch_dims, *,
   new_dimension_numbers, result_batch_dim = _dot_general_batch_dim_nums(
       (len(lhs_spinfo.shape), rhs.ndim), (0, rhs_bdim), dimension_numbers)
   batched_out = _bcsr_dot_general(*new_lhs_args, rhs, lhs_spinfo=new_lhs_spinfo,
-                                  dimension_numbers=new_dimension_numbers)
+                                  dimension_numbers=new_dimension_numbers,
+                                  preferred_element_type=preferred_element_type)
   return batched_out, result_batch_dim
 
 
@@ -613,12 +621,14 @@ _bcsr_correct_out_of_bound_indices_lowered = mlir.lower_fun(
 def _bcsr_dot_general_gpu_lowering(
     csr_matvec_lowering, csr_matmat_lowering,
     ctx, lhs_data, lhs_indices, lhs_indptr, rhs, *, dimension_numbers,
-    lhs_spinfo: SparseInfo):
+    preferred_element_type, lhs_spinfo: SparseInfo):
 
-  if not config.jax_bcoo_cusparse_lowering:
+  if not config.bcoo_cusparse_lowering.value:
     return _bcsr_dot_general_default_lowering(
       ctx, lhs_data, lhs_indices, lhs_indptr, rhs,
-      dimension_numbers=dimension_numbers, lhs_spinfo=lhs_spinfo)
+      dimension_numbers=dimension_numbers,
+      preferred_element_type=preferred_element_type,
+      lhs_spinfo=lhs_spinfo)
 
   (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
   lhs_data_aval, lhs_indices_aval, lhs_indptr_aval, rhs_aval = ctx.avals_in
@@ -630,6 +640,10 @@ def _bcsr_dot_general_gpu_lowering(
   # TODO(vanderplas, tianjianlu): lower batched matmuls to GPU
   if lhs_batch or rhs_batch:
     # batch dimensions in dot_general are not supported
+    use_default_lowering = True
+  elif (lhs_data_aval.dtype != rhs_aval.dtype):
+    use_default_lowering = True
+  elif preferred_element_type is not None and preferred_element_type != lhs_data_aval.dtype:
     use_default_lowering = True
   elif len(lhs_spinfo.shape) != 2 or rhs_aval.ndim not in [1, 2]:
     # only matmat / matvec supported
@@ -650,7 +664,9 @@ def _bcsr_dot_general_gpu_lowering(
   if use_default_lowering:
     return _bcsr_dot_general_default_lowering(
       ctx, lhs_data, lhs_indices, lhs_indptr, rhs,
-      dimension_numbers=dimension_numbers, lhs_spinfo=lhs_spinfo)
+      dimension_numbers=dimension_numbers,
+      preferred_element_type=preferred_element_type,
+      lhs_spinfo=lhs_spinfo)
 
   # Account for a bug in cusparse: it references indices and data beyond
   # the extent of indptr.
@@ -771,7 +787,7 @@ class BCSR(JAXSparse):
     return repr_
 
   def transpose(self, *args, **kwargs):
-    raise NotImplementedError("Tranpose is not implemented.")
+    raise NotImplementedError("Transpose is not implemented.")
 
   def tree_flatten(self):
     return (self.data, self.indices, self.indptr), self._info._asdict()
@@ -803,7 +819,7 @@ class BCSR(JAXSparse):
     indptr = jnp.zeros((*batch_shape, sparse_shape[0] + 1), index_dtype)
     return cls((data, indices, indptr), shape=shape)
 
-  def sum_duplicates(self, nse: Optional[int] = None, remove_zeros: bool = True) -> BCSR:
+  def sum_duplicates(self, nse: int | None = None, remove_zeros: bool = True) -> BCSR:
     """Return a copy of the array with duplicate indices summed.
 
     Additionally, this operation will result in explicit zero entries removed, and
@@ -832,7 +848,7 @@ class BCSR(JAXSparse):
   @classmethod
   def fromdense(cls, mat, *, nse=None, index_dtype=np.int32, n_dense=0,
                 n_batch=0):
-    """Create a BCSR array from a (dense) :class:`DeviceArray`."""
+    """Create a BCSR array from a (dense) :class:`Array`."""
     return bcsr_fromdense(mat, nse=nse, index_dtype=index_dtype,
                           n_dense=n_dense, n_batch=n_batch)
 

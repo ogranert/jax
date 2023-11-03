@@ -12,18 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
-import numpy as np
-import itertools as it
 from collections import OrderedDict, abc
-from typing import (Callable, Iterable, Optional, Any,
-                    NamedTuple, Union, Sequence, Mapping)
+from collections.abc import Iterable, Sequence, Mapping
+import contextlib
 from functools import wraps, partial, partialmethod, lru_cache
+import itertools as it
 import math
+from typing import (Callable, Optional, Any,
+                    NamedTuple, Union)
+
+import numpy as np
 
 from jax import lax
 from jax import numpy as jnp
 
+from jax._src import config
 from jax._src import core
 from jax._src import dispatch
 from jax._src import effects
@@ -38,17 +41,16 @@ from jax._src.api_util import (flatten_fun_nokwargs, flatten_axes,
                                _ensure_index_tuple, donation_vector,
                                shaped_abstractify, check_callable)
 from jax._src.array import ArrayImpl
-from jax._src.config import config
 from jax._src.errors import JAXTypeError
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
+from jax._src.interpreters import xla
 from jax._src.interpreters import partial_eval as pe
 from jax._src.interpreters.partial_eval import (
   trace_to_subjaxpr_dynamic, DynamicJaxprTracer,
   convert_constvars_jaxpr, new_jaxpr_eqn)
 from jax._src.interpreters import pxla
-from jax._src.interpreters import xla
 from jax._src.pjit import (sharding_constraint_p, get_unconstrained_dims,
                            GSPMDSharding)
 from jax._src.sharding_impls import (
@@ -524,7 +526,7 @@ def xmap(fun: Callable,
     args_flat, in_tree = tree_flatten(args)
     fun_flat, out_tree = flatten_fun_nokwargs(lu.wrap_init(fun), in_tree)
     if donate_argnums:
-      donated_invars = donation_vector(donate_argnums, args, ())
+      donated_invars = donation_vector(donate_argnums, (), args, {})
     else:
       donated_invars = (False,) * len(args_flat)
     in_axes_flat = _flatten_axes("xmap in_axes", in_tree, in_axes, tupled_args=True)
@@ -603,8 +605,8 @@ def xmap(fun: Callable,
 
   @decorate_serial
   def lower(*args, **kwargs):
-    _experimental_lowering_platform = kwargs.pop(
-        '_experimental_lowering_platform', None)
+    lowering_parameters = kwargs.pop(
+        '_experimental_lowering_platform', mlir.LoweringParameters())
     fun_flat, args_flat, params, in_tree, out_tree = infer_params(*args)
     avals_flat = [shaped_abstractify(arg) for arg in args_flat]
     computation = make_xmap_callable(
@@ -612,7 +614,7 @@ def xmap(fun: Callable,
         params['donated_invars'], params['global_axis_sizes'], params['axis_resources'],
         params['resource_env'], params['backend'], params['spmd_in_axes'],
         params['spmd_out_axes_thunk'],
-        _experimental_lowering_platform, *avals_flat)
+        lowering_parameters, *avals_flat)
 
     in_tree = treedef_tuple([in_tree, tree_flatten({})[1]])
     in_avals = in_tree.unflatten(avals_flat)
@@ -631,7 +633,7 @@ def xmap_impl(fun: lu.WrappedFun, *args, name, in_axes, out_axes_thunk, donated_
       fun, name, in_axes, out_axes_thunk, donated_invars, global_axis_sizes,
       axis_resources, resource_env, backend,
       spmd_in_axes, spmd_out_axes_thunk,
-      None, *in_avals).compile().unsafe_call
+      mlir.LoweringParameters(), *in_avals).compile().unsafe_call
   distributed_debug_log(("Running xmapped function", name),
                         ("python function", fun.f),
                         ("mesh", resource_env.physical_mesh),
@@ -644,7 +646,7 @@ def make_xmap_callable(fun: lu.WrappedFun,
                        in_axes, out_axes_thunk, donated_invars,
                        global_axis_sizes, axis_resources, resource_env, backend,
                        spmd_in_axes, spmd_out_axes_thunk,
-                       lowering_platform: Optional[str],
+                       lowering_parameters: mlir.LoweringParameters,
                        *in_avals):
   plan = EvaluationPlan.from_axis_resources(
       axis_resources, resource_env, global_axis_sizes)
@@ -668,8 +670,8 @@ def make_xmap_callable(fun: lu.WrappedFun,
                                  name=name),
                         source_info_util.new_source_info(), resource_env, {})
   jaxpr = plan.subst_axes_with_resources(jaxpr)
-  use_spmd_lowering = config.experimental_xmap_spmd_lowering
-  ensure_fixed_sharding = config.experimental_xmap_ensure_fixed_sharding
+  use_spmd_lowering = SPMD_LOWERING.value
+  ensure_fixed_sharding = _ENSURE_FIXED_SHARDING.value
   if use_spmd_lowering and ensure_fixed_sharding:
     jaxpr = _fix_inferred_spmd_sharding(jaxpr, resource_env)
 
@@ -684,7 +686,7 @@ def make_xmap_callable(fun: lu.WrappedFun,
     mesh_in_axes, mesh_out_axes = plan.to_mesh_axes(in_axes, out_axes)
     mesh = resource_env.physical_mesh
     tiling_method: pxla.TilingMethod
-    if config.experimental_xmap_spmd_lowering_manual:
+    if SPMD_LOWERING_MANUAL.value:
       manual_mesh_axes = frozenset(it.chain.from_iterable(plan.physical_axis_resources.values()))
       tiling_method = pxla.TileManual(manual_mesh_axes)
     else:
@@ -698,11 +700,11 @@ def make_xmap_callable(fun: lu.WrappedFun,
         in_shardings, out_shardings, donated_invars,
         use_spmd_lowering, in_avals,
         tiling_method=tiling_method,
-        lowering_platform=lowering_platform)
+        lowering_parameters=lowering_parameters)
   else:
     return dispatch.sharded_lowering(
         f, name, donated_invars, True, False, in_avals, (None,) * len(in_avals),
-        lowering_platform=lowering_platform)
+        lowering_parameters=lowering_parameters)
 
 
 class EvaluationPlan(NamedTuple):
@@ -866,7 +868,7 @@ core.axis_substitution_rules[xmap_p] = _xmap_axis_subst
 # NOTE: We don't have to handle spmd_{in|out}_axes here, because
 # SPMD batching always gets involved as the last transform before XLA translation
 ad.JVPTrace.process_xmap = ad.JVPTrace.process_call  # type: ignore
-ad.call_param_updaters[xmap_p] = xla.xla_call_jvp_update_params
+ad.call_param_updaters[xmap_p] = pxla.xla_call_jvp_update_params
 
 def _xmap_transpose(params, call_jaxpr, args, cts_in, cts_in_avals, reduce_axes):
   all_args, in_tree_def = tree_flatten(((), args, cts_in))  # empty consts
@@ -1282,7 +1284,7 @@ batching.BatchTrace.post_process_xmap = _batch_trace_post_process_xmap
 
 def _xmap_lowering_rule(ctx, *args, **kwargs):
   if isinstance(ctx.module_context.axis_context, sharding_impls.SPMDAxisContext):
-    if config.experimental_xmap_spmd_lowering_manual:
+    if SPMD_LOWERING_MANUAL.value:
       return _xmap_lowering_rule_spmd_manual(ctx, *args, **kwargs)
     else:
       return _xmap_lowering_rule_spmd(ctx, *args, **kwargs)
@@ -1303,7 +1305,8 @@ def _xmap_lowering_rule_replica(ctx, *in_nodes,
                                 global_axis_sizes,
                                 spmd_in_axes, spmd_out_axes,
                                 axis_resources, resource_env, backend):
-  xla.check_backend_matches(backend, ctx.module_context.platform)
+  mlir.check_backend_matches(backend, ctx.module_context.platforms)
+  del backend, donated_invars
   # The only way for any of those two assertions to be violated is when xmap
   # is using the SPMD lowering, but then this rule shouldn't even trigger.
   assert spmd_in_axes is None and spmd_out_axes is None
@@ -1334,7 +1337,7 @@ def _xmap_lowering_rule_replica(ctx, *in_nodes,
   #       them!
   vectorized_jaxpr, out_avals, consts = pe.trace_to_jaxpr_dynamic(f, local_avals)
   _check_out_avals_vs_out_axes(out_avals, out_axes, global_axis_sizes)
-  const_nodes = map(mlir.ir_constants, consts)
+  const_nodes = [mlir.ir_constants(xla.canonicalize_dtype(x)) for x in consts]
 
   local_mesh_shape = mesh.local_mesh.shape
   tiled_ins = (
@@ -1363,8 +1366,7 @@ def _xmap_lowering_rule_replica(ctx, *in_nodes,
 
   outs = [
       mlir.lower_fun(
-          partial(_untile, out_axes=ans_out_axes, axis_sizes=local_mesh_shape,
-                  platform=ctx.module_context.platform),
+          partial(_untile, out_axes=ans_out_axes, axis_sizes=local_mesh_shape),
           multiple_results=False)(
               ctx.replace(primitive=None,
                           avals_in=[vectorized_outvar.aval],
@@ -1380,7 +1382,8 @@ def _xmap_lowering_rule_spmd(ctx, *global_in_nodes,
                              donated_invars, global_axis_sizes, spmd_in_axes,
                              spmd_out_axes, axis_resources,
                              resource_env, backend):
-  xla.check_backend_matches(backend, ctx.module_context.platform)
+  mlir.check_backend_matches(backend, ctx.module_context.platforms)
+  del backend, donated_invars
   plan = EvaluationPlan.from_axis_resources(
       axis_resources, resource_env, global_axis_sizes)
 
@@ -1402,7 +1405,7 @@ def _xmap_lowering_rule_spmd(ctx, *global_in_nodes,
       for dim, dim_extra_axis in enumerate(extra):
         if dim_extra_axis is None: continue
         assert dim_extra_axis not in axes
-        assert not config.jax_enable_checks or all(v != dim for v in axes.values())
+        assert not config.enable_checks.value or all(v != dim for v in axes.values())
         axes[dim_extra_axis] = dim
   add_spmd_axes(mesh_in_axes, spmd_in_axes)
   add_spmd_axes(mesh_out_axes, spmd_out_axes)
@@ -1417,7 +1420,7 @@ def _xmap_lowering_rule_spmd(ctx, *global_in_nodes,
     if aval_axes else [node]
     for node, aval, aval_axes in zip(global_in_nodes, global_in_avals, mesh_in_axes)
   ]
-  const_nodes = map(mlir.ir_constants, consts)
+  const_nodes = [mlir.ir_constants(xla.canonicalize_dtype(x)) for x in consts]
 
   # We in-line here rather than generating a Call HLO as in the xla_call
   # translation rule just because the extra tuple stuff is a pain.
@@ -1446,9 +1449,10 @@ def _xmap_lowering_rule_spmd_manual(ctx, *global_in_nodes,
                                     donated_invars, global_axis_sizes, spmd_in_axes,
                                     spmd_out_axes, axis_resources,
                                     resource_env, backend):
+  del donated_invars
   assert spmd_in_axes is None and spmd_out_axes is None
   # This first part (up to vtile_manual) is shared with non-MANUAL SPMD rule.
-  xla.check_backend_matches(backend, ctx.module_context.platform)
+  mlir.check_backend_matches(backend, ctx.module_context.platforms)
   plan = EvaluationPlan.from_axis_resources(
       axis_resources, resource_env, global_axis_sizes)
   manual_mesh_axes = frozenset(it.chain.from_iterable(plan.physical_axis_resources.values()))
@@ -1468,7 +1472,7 @@ def _xmap_lowering_rule_spmd_manual(ctx, *global_in_nodes,
   #       them!
   global_in_avals = ctx.avals_in
   vectorized_jaxpr, global_out_avals, consts = pe.trace_to_jaxpr_dynamic(f, global_in_avals)
-  const_nodes = map(mlir.ir_constants, consts)
+  const_nodes = [mlir.ir_constants(xla.canonicalize_dtype(x)) for x in consts]
 
   # We in-line here rather than generating a Call HLO as in the xla_call
   # translation rule just because the extra tuple stuff is a pain.
@@ -1518,13 +1522,7 @@ def _tile(x, in_axes, axis_sizes):
 
 
 # TODO(b/110096942): more efficient gather
-def _untile(x, out_axes, axis_sizes, platform):
-  # TODO(mattjj): remove this logic when AllReduce PRED supported on CPU / GPU
-  convert_bool = (np.issubdtype(x.dtype, np.bool_)
-                  and platform in ('cpu', 'gpu'))
-  if convert_bool:
-    x = lax.convert_element_type(x, np.dtype(np.float32))
-
+def _untile(x, out_axes, axis_sizes):
   tile_shape = list(x.shape)
   shape = list(tile_shape)
   for name, axis in out_axes.items():
@@ -1534,11 +1532,6 @@ def _untile(x, out_axes, axis_sizes, platform):
   padded = lax.broadcast(np.array(0, x.dtype), shape)
   padded = lax.dynamic_update_slice(padded, x, base_idxs)
   out = lax.psum(padded, tuple(out_axes.keys()))
-
-  # TODO(mattjj): remove this logic when AllReduce PRED supported on CPU / GPU
-  if convert_bool:
-    nonzero = lax.ne(out, np.array(0, dtype=np.float32))
-    out = lax.convert_element_type(nonzero, np.dtype(np.bool_))
   return out
 
 
@@ -1737,11 +1730,12 @@ def _check_out_avals_vs_out_axes(out_avals: Sequence[core.AbstractValue],
 def _check_gda_or_array_xmap_partitioning(axis_resources, resource_env,
                                           global_axis_sizes, in_axes_flat,
                                           args_flat):
-  @lru_cache()
+  @lru_cache
   def _check_sharding(in_sharding, xmap_sharding, ndim, arr_flavor):
-    if not op_shardings.are_op_shardings_equal(
-        in_sharding._to_xla_hlo_sharding(ndim),
-        xmap_sharding._to_xla_hlo_sharding(ndim)):
+    if (not op_shardings.are_op_shardings_equal(
+          in_sharding._to_xla_hlo_sharding(ndim),
+          xmap_sharding._to_xla_hlo_sharding(ndim)) or
+        in_sharding.memory_kind != xmap_sharding.memory_kind):
       raise ValueError(
           f"Got an input {arr_flavor} to xmap with different partitioning than "
           "specified in xmap. The partitioning must match. "
@@ -1836,38 +1830,34 @@ def _clear_compilation_cache(_):
 
 def _ensure_spmd_and(f):
   def update(v):
-    if v and not config.experimental_xmap_spmd_lowering:
+    if v and not SPMD_LOWERING.value:
       raise RuntimeError("This flag requires enabling the experimental_xmap_spmd_lowering flag")
     return f(v)
   return update
 
 
-try:
-  config.define_bool_state(
-      name="experimental_xmap_spmd_lowering",
-      default=False,
-      help=("When set, multi-device xmap computations will be compiled through "
-            "the XLA SPMD partitioner instead of explicit cross-replica collectives. "
-            "Not supported on CPU!"),
-      update_global_hook=_clear_compilation_cache,
-      update_thread_local_hook=_thread_local_flag_unsupported)
-  config.define_bool_state(
-      name="experimental_xmap_spmd_lowering_manual",
-      default=False,
-      help=("When set, multi-device xmap computations will be compiled using "
-            "the MANUAL partitioning feature of the XLA SPMD partitioner instead of "
-            "sharding constraints on vectorized code. "
-            "Requires experimental_xmap_spmd_lowering!"),
-      update_global_hook=_ensure_spmd_and(_clear_compilation_cache),
-      update_thread_local_hook=_thread_local_flag_unsupported)
-  config.define_bool_state(
-      name="experimental_xmap_ensure_fixed_sharding",
-      default=False,
-      help=("When set and `experimental_xmap_spmd_lowering` is enabled, the lowering will "
-            "try to limit the flexibility of the automated SPMD partitioner heuristics "
-            "by emitting additional sharding annotations for program intermediates."),
-      update_global_hook=_ensure_spmd_and(_clear_compilation_cache),
-      update_thread_local_hook=_thread_local_flag_unsupported)
-except Exception:
-  raise ImportError("jax.experimental.maps has to be imported before JAX flags "
-                    "are parsed")
+SPMD_LOWERING = config.define_bool_state(
+    name="experimental_xmap_spmd_lowering",
+    default=False,
+    help=("When set, multi-device xmap computations will be compiled through "
+          "the XLA SPMD partitioner instead of explicit cross-replica collectives. "
+          "Not supported on CPU!"),
+    update_global_hook=_clear_compilation_cache,
+    update_thread_local_hook=_thread_local_flag_unsupported)
+SPMD_LOWERING_MANUAL = config.define_bool_state(
+    name="experimental_xmap_spmd_lowering_manual",
+    default=False,
+    help=("When set, multi-device xmap computations will be compiled using "
+          "the MANUAL partitioning feature of the XLA SPMD partitioner instead of "
+          "sharding constraints on vectorized code. "
+          "Requires experimental_xmap_spmd_lowering!"),
+    update_global_hook=_ensure_spmd_and(_clear_compilation_cache),
+    update_thread_local_hook=_thread_local_flag_unsupported)
+_ENSURE_FIXED_SHARDING = config.define_bool_state(
+    name="experimental_xmap_ensure_fixed_sharding",
+    default=False,
+    help=("When set and `experimental_xmap_spmd_lowering` is enabled, the lowering will "
+          "try to limit the flexibility of the automated SPMD partitioner heuristics "
+          "by emitting additional sharding annotations for program intermediates."),
+    update_global_hook=_ensure_spmd_and(_clear_compilation_cache),
+    update_thread_local_hook=_thread_local_flag_unsupported)

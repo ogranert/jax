@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Sequence
 from functools import partial
-from typing import Any, Callable, Optional, Sequence, Union
+from typing import Callable, Optional, Union
 import warnings
 
 import numpy as np
@@ -35,11 +36,10 @@ from jax._src.lax import slicing
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import hlo
 from jax._src.numpy.ufuncs import logaddexp
+from jax._src.typing import Array
 
 map = util.safe_map
 zip = util.safe_zip
-
-Array = Any
 
 
 def reduce_window(operand, init_value, computation: Callable,
@@ -438,9 +438,8 @@ def reduce_window_shape_tuple(operand_shape, window_dimensions, window_strides,
     operand_shape = lax._dilate_shape(operand_shape, base_dilation)
   if window_dilation is not None:
     window_dimensions = lax._dilate_shape(window_dimensions, window_dilation)
-  pads_lo, pads_hi = util.unzip2(padding)
-  operand_padded = core.sum_shapes(operand_shape, pads_lo, pads_hi)
-  return core.stride_shape(operand_padded, window_dimensions, window_strides)
+  operand_padded = tuple(d + pl + ph for d, (pl, ph) in zip(operand_shape, padding))
+  return tuple(map(core.stride_dim, operand_padded, window_dimensions, window_strides))
 
 reduce_window_max_p = lax.standard_primitive(
     _common_reduce_window_shape_rule, lax._input_dtype, 'reduce_window_max')
@@ -668,8 +667,7 @@ def _select_and_gather_add_lowering(
   assert nbits <= max_bits
   double_word_reduction = nbits * 2 <= max_bits
 
-  const = lambda dtype, x: mlir.ir_constant(np.array(x, dtype=dtype),
-                                            canonicalize_types=False)
+  const = lambda dtype, x: mlir.ir_constant(np.array(x, dtype=dtype))
 
   def _broadcast_scalar_const(x, aval_out):
     return mlir.broadcast_in_dim(ctx, const(aval_out.dtype, x),

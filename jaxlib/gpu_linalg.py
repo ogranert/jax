@@ -19,6 +19,7 @@ import operator
 import jaxlib.mlir.ir as ir
 
 from .hlo_helpers import custom_call
+from .gpu_common_utils import GpuLibNotLinkedError
 
 from jaxlib import xla_client
 
@@ -50,6 +51,9 @@ def _lu_pivots_to_permutation_hlo(platform, gpu_linalg, pivots, *, permutation_s
   batch_size = _prod(dims[:-1])
   pivot_size = dims[-1]
 
+  if not gpu_linalg:
+    raise GpuLibNotLinkedError()
+
   opaque = gpu_linalg.lu_pivots_to_permutation_descriptor(
       batch_size, pivot_size, permutation_size)
   pivots_layout = tuple(range(len(dims) - 1, -1, -1))
@@ -59,11 +63,11 @@ def _lu_pivots_to_permutation_hlo(platform, gpu_linalg, pivots, *, permutation_s
   permutations_type = ir.RankedTensorType.get(permutations_dims, i32_type)
   return custom_call(
       f"{platform}_lu_pivots_to_permutation",
-      [permutations_type],
-      [pivots],
+      result_types=[permutations_type],
+      operands=[pivots],
       backend_config=opaque,
       operand_layouts=[pivots_layout],
-      result_layouts=[permutations_layout])
+      result_layouts=[permutations_layout]).results
 
 cuda_lu_pivots_to_permutation = partial(_lu_pivots_to_permutation_hlo, "cu",
                                         _cuda_linalg)

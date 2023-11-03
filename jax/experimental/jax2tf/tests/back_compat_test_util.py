@@ -21,7 +21,7 @@ The tests in this file refer to the test data in ./back_compat_testdata.
 There is one test for each version of a custom call target, e.g.,
 `test_ducc_fft` tests the FFT custom calls on CPU.
 Only custom call targets tested here should be listed in
-jax_export._CUSTOM_CALL_TARGETS_GUARANTEED_STABLE. All other custom
+export._CUSTOM_CALL_TARGETS_GUARANTEED_STABLE. All other custom
 call targets will result in an error when encountered during serialization.
 
 Once we stop using a custom call target in JAX, you can remove it from the
@@ -40,19 +40,13 @@ want, then pick some inputs, and then add this to the new test to get started.
     def func(...): ...
     inputs = (...,)  # Tuple of nd.array, keep it small, perhaps generate the
                      # inputs in `func`.
-    data = dataclasses.replace(self.load_testdata(bctu.dummy_data_dict),
-                               inputs=inputs,
-                               platform=self.default_jax_backend())
-    self.run_one_test(func, data,
-                      # Temporarily allow calls to "foo"
-                      allow_additional_custom_call_targets=("foo",))
+    data = self.starter_data(inputs)  # This is temporary, just for starting.
+    self.run_one_test(func, data)
 
 The test will fail, but will save to a file the test data you will need. The
 file name will be printed in the logs. Create a new
 file ./back_compat_testdata/foo_call.py and paste the test data that
-you will see printed in the logs. You may want to
-edit the serialization string to remove any pathnames that may be included at
-the end, or gxxxxx3 at the beginning.
+you will see printed in the logs.
 
 Name the literal `data_YYYYY_MM_DD` to include the date of serializaton
 (for readability only). Then add to this file:
@@ -67,12 +61,14 @@ then update `test_custom_call_coverage`, and then update your `test_foo_call`:
     self.run_one_test(func, data)
 
 """
+
+from collections.abc import Iterable, Sequence
 import dataclasses
 import datetime
 import os
 import re
 import sys
-from typing import Any, Callable, Iterable, Optional, Sequence
+from typing import Any, Callable, Optional
 
 from absl import logging
 
@@ -82,7 +78,7 @@ from numpy import array, float32
 
 import jax
 from jax import tree_util
-from jax.experimental.jax2tf import jax_export
+from jax.experimental.export import export
 
 from jax.experimental import pjit
 
@@ -135,6 +131,13 @@ class CompatTestBase(jtu.JaxTestCase):
     # Canonicalize to turn into "cuda" or "rocm"
     return xb.canonicalize_platform(jax.default_backend())
 
+  def starter_data(self, inputs: Sequence[np.ndarray]) -> CompatTestData:
+    # Helper for starting a test, see module docstring.
+    assert isinstance(inputs, Sequence), f"{inputs}"
+    return dataclasses.replace(self.load_testdata(dummy_data_dict),
+                               inputs=inputs,
+                               platform=self.default_jax_backend())
+
   def load_testdata(self, testdata_dict: dict[str, Any]) -> CompatTestData:
     if testdata_dict["testdata_version"] == CURRENT_TESTDATA_VERSION:
       return CompatTestData(**testdata_dict)
@@ -160,9 +163,9 @@ class CompatTestBase(jtu.JaxTestCase):
                    polymorphic_shapes: Optional[Sequence[str]] = None,
                    rtol: Optional[float] = None,
                    atol: Optional[float] = None,
-                   allow_additional_custom_call_targets: Sequence[str] = (),
+                   allow_unstable_custom_call_targets: Sequence[str] = (),
                    check_results: Optional[Callable[..., None]] = None,
-                   compare_with_current: bool = True):
+                   expect_current_custom_calls: Optional[Sequence[str]] = None):
     """Run one compatibility test.
 
     Args:
@@ -175,14 +178,12 @@ class CompatTestBase(jtu.JaxTestCase):
       check_results: invoked with the results obtained from running the
         serialized code, and those stored in the test data, and the kwargs rtol
         and atol.
-      allow_additional_custom_call_targets: additional custom call targets to allow.
-      compare_with_current: whether to compare the current behavior for
-        `func` with the one stored in `data`. If `True` (default) uses the
-        current version of JAX and XLA to lower and serialize `func` and check
-        its results compared to the stored ones; it also dumps the current
-        test data. If `False`, no current serialization are comparisons are
-        done, tests only the saved serialization. Use this option for a test
-        data for which we have changed the serialization.
+      allow_unstable_custom_call_targets: additional custom call targets to allow.
+      expect_current_custom_calls: if `None` checks that the current serialization
+        has the same custom calls as the saved one. This is the default, and
+        will fail when the serialization changes. Otherwise, when checking old
+        serializations you can specify what custom calls are expected in the
+        current serialization.
     """
     if not isinstance(data, CompatTestData):
       raise ValueError(f"Expecting data: CompatTestData but got {data}. "
@@ -201,25 +202,25 @@ class CompatTestBase(jtu.JaxTestCase):
     serialized, module_str, module_version = self.serialize(
       func, data,
       polymorphic_shapes=polymorphic_shapes,
-      allow_additional_custom_call_targets=allow_additional_custom_call_targets)
+      allow_unstable_custom_call_targets=allow_unstable_custom_call_targets)
 
     custom_call_re = r"stablehlo.custom_call\s*@([^\(]+)\("
-    custom_call_targets = sorted(
+    current_custom_call_targets = sorted(
         list(set(re.findall(custom_call_re, module_str))))
 
     np.set_printoptions(threshold=sys.maxsize, floatmode="unique")
     # Print the current test data to simplify updating the test.
     updated_testdata = f"""
-# Pasted from the test output (see back_compat_test.py module docstring)
+# Pasted from the test output (see back_compat_test_util.py module docstring)
 data_{datetime.date.today().strftime('%Y_%m_%d')} = dict(
     testdata_version={CURRENT_TESTDATA_VERSION},
-    platform={repr(self.default_jax_backend())},
-    custom_call_targets={repr(custom_call_targets)},
-    serialized_date={repr(datetime.date.today())},
-    inputs={repr(data.inputs)},
-    expected_outputs={repr(res_run_current)},
+    platform={self.default_jax_backend()!r},
+    custom_call_targets={current_custom_call_targets!r},
+    serialized_date={datetime.date.today()!r},
+    inputs={data.inputs!r},
+    expected_outputs={res_run_current!r},
     mlir_module_text=r\"\"\"\n{module_str}\"\"\",
-    mlir_module_serialized={repr(serialized)},
+    mlir_module_serialized={serialized!r},
     xla_call_module_version={module_version},
 )  # End paste
 
@@ -255,53 +256,54 @@ data_{datetime.date.today().strftime('%Y_%m_%d')} = dict(
     else:
       self.assertAllClose(res_run_serialized, data.expected_outputs,
                           rtol=rtol, atol=atol)
-    if compare_with_current:
-      self.assertListEqual(custom_call_targets, data.custom_call_targets)
+    if expect_current_custom_calls is None:
+      expect_current_custom_calls = data.custom_call_targets
+    self.assertItemsEqual(expect_current_custom_calls, current_custom_call_targets)
 
   def run_current(self, func: Callable, data: CompatTestData):
     """Lowers and runs the test function at the current JAX version."""
     return jax.jit(func)(*data.inputs)
 
   def serialize(self,
-      func: Callable, data: CompatTestData, *,
-      polymorphic_shapes: Optional[Sequence[str]] = None,
-      allow_additional_custom_call_targets: Sequence[str] = ()
-  ) -> tuple[bytes, str, int]:
+                func: Callable, data: CompatTestData, *,
+                polymorphic_shapes: Optional[Sequence[str]] = None,
+                allow_unstable_custom_call_targets: Sequence[str] = ()
+                ) -> tuple[bytes, str, int]:
     """Serializes the test function.
 
     Args:
       func: the function to serialize
       polymorphic_shapes: the polymorphic_shapes to use for serialization
-      allow_additional_custom_call_targets: whether to allow additional
-        custom call targets besides the standard ones.
+      allow_unstable_custom_call_targets: whether to allow additional
+        custom call targets besides those known as stable.
 
     Returns: a tuple with the (a) serialization, (b) the module contents as
       a string (for debugging), and (c) the module serialization version.
     """
     # Use the native exporter, to make sure we get the proper serialization.
-    args_specs = jax_export.poly_specs(data.inputs, polymorphic_shapes)
-    exported = jax_export.export(
+    args_specs = export.poly_specs(data.inputs, polymorphic_shapes)
+    exported = export.export(
       jax.jit(func),
-      lowering_platform=self.default_jax_backend(),
+      lowering_platforms=(self.default_jax_backend(),),
       disabled_checks=tuple(
-        jax_export.DisabledSafetyCheck.custom_call(target)
-        for target in allow_additional_custom_call_targets)
+        export.DisabledSafetyCheck.custom_call(target)
+        for target in allow_unstable_custom_call_targets)
     )(*args_specs)
 
-    module_str = str(exported.mlir_module)
+    module_str = str(exported.mlir_module())
     serialized = exported.mlir_module_serialized
-    module_version = exported.xla_call_module_version
+    module_version = exported.serialization_version
     return serialized, module_str, module_version
 
   def run_serialized(self, data: CompatTestData,
                      polymorphic_shapes: Optional[Sequence[str]] = None):
-    args_specs = jax_export.poly_specs(data.inputs, polymorphic_shapes)
+    args_specs = export.poly_specs(data.inputs, polymorphic_shapes)
     def ndarray_to_aval(a: np.ndarray) -> core.ShapedArray:
       return core.ShapedArray(a.shape, a.dtype)
     in_avals_tree = tree_util.tree_map(ndarray_to_aval, args_specs)
     # TODO: we ought to ensure that out_avals are polymorphic if need be. We
     # could either save the in/out_avals (but we need to first implement that
-    # support in jax_export), or we can just re-use them from the current
+    # support in export), or we can just re-use them from the current
     # exported.
     out_avals_tree = tree_util.tree_map(ndarray_to_aval, data.expected_outputs)
     # in_tree must be for (args, kwargs)
@@ -310,7 +312,7 @@ data_{datetime.date.today().strftime('%Y_%m_%d')} = dict(
     def _get_vjp(_):
       assert False  # We do not have and do not need VJP
 
-    exported = jax_export.Exported(
+    exported = export.Exported(
         fun_name="run_serialized",
         in_tree=in_tree,
         in_avals=tuple(in_avals),
@@ -318,14 +320,16 @@ data_{datetime.date.today().strftime('%Y_%m_%d')} = dict(
         out_avals=tuple(out_avals),
         in_shardings=(pxla.UNSPECIFIED,) * len(in_avals),
         out_shardings=(pxla.UNSPECIFIED,) * len(out_avals),
-        lowering_platform=data.platform,
+        lowering_platforms=(data.platform,),
+        ordered_effects=(),
+        unordered_effects=(),
         disabled_checks=(),
         mlir_module_serialized=data.mlir_module_serialized,
-        xla_call_module_version=data.xla_call_module_version,
+        serialization_version=data.xla_call_module_version,
         module_kept_var_idx=tuple(range(len(in_avals))),
-        module_uses_dim_vars=any(not core.is_constant_shape(a.shape)
-                                 for a in in_avals),
+        uses_shape_polymorphism=any(not core.is_constant_shape(a.shape)
+                                    for a in in_avals),
       _get_vjp=_get_vjp)
 
       # We use pjit in case there are shardings in the exported module.
-    return pjit.pjit(jax_export.call_exported(exported))(*data.inputs)
+    return pjit.pjit(export.call_exported(exported))(*data.inputs)

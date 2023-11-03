@@ -15,6 +15,7 @@
 # This module is largely a wrapper around `jaxlib` that performs version
 # checking on import.
 
+import datetime
 import gc
 import pathlib
 import re
@@ -62,12 +63,12 @@ def check_jaxlib_version(jax_version: str, jaxlib_version: str,
     raise RuntimeError(msg)
 
   if _jaxlib_version > _jax_version:
-    msg = (f'jaxlib version {jaxlib_version} is newer than and '
-           f'incompatible with jax version {jax_version}. Please '
-           'update your jax and/or jaxlib packages.')
-    raise RuntimeError(msg)
-
+    raise RuntimeError(
+        f'jaxlib version {jaxlib_version} is newer than and '
+        f'incompatible with jax version {jax_version}. Please '
+        'update your jax and/or jaxlib packages.')
   return _jaxlib_version
+
 
 version_str = jaxlib.version.__version__
 version = check_jaxlib_version(
@@ -75,20 +76,17 @@ version = check_jaxlib_version(
   jaxlib_version=jaxlib.version.__version__,
   minimum_jaxlib_version=jax.version._minimum_jaxlib_version)
 
-
-
 # Before importing any C compiled modules from jaxlib, first import the CPU
 # feature guard module to verify that jaxlib was compiled in a way that only
 # uses instructions that are present on this machine.
 import jaxlib.cpu_feature_guard as cpu_feature_guard
 cpu_feature_guard.check_cpu_features()
 
-# TODO(phawkins): remove after minimium jaxlib version is 0.4.9 or newer.
 try:
-  import jaxlib.utils as utils
-except ImportError:
-  utils = None
-
+  import jaxlib.cuda_plugin_extension as cuda_plugin_extension  # pytype: disable=import-error
+except ModuleNotFoundError:
+  cuda_plugin_extension = None
+import jaxlib.utils as utils
 import jaxlib.xla_client as xla_client
 import jaxlib.lapack as lapack
 
@@ -104,10 +102,16 @@ def _xla_gc_callback(*args):
   xla_client._xla.collect_garbage()
 gc.callbacks.append(_xla_gc_callback)
 
+try:
+  import jaxlib.cuda._versions as cuda_versions  # pytype: disable=import-error
+except ImportError:
+  cuda_versions = None
+
 import jaxlib.gpu_solver as gpu_solver  # pytype: disable=import-error
 import jaxlib.gpu_sparse as gpu_sparse  # pytype: disable=import-error
 import jaxlib.gpu_prng as gpu_prng  # pytype: disable=import-error
 import jaxlib.gpu_linalg as gpu_linalg  # pytype: disable=import-error
+import jaxlib.hlo_helpers as hlo_helpers  # pytype: disable=import-error
 
 # Jaxlib code is split between the Jax and the Tensorflow repositories.
 # Only for the internal usage of the JAX developers, we expose a version
@@ -117,6 +121,12 @@ xla_extension_version: int = getattr(xla_client, '_version', 0)
 
 import jaxlib.gpu_rnn as gpu_rnn  # pytype: disable=import-error
 import jaxlib.gpu_triton as gpu_triton # pytype: disable=import-error
+
+if version >= (0, 4, 14):
+  import jaxlib.tpu_mosaic as tpu_mosaic # pytype: disable=import-error
+else:
+  # Jaxlib doesn't contain Mosaic bindings
+  tpu_mosaic = None  # type: ignore
 
 # Version number for MLIR:Python APIs, provided by jaxlib.
 mlir_api_version = xla_client.mlir_api_version

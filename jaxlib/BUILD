@@ -34,6 +34,7 @@ py_library_providing_imports_info(
     name = "jaxlib",
     srcs = [
         "ducc_fft.py",
+        "gpu_common_utils.py",
         "gpu_linalg.py",
         "gpu_prng.py",
         "gpu_rnn.py",
@@ -43,6 +44,7 @@ py_library_providing_imports_info(
         "hlo_helpers.py",
         "init.py",
         "lapack.py",
+        "tpu_mosaic.py",
         ":version",
         ":xla_client",
     ],
@@ -58,12 +60,14 @@ py_library_providing_imports_info(
         "//jaxlib/mlir:chlo_dialect",
         "//jaxlib/mlir:func_dialect",
         "//jaxlib/mlir:ir",
-        "//jaxlib/mlir:jax",
+        "//jaxlib/mlir:memref_dialect",
         "//jaxlib/mlir:mhlo_dialect",
         "//jaxlib/mlir:ml_program_dialect",
         "//jaxlib/mlir:pass_manager",
+        "//jaxlib/mlir:scf_dialect",
         "//jaxlib/mlir:sparse_tensor_dialect",
         "//jaxlib/mlir:stablehlo_dialect",
+        "//jaxlib/mosaic",
     ],
 )
 
@@ -94,12 +98,25 @@ symlink_files(
 exports_files([
     "README.md",
     "setup.py",
-    "setup.cfg",
 ])
 
 cc_library(
-    name = "kernel_pybind11_helpers",
-    hdrs = ["kernel_pybind11_helpers.h"],
+    name = "absl_status_casters",
+    hdrs = ["absl_status_casters.h"],
+    copts = [
+        "-fexceptions",
+        "-fno-strict-aliasing",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_library(
+    name = "kernel_nanobind_helpers",
+    hdrs = ["kernel_nanobind_helpers.h"],
     copts = [
         "-fexceptions",
         "-fno-strict-aliasing",
@@ -107,8 +124,9 @@ cc_library(
     features = ["-use_header_modules"],
     deps = [
         ":kernel_helpers",
+        "@tsl//tsl/python/lib/core:numpy",
         "@com_google_absl//absl/base",
-        "@pybind11",
+        "@nanobind",
     ],
 )
 
@@ -160,7 +178,28 @@ pybind_extension(
         "@xla//third_party/python_runtime:headers",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:inlined_vector",
-        "@pybind11",
+        "@nanobind",
+    ],
+)
+
+pybind_extension(
+    name = "cuda_plugin_extension",
+    srcs = ["cuda_plugin_extension.cc"],
+    module_name = "cuda_plugin_extension",
+    deps = [
+        "@nanobind",
+        "//jaxlib:kernel_nanobind_helpers",
+        "@xla//third_party/python_runtime:headers",
+        "@xla//xla:status",
+        "@xla//xla:util",
+        "@xla//xla/pjrt/c:pjrt_c_api_gpu_extension_hdrs",
+        "@xla//xla/pjrt/c:pjrt_c_api_hdrs",
+        "@xla//xla/pjrt/c:pjrt_c_api_helpers",
+        # TODO(jieying): move to jaxlib after py_client_gpu is separated from py_client
+        "@xla//xla/python:py_client_gpu",
+        "@xla//xla/python:status_casters",
+        "@tsl//tsl/cuda:cublas",
+        "@tsl//tsl/cuda:cudart",
     ],
 )
 

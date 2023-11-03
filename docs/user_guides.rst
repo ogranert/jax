@@ -14,6 +14,7 @@ or deployed codebases.
    profiling
    device_memory_profiling
    debugging/index
+   gpu_performance_tips
 
 
 .. toctree::
@@ -32,3 +33,5 @@ or deployed codebases.
    aot
    errors
    transfer_guard
+
+   pallas/index

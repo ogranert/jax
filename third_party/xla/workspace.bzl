@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# buildifier: disable=module-docstring
 load("//third_party:repo.bzl", "tf_http_archive", "tf_mirror_urls")
 
 # To update XLA to a new revision,
@@ -20,8 +21,8 @@ load("//third_party:repo.bzl", "tf_http_archive", "tf_mirror_urls")
 #    curl -L https://github.com/openxla/xla/archive/<git hash>.tar.gz | sha256sum
 #    and update XLA_SHA256 with the result.
 
-XLA_COMMIT = "ca31652cdbeb6ea187589dea546ff8019274f8b2"
-XLA_SHA256 = "15235814a637f2199d2adae05c09dc8f6655737f06713108f970749bc5e87b46"
+XLA_COMMIT = "2f6eabb5a1d0a4ce5ba9eb0d52620463b3ece2c3"
+XLA_SHA256 = "22887dd5c08c9f850c1d27de9e41c21cf49ae023fd3da9e996bf8454b36ccde7"
 
 def repo():
     tf_http_archive(
@@ -36,7 +37,7 @@ def repo():
     # local checkout by either:
     # a) overriding the TF repository on the build.py command line by passing a flag
     #    like:
-    #    python build/build.py --bazel_options=--override_repository=xla=/path/to/xla
+    #    python build/build.py build --local_xla_path=/path/to/xla
     #    or
     # b) by commenting out the http_archive above and uncommenting the following:
     # local_repository(

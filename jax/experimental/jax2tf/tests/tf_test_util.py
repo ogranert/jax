@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Sequence
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
 import contextlib
 import dataclasses
-import functools
 import re
 import os
-from typing import Any, Callable, Optional
+from typing import Any
 
 from absl.testing import absltest
 from absl import logging
@@ -30,13 +31,13 @@ from jax._src import test_util as jtu
 from jax import tree_util
 
 from jax.experimental import jax2tf
-from jax.experimental.export import export
+from jax import export
 from jax._src import config
 from jax._src import xla_bridge
 import numpy as np
-import tensorflow as tf  # type: ignore[import]
-from tensorflow.compiler.xla import xla_data_pb2  # type: ignore[import]
-from tensorflow.compiler.tf2xla.python import xla as tfxla  # type: ignore[import]
+import tensorflow as tf
+from tensorflow.compiler.xla import xla_data_pb2
+from tensorflow.compiler.tf2xla.python import xla as tfxla
 
 DType = Any
 
@@ -91,8 +92,8 @@ def SaveAndLoadModel(model: tf.Module,
   return restored_model
 
 def SaveAndLoadFunction(f_tf: Callable, *,
-                        input_signature: Optional[Sequence[tf.TensorSpec]] = None,
-                        input_args: Optional[Sequence[Any]] = None,
+                        input_signature: Sequence[tf.TensorSpec] | None = None,
+                        input_args: Sequence[Any] | None = None,
                         variables: Sequence[tf.Variable] = (),
                         save_gradients=True) -> tuple[Callable, tf.train.Checkpoint]:
   # Roundtrip through saved model on disk. Return the Checkpoint also
@@ -153,9 +154,11 @@ def ComputeTfValueAndGrad(tf_f: Callable, tf_args: Sequence,
   return f1(*args1)
 
 
+# TODO(necula): clean up the test harnesses to not require these flags
 @jtu.with_config(jax_numpy_rank_promotion="allow",
                  jax_numpy_dtype_promotion='standard',
-                 jax_legacy_prng_key="allow")
+                 jax_legacy_prng_key="allow",
+                 jax_debug_key_reuse=False)
 class JaxToTfTestCase(jtu.JaxTestCase):
   # We want most tests to use the maximum available version, from the locally
   # installed tfxla module and export.
@@ -177,18 +180,18 @@ class JaxToTfTestCase(jtu.JaxTestCase):
     # We run the tests using the maximum version supported, even though
     # the default serialization version may be held back for a while to
     # ensure compatibility
-    version = config.jax_serialization_version.value
+    version = config.jax_export_calling_convention_version.value
     if self.use_max_serialization_version:
       # Use the largest supported by both export and tfxla.call_module
-      version = min(export.maximum_supported_serialization_version,
+      version = min(export.maximum_supported_calling_convention_version,
                     tfxla.call_module_maximum_supported_version())
       self.assertGreaterEqual(version,
-                              export.minimum_supported_serialization_version)
-      self.enter_context(config.jax_serialization_version(version))
+                              export.minimum_supported_calling_convention_version)
+      self.enter_context(config.jax_export_calling_convention_version(version))
     logging.info(
       "Using JAX serialization version %s (export.max_version %s, tf.XlaCallModule max version %s)",
       version,
-      export.maximum_supported_serialization_version,
+      export.maximum_supported_calling_convention_version,
       tfxla.call_module_maximum_supported_version())
 
     with contextlib.ExitStack() as stack:
@@ -290,7 +293,7 @@ class JaxToTfTestCase(jtu.JaxTestCase):
         logging.info(log_message(f"Using tol={max_tol} due to {max_tol_lim}"))
 
       # Convert results to np.arrays
-      result_tf = tf.nest.map_structure(lambda t: t.numpy(), result_tf)  # type: ignore
+      result_tf = tf.nest.map_structure(lambda t: t.numpy(), result_tf)
 
       custom_assert_lim = [l for l in jax2tf_limits if l.custom_assert]
       assert len(custom_assert_lim) <= 1, f"Expecting at most one applicable limitation with custom_assert, found {custom_assert_lim}"
@@ -363,7 +366,7 @@ class JaxToTfTestCase(jtu.JaxTestCase):
     return result_jax, result_tf
 
   def TransformConvertAndCompare(self, func: Callable, arg,
-                                 transform: Optional[str]):
+                                 transform: str | None):
     """Like ConvertAndCompare but first applies a transformation.
 
     `func` must be a function from one argument to one result. `arg` is
@@ -398,9 +401,9 @@ class JaxToTfTestCase(jtu.JaxTestCase):
     # Converts a tf.function to HLO text which we can inspect for occurrence of
     # substrings. This works whether we use native serialization or not.
     tf_function = tf.function(tf_fun, autograph=False, jit_compile=True)
-    device_name = f"/device:{jtu.device_under_test().upper()}:0"
-    return tf_function.experimental_get_compiler_ir(*args)(stage="hlo",
-                                                           device_name=device_name)
+    return tf_function.experimental_get_compiler_ir(*args)(
+        stage="hlo", platform_name=jtu.device_under_test().upper()
+    )
 
   def FindLargeTfConstants(self, tf_fun: Callable, *args,
                            at_least=256):

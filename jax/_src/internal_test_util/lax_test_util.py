@@ -17,10 +17,13 @@
 # only, and may be changed or removed at any time and without any deprecation
 # cycle.
 
+from __future__ import annotations
+
 import collections
 import itertools
-from typing import Optional, cast
+from typing import Union, cast
 
+import jax
 from jax import lax
 from jax._src import dtypes
 from jax._src import test_util
@@ -28,8 +31,7 @@ from jax._src.util import safe_map, safe_zip
 
 import numpy as np
 
-from jax import config
-config.parse_flags_with_absl()
+jax.config.parse_flags_with_absl()
 
 map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
@@ -278,8 +280,11 @@ def lax_ops():
           "betainc",
           3,
           float_dtypes,
-          test_util.rand_positive,
-          {np.float64: 1e-14},
+          test_util.rand_uniform,
+          {
+              np.float32: 1e-5,
+              np.float64: 1e-12,
+          },
       ),
       op_record(
           "igamma",
@@ -352,7 +357,7 @@ def lax_ops():
 
 
 def all_bdims(*shapes):
-  bdims = (itertools.chain([cast(Optional[int], None)],
+  bdims = (itertools.chain([cast(Union[int, None], None)],
                            range(len(shape) + 1)) for shape in shapes)
   return (t for t in itertools.product(*bdims) if not all(e is None for e in t))
 

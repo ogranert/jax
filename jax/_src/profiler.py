@@ -12,27 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+from collections.abc import Callable
 from contextlib import contextmanager
 from functools import wraps
-import glob
 import gzip
 import http.server
 import json
 import logging
 import os
+import pathlib
 import socketserver
 import threading
-
-from typing import Callable, Optional
+from typing import Any
 
 from jax._src import traceback_util
 traceback_util.register_exclusion(__file__)
 
 from jax._src import xla_bridge
 from jax._src.lib import xla_client
-from jax._src.lib import xla_extension_version
 
-_profiler_server: Optional[xla_client.profiler.ProfilerServer] = None
+_profiler_server: xla_client.profiler.ProfilerServer | None = None
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +88,7 @@ class _ProfileState:
 _profile_state = _ProfileState()
 
 
-def start_trace(log_dir, create_perfetto_link: bool = False,
+def start_trace(log_dir: os.PathLike | str, create_perfetto_link: bool = False,
                 create_perfetto_trace: bool = False) -> None:
   """Starts a profiler trace.
 
@@ -98,7 +99,7 @@ def start_trace(log_dir, create_perfetto_link: bool = False,
   The resulting trace can be viewed with TensorBoard. Note that TensorBoard
   doesn't need to be running when collecting the trace.
 
-  Only once trace may be collected a time. A RuntimeError will be raised if
+  Only one trace may be collected at a time. A RuntimeError will be raised if
   :func:`start_trace` is called while another trace is running.
 
   Args:
@@ -128,20 +129,18 @@ def start_trace(log_dir, create_perfetto_link: bool = False,
     _profile_state.create_perfetto_link = create_perfetto_link
     _profile_state.create_perfetto_trace = (
         create_perfetto_trace or create_perfetto_link)
-    _profile_state.log_dir = log_dir
+    _profile_state.log_dir = str(log_dir)
 
 
-def _write_perfetto_trace_file(log_dir):
+def _write_perfetto_trace_file(log_dir: os.PathLike | str):
   # Navigate to folder with the latest trace dump to find `trace.json.jz`
-  curr_path = os.path.abspath(log_dir)
-  root_trace_folder = os.path.join(curr_path, "plugins", "profile")
-  trace_folders = [os.path.join(root_trace_folder, trace_folder) for
-      trace_folder in os.listdir(root_trace_folder)]
-  latest_folder = max(trace_folders, key=os.path.getmtime)
-  trace_jsons = glob.glob(os.path.join(latest_folder, "*.trace.json.gz"))
-  if len(trace_jsons) != 1:
-    raise ValueError(f"Invalid trace folder: {latest_folder}")
-  trace_json, = trace_jsons
+  trace_folders = (pathlib.Path(log_dir).absolute() / "plugins" / "profile").iterdir()
+  latest_trace_folder = max(trace_folders, key=os.path.getmtime)
+  trace_jsons = latest_trace_folder.glob("*.trace.json.gz")
+  try:
+    trace_json, = trace_jsons
+  except ValueError as value_error:
+    raise ValueError(f"Invalid trace folder: {latest_trace_folder}") from value_error
 
   logger.info("Loading trace.json.gz and removing its metadata...")
   # Perfetto doesn't like the `metadata` field in `trace.json` so we remove
@@ -151,8 +150,7 @@ def _write_perfetto_trace_file(log_dir):
   with gzip.open(trace_json, "rb") as fp:
     trace = json.load(fp)
     del trace["metadata"]
-  filename = "perfetto_trace.json.gz"
-  perfetto_trace = os.path.join(latest_folder, filename)
+  perfetto_trace = latest_trace_folder / "perfetto_trace.json.gz"
   logger.info("Writing perfetto_trace.json.gz...")
   with gzip.open(perfetto_trace, "w") as fp:
     fp.write(json.dumps(trace).encode("utf-8"))
@@ -172,11 +170,11 @@ class _PerfettoServer(http.server.SimpleHTTPRequestHandler):
   def do_POST(self):
     self.send_error(404, "File not found")
 
-def _host_perfetto_trace_file(path):
+def _host_perfetto_trace_file(path: os.PathLike | str):
   # ui.perfetto.dev looks for files hosted on `127.0.0.1:9001`. We set up a
   # TCP server that is hosting the `perfetto_trace.json.gz` file.
   port = 9001
-  orig_directory = os.path.abspath(os.getcwd())
+  orig_directory = pathlib.Path.cwd()
   directory, filename = os.path.split(path)
   try:
     os.chdir(directory)
@@ -201,11 +199,8 @@ def stop_trace():
   with _profile_state.lock:
     if _profile_state.profile_session is None:
       raise RuntimeError("No profile started")
-    if xla_extension_version > 205:
-      sess = _profile_state.profile_session
-      sess.export(sess.stop(), _profile_state.log_dir)
-    else:
-      _profile_state.profile_session.stop_and_export(_profile_state.log_dir)  # pytype: disable=attribute-error
+    sess = _profile_state.profile_session
+    sess.export(sess.stop(), str(_profile_state.log_dir))
     if _profile_state.create_perfetto_trace:
       abs_filename = _write_perfetto_trace_file(_profile_state.log_dir)
       if _profile_state.create_perfetto_link:
@@ -213,14 +208,12 @@ def stop_trace():
     _profile_state.reset()
 
 
-def stop_and_get_fdo_profile() -> bytes:
+def stop_and_get_fdo_profile() -> bytes | str:
   """Stops the currently-running profiler trace and export fdo_profile.
 
   Currently, this is only supported for GPU.
   Raises a RuntimeError if a trace hasn't been started.
   """
-  if xla_extension_version < 206:
-    raise NotImplementedError("stop and get fdo profile is not supported.")
   with _profile_state.lock:
     if _profile_state.profile_session is None:
       raise RuntimeError("No profile started")
@@ -231,7 +224,7 @@ def stop_and_get_fdo_profile() -> bytes:
 
 
 @contextmanager
-def trace(log_dir, create_perfetto_link=False, create_perfetto_trace=False):
+def trace(log_dir: os.PathLike | str, create_perfetto_link=False, create_perfetto_trace=False):
   """Context manager to take a profiler trace.
 
   The trace will capture CPU, GPU, and/or TPU activity, including Python
@@ -240,7 +233,7 @@ def trace(log_dir, create_perfetto_link=False, create_perfetto_trace=False):
   The resulting trace can be viewed with TensorBoard. Note that TensorBoard
   doesn't need to be running when collecting the trace.
 
-  Only once trace may be collected a time. A RuntimeError will be raised if a
+  Only one trace may be collected at a time. A RuntimeError will be raised if a
   trace is started while another trace is running.
 
   Args:
@@ -306,7 +299,7 @@ class StepTraceAnnotation(TraceAnnotation):
     super().__init__(name, _r=1, **kwargs)
 
 
-def annotate_function(func: Callable, name: Optional[str] = None,
+def annotate_function(func: Callable, name: str | None = None,
                       **decorator_kwargs):
   """Decorator that generates a trace event for the execution of a function.
 
@@ -342,7 +335,7 @@ def annotate_function(func: Callable, name: Optional[str] = None,
   return wrapper
 
 
-def device_memory_profile(backend: Optional[str] = None) -> bytes:
+def device_memory_profile(backend: str | None = None) -> bytes:
   """Captures a JAX device memory profile as ``pprof``-format protocol buffer.
 
   A device memory profile is a snapshot of the state of memory, that describes the JAX
@@ -370,7 +363,7 @@ def device_memory_profile(backend: Optional[str] = None) -> bytes:
   return xla_client.heap_profile(xla_bridge.get_backend(backend))
 
 
-def save_device_memory_profile(filename, backend: Optional[str] = None) -> None:
+def save_device_memory_profile(filename, backend: str | None = None) -> None:
   """Collects a device memory profile and writes it to a file.
 
   :func:`save_device_memory_profile` is a convenience wrapper around :func:`device_memory_profile`
@@ -385,3 +378,62 @@ def save_device_memory_profile(filename, backend: Optional[str] = None) -> None:
   profile = device_memory_profile(backend)
   with open(filename, "wb") as f:
     f.write(profile)
+
+
+# Allows to run model with profiler given amount of times. After required amount
+# of retries achived client can collect FDO data.
+class PGLEProfiler:
+
+  def __init__(self, retries: int, percentile: int):
+    self.retries: int = retries
+    self.percentile: int = percentile
+    self.collected_fdo: str | None = None
+    self.called_times: int = 0
+    self.fdo_profiles: list[Any] = []
+    self.current_session: xla_client.profiler.ProfilerSession | None = None
+
+  def consume_fdo_profile(self) -> str | None:
+    if self.collected_fdo is not None:
+      return self.collected_fdo
+
+    if not self.is_enabled() or self.called_times != self.retries:
+      return None
+
+    self.collected_fdo = xla_client.profiler.aggregate_profiled_instructions(
+        self.fdo_profiles, self.percentile
+    )
+    return self.collected_fdo
+
+  def is_fdo_consumed(self):
+    return self.collected_fdo is not None
+
+  def disable(self):
+    self.retries = 0
+
+  def is_enabled(self):
+    return self.retries > 0
+
+  def is_running(self):
+    return self.current_session is not None
+
+  @classmethod
+  @contextmanager
+  def trace(cls, runner: PGLEProfiler | None):
+    if (runner is None or runner.is_running()
+        or not runner.is_enabled() or runner.is_fdo_consumed()):
+      yield
+    else:
+      options = xla_client.profiler.ProfileOptions()
+      options.enable_hlo_proto = True
+      runner.current_session = xla_client.profiler.ProfilerSession(options)
+
+      try:
+        yield
+      finally:
+        xspace = runner.current_session.stop()
+        runner.fdo_profiles.append(
+            xla_client.profiler.get_fdo_profile(xspace)
+        )
+        runner.current_session = None
+
+        runner.called_times += 1

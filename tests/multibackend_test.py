@@ -25,8 +25,7 @@ import jax
 from jax._src import test_util as jtu
 from jax import numpy as jnp
 
-from jax import config
-config.parse_flags_with_absl()
+jax.config.parse_flags_with_absl()
 
 npr.seed(0)
 
@@ -35,6 +34,8 @@ class MultiBackendTest(jtu.JaxTestCase):
   """Tests jit targeting to different backends."""
 
   @jtu.sample_product(backend=['cpu', 'gpu', 'tpu', None])
+  @jtu.ignore_warning(category=DeprecationWarning,
+                      message="backend and device argument")
   def testMultiBackend(self, backend):
     if backend not in ('cpu', jtu.device_under_test(), None):
       raise SkipTest("Backend is not CPU or the device under test")
@@ -48,11 +49,13 @@ class MultiBackendTest(jtu.JaxTestCase):
     z = fun(x, y)
     self.assertAllClose(z, z_host, rtol=1e-2)
     correct_platform = backend if backend else jtu.device_under_test()
-    self.assertEqual(z.device().platform, correct_platform)
+    self.assertEqual(list(z.devices())[0].platform, correct_platform)
 
   @jtu.sample_product(
     ordering=[('cpu', None), ('gpu', None), ('tpu', None), (None, None)]
   )
+  @jtu.ignore_warning(category=DeprecationWarning,
+                      message="backend and device argument")
   def testMultiBackendNestedJit(self, ordering):
     outer, inner = ordering
     if outer not in ('cpu', jtu.device_under_test(), None):
@@ -72,13 +75,15 @@ class MultiBackendTest(jtu.JaxTestCase):
     z = fun(x, y)
     self.assertAllClose(z, z_host, rtol=1e-2)
     correct_platform = outer if outer else jtu.device_under_test()
-    self.assertEqual(z.device().platform, correct_platform)
+    self.assertEqual(list(z.devices())[0].platform, correct_platform)
 
   @jtu.sample_product(
     ordering=[('cpu', 'gpu'), ('gpu', 'cpu'), ('cpu', 'tpu'), ('tpu', 'cpu'),
               (None, 'cpu'), (None, 'gpu'), (None, 'tpu'),
     ],
   )
+  @jtu.ignore_warning(category=DeprecationWarning,
+                      message="backend and device argument")
   def testMultiBackendNestedJitConflict(self, ordering):
     outer, inner = ordering
     if outer not in ('cpu', jtu.device_under_test(), None):
@@ -106,6 +111,8 @@ class MultiBackendTest(jtu.JaxTestCase):
     self.assertRaises(ValueError, lambda: fun(x, y))
 
   @jtu.sample_product(backend=['cpu', 'gpu', 'tpu'])
+  @jtu.ignore_warning(category=DeprecationWarning,
+                      message="backend and device argument")
   def testGpuMultiBackendOpByOpReturn(self, backend):
     if backend not in ('cpu', jtu.device_under_test()):
       raise SkipTest("Backend is not CPU or the device under test")
@@ -116,10 +123,12 @@ class MultiBackendTest(jtu.JaxTestCase):
     y = npr.uniform(size=(10,10))
     z = fun(x, y)
     w = jnp.sin(z)
-    self.assertEqual(z.device().platform, backend)
-    self.assertEqual(w.device().platform, backend)
+    self.assertEqual(list(z.devices())[0].platform, backend)
+    self.assertEqual(list(w.devices())[0].platform, backend)
 
   @jtu.skip_on_devices("cpu")  # test can only fail with non-cpu backends
+  @jtu.ignore_warning(category=DeprecationWarning,
+                      message="backend and device argument")
   def testJitCpu(self):
     @partial(jax.jit, backend='cpu')
     def get_arr(scale):
@@ -131,20 +140,24 @@ class MultiBackendTest(jtu.JaxTestCase):
     b = x + jnp.ones_like(x)
     c = x + jnp.eye(2)
 
-    self.assertEqual(a.device(), jax.devices('cpu')[0])
-    self.assertEqual(b.device(), jax.devices('cpu')[0])
-    self.assertEqual(c.device(), jax.devices('cpu')[0])
+    self.assertEqual(a.devices(), {jax.devices('cpu')[0]})
+    self.assertEqual(b.devices(), {jax.devices('cpu')[0]})
+    self.assertEqual(c.devices(), {jax.devices('cpu')[0]})
 
   @jtu.skip_on_devices("cpu")  # test can only fail with non-cpu backends
+  @jtu.ignore_warning(category=DeprecationWarning,
+                      message="backend and device argument")
   def test_closed_over_values_device_placement(self):
-    # see https://github.com/google/jax/issues/1431
+    # see https://github.com/jax-ml/jax/issues/1431
     def f(): return jnp.add(3., 4.)
-    self.assertNotEqual(jax.jit(f)().device(),
-                        jax.devices('cpu')[0])
-    self.assertEqual(jax.jit(f, backend='cpu')().device(),
-                     jax.devices('cpu')[0])
+    self.assertNotEqual(jax.jit(f)().devices(),
+                        {jax.devices('cpu')[0]})
+    self.assertEqual(jax.jit(f, backend='cpu')().devices(),
+                     {jax.devices('cpu')[0]})
 
   @jtu.skip_on_devices("cpu")  # test only makes sense on non-cpu backends
+  @jtu.ignore_warning(category=DeprecationWarning,
+                      message="backend and device argument")
   def test_jit_on_nondefault_backend(self):
     cpus = jax.devices("cpu")
     self.assertNotEmpty(cpus)
@@ -154,40 +167,40 @@ class MultiBackendTest(jtu.JaxTestCase):
     self.assertNotEqual(default_dev.platform, "cpu")
 
     data_on_cpu = jax.device_put(1, device=cpus[0])
-    self.assertEqual(data_on_cpu.device(), cpus[0])
+    self.assertEqual(data_on_cpu.devices(), {cpus[0]})
 
     def my_sin(x): return jnp.sin(x)
     # jit without any device spec follows the data
     result1 = jax.jit(my_sin)(2)
-    self.assertEqual(result1.device(), default_dev)
+    self.assertEqual(result1.devices(), {default_dev})
     result2 = jax.jit(my_sin)(data_on_cpu)
-    self.assertEqual(result2.device(), cpus[0])
+    self.assertEqual(result2.devices(), {cpus[0]})
 
     # jit with `device` spec places the data on the specified device
     result3 = jax.jit(my_sin, device=cpus[0])(2)
-    self.assertEqual(result3.device(), cpus[0])
+    self.assertEqual(result3.devices(), {cpus[0]})
 
     # jit with `backend` spec places the data on the specified backend
     result4 = jax.jit(my_sin, backend="cpu")(2)
-    self.assertEqual(result4.device(), cpus[0])
+    self.assertEqual(result4.devices(), {cpus[0]})
 
   @jtu.skip_on_devices("cpu")  # test only makes sense on non-cpu backends
   def test_indexing(self):
-    # https://github.com/google/jax/issues/2905
+    # https://github.com/jax-ml/jax/issues/2905
     cpus = jax.devices("cpu")
 
     x = jax.device_put(np.ones(2), cpus[0])
     y = x[0]
-    self.assertEqual(y.device(), cpus[0])
+    self.assertEqual(y.devices(), {cpus[0]})
 
   @jtu.skip_on_devices("cpu")  # test only makes sense on non-cpu backends
   def test_sum(self):
-    # https://github.com/google/jax/issues/2905
+    # https://github.com/jax-ml/jax/issues/2905
     cpus = jax.devices("cpu")
 
     x = jax.device_put(np.ones(2), cpus[0])
     y = x.sum()
-    self.assertEqual(y.device(), cpus[0])
+    self.assertEqual(y.devices(), {cpus[0]})
 
 
 if __name__ == "__main__":

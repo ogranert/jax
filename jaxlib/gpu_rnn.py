@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+
 import jaxlib.mlir.ir as ir
 import jaxlib.mlir.dialects.stablehlo as hlo
 
@@ -20,14 +22,17 @@ import numpy as np
 from jaxlib import xla_client
 from .gpu_common_utils import GpuLibNotLinkedError
 
-try:
-  from .cuda import _rnn  # pytype: disable=import-error
-  for _name, _value in _rnn.registrations().items():
-    xla_client.register_custom_call_target(_name, _value, platform='CUDA')
-except ImportError:
-  _rnn = None
+for cuda_module_name in [".cuda", "jax_cuda12_plugin"]:
+  try:
+    _rnn = importlib.import_module(f"{cuda_module_name}._rnn", package="jaxlib")
+  except ImportError:
+    _rnn = None
+  else:
+    break
 
 if _rnn:
+  for _name, _value in _rnn.registrations().items():
+    xla_client.register_custom_call_target(_name, _value, platform='CUDA')
   compute_rnn_workspace_reserve_space_sizes = _rnn.compute_rnn_workspace_reserve_space_sizes
 
 
@@ -84,9 +89,9 @@ def cudnn_rnn_lowering(ctx, input, h_0, c_0, weights, seq_lengths, *,
 
 
 def _hlo_zeros_f32(shape):
-  return hlo.ConstantOp(
+  return hlo.constant(
       ir.DenseElementsAttr.get(
-          np.zeros(shape, dtype=np.float32), type=ir.F32Type.get())).result
+          np.zeros(shape, dtype=np.float32), type=ir.F32Type.get()))
 
 
 def cudnn_rnn_bwd_lowering(ctx, dy, dhn, dcn, x, h0, c0, w, y,

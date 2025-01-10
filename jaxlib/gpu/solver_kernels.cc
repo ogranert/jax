@@ -16,16 +16,16 @@ limitations under the License.
 #include "jaxlib/gpu/solver_kernels.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
-#include <stdexcept>
-#include <utility>
-#include <vector>
+#include <memory>
+#include <string>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/synchronization/mutex.h"
 #include "jaxlib/gpu/gpu_kernel_helpers.h"
-#include "jaxlib/handle_pool.h"
+#include "jaxlib/gpu/solver_handle_pool.h"
+#include "jaxlib/gpu/vendor.h"
 #include "jaxlib/kernel_helpers.h"
 #include "xla/service/custom_call_status.h"
 
@@ -34,46 +34,6 @@ limitations under the License.
 #endif  // JAX_GPU_CUDA
 
 namespace jax {
-
-template <>
-/*static*/ absl::StatusOr<SolverHandlePool::Handle> SolverHandlePool::Borrow(
-    gpuStream_t stream) {
-  SolverHandlePool* pool = Instance();
-  absl::MutexLock lock(&pool->mu_);
-  gpusolverDnHandle_t handle;
-  if (pool->handles_[stream].empty()) {
-    JAX_RETURN_IF_ERROR(JAX_AS_STATUS(gpusolverDnCreate(&handle)));
-  } else {
-    handle = pool->handles_[stream].back();
-    pool->handles_[stream].pop_back();
-  }
-  if (stream) {
-    JAX_RETURN_IF_ERROR(JAX_AS_STATUS(gpusolverDnSetStream(handle, stream)));
-  }
-  return Handle(pool, handle, stream);
-}
-
-#ifdef JAX_GPU_CUDA
-
-template <>
-/*static*/ absl::StatusOr<SpSolverHandlePool::Handle>
-SpSolverHandlePool::Borrow(gpuStream_t stream) {
-  SpSolverHandlePool* pool = Instance();
-  absl::MutexLock lock(&pool->mu_);
-  cusolverSpHandle_t handle;
-  if (pool->handles_[stream].empty()) {
-    JAX_RETURN_IF_ERROR(JAX_AS_STATUS(cusolverSpCreate(&handle)));
-  } else {
-    handle = pool->handles_[stream].back();
-    pool->handles_[stream].pop_back();
-  }
-  if (stream) {
-    JAX_RETURN_IF_ERROR(JAX_AS_STATUS(cusolverSpSetStream(handle, stream)));
-  }
-  return Handle(pool, handle, stream);
-}
-
-#endif  // JAX_GPU_CUDA
 
 namespace JAX_GPU_NAMESPACE {
 
@@ -461,17 +421,16 @@ static absl::Status Syevd_(gpuStream_t stream, void** buffers,
   int output_idx = 1;  // with static shapes buffers[1] is the first output
   if (d.batch == -1) {
     // the batch is passed as a second operand
-    gpuMemcpyAsync((void*)&batch,
-                   reinterpret_cast<const std::int64_t*>(buffers[1]),
-                   sizeof(batch), gpuMemcpyDeviceToHost,
-                   stream);
+    JAX_RETURN_IF_ERROR(JAX_AS_STATUS(gpuMemcpyAsync(
+        (void*)&batch, reinterpret_cast<const std::int64_t*>(buffers[1]),
+        sizeof(batch), gpuMemcpyDeviceToHost, stream)));
     JAX_RETURN_IF_ERROR(JAX_AS_STATUS(gpuStreamSynchronize(stream)));
     output_idx = 2;
   }
   JAX_RETURN_IF_ERROR(JAX_AS_STATUS(gpuMemcpyAsync(
       buffers[output_idx], buffers[0],
-      SizeOfSolverType(d.type) * batch *
-          static_cast<std::int64_t>(d.n) * static_cast<std::int64_t>(d.n),
+      SizeOfSolverType(d.type) * batch * static_cast<std::int64_t>(d.n) *
+          static_cast<std::int64_t>(d.n),
       gpuMemcpyDeviceToDevice, stream)));
   gpusolverEigMode_t jobz = GPUSOLVER_EIG_MODE_VECTOR;
   int* info = static_cast<int*>(buffers[output_idx + 2]);
@@ -662,11 +621,13 @@ static absl::Status Gesvd_(gpuStream_t stream, void** buffers,
   auto h = SolverHandlePool::Borrow(stream);
   JAX_RETURN_IF_ERROR(h.status());
   auto& handle = *h;
-  JAX_RETURN_IF_ERROR(JAX_AS_STATUS(gpuMemcpyAsync(
-      buffers[1], buffers[0],
-      SizeOfSolverType(d.type) * static_cast<std::int64_t>(d.batch) *
-          static_cast<std::int64_t>(d.m) * static_cast<std::int64_t>(d.n),
-      gpuMemcpyDeviceToDevice, stream)));
+  if (buffers[1] != buffers[0]) {
+    JAX_RETURN_IF_ERROR(JAX_AS_STATUS(gpuMemcpyAsync(
+        buffers[1], buffers[0],
+        SizeOfSolverType(d.type) * static_cast<std::int64_t>(d.batch) *
+            static_cast<std::int64_t>(d.m) * static_cast<std::int64_t>(d.n),
+        gpuMemcpyDeviceToDevice, stream)));
+  }
   int* info = static_cast<int*>(buffers[5]);
   void* work = buffers[6];
   int64_t k = d.jobu == 'A' ? d.m : d.n;
@@ -767,27 +728,37 @@ static absl::Status Gesvdj_(gpuStream_t stream, void** buffers,
   auto h = SolverHandlePool::Borrow(stream);
   JAX_RETURN_IF_ERROR(h.status());
   auto& handle = *h;
-  JAX_RETURN_IF_ERROR(JAX_AS_STATUS(gpuMemcpyAsync(
-      buffers[1], buffers[0],
-      SizeOfSolverType(d.type) * static_cast<std::int64_t>(d.batch) *
-          static_cast<std::int64_t>(d.m) * static_cast<std::int64_t>(d.n),
-      gpuMemcpyDeviceToDevice, stream)));
+  if (buffers[1] != buffers[0]) {
+    JAX_RETURN_IF_ERROR(JAX_AS_STATUS(gpuMemcpyAsync(
+        buffers[1], buffers[0],
+        SizeOfSolverType(d.type) * static_cast<std::int64_t>(d.batch) *
+            static_cast<std::int64_t>(d.m) * static_cast<std::int64_t>(d.n),
+        gpuMemcpyDeviceToDevice, stream)));
+  }
   int* info = static_cast<int*>(buffers[5]);
   void* work = buffers[6];
   gesvdjInfo_t params;
   JAX_RETURN_IF_ERROR(JAX_AS_STATUS(cusolverDnCreateGesvdjInfo(&params)));
   std::unique_ptr<gesvdjInfo, void (*)(gesvdjInfo*)> params_cleanup(
       params, [](gesvdjInfo* p) { cusolverDnDestroyGesvdjInfo(p); });
-  if (d.batch == 1) {
+  if (d.batch <= 1 || d.m > 32 || d.n > 32 || d.econ) {
+    int k = std::min(d.m, d.n);
     switch (d.type) {
       case SolverType::F32: {
         float* a = static_cast<float*>(buffers[1]);
         float* s = static_cast<float*>(buffers[2]);
         float* u = static_cast<float*>(buffers[3]);
         float* v = static_cast<float*>(buffers[4]);
-        JAX_RETURN_IF_ERROR(JAX_AS_STATUS(cusolverDnSgesvdj(
-            handle.get(), d.jobz, d.econ, d.m, d.n, a, d.m, s, u, d.m, v, d.n,
-            static_cast<float*>(work), d.lwork, info, params)));
+        for (int i = 0; i < d.batch; ++i) {
+          JAX_RETURN_IF_ERROR(JAX_AS_STATUS(cusolverDnSgesvdj(
+              handle.get(), d.jobz, d.econ, d.m, d.n, a, d.m, s, u, d.m, v, d.n,
+              static_cast<float*>(work), d.lwork, info, params)));
+          a += d.m * d.n;
+          s += k;
+          u += d.m * (d.econ ? k : d.m);
+          v += (d.econ ? k : d.n) * d.n;
+          ++info;
+        }
         break;
       }
       case SolverType::F64: {
@@ -795,9 +766,16 @@ static absl::Status Gesvdj_(gpuStream_t stream, void** buffers,
         double* s = static_cast<double*>(buffers[2]);
         double* u = static_cast<double*>(buffers[3]);
         double* v = static_cast<double*>(buffers[4]);
-        JAX_RETURN_IF_ERROR(JAX_AS_STATUS(cusolverDnDgesvdj(
-            handle.get(), d.jobz, d.econ, d.m, d.n, a, d.m, s, u, d.m, v, d.n,
-            static_cast<double*>(work), d.lwork, info, params)));
+        for (int i = 0; i < d.batch; ++i) {
+          JAX_RETURN_IF_ERROR(JAX_AS_STATUS(cusolverDnDgesvdj(
+              handle.get(), d.jobz, d.econ, d.m, d.n, a, d.m, s, u, d.m, v, d.n,
+              static_cast<double*>(work), d.lwork, info, params)));
+          a += d.m * d.n;
+          s += k;
+          u += d.m * (d.econ ? k : d.m);
+          v += (d.econ ? k : d.n) * d.n;
+          ++info;
+        }
         break;
       }
       case SolverType::C64: {
@@ -805,9 +783,16 @@ static absl::Status Gesvdj_(gpuStream_t stream, void** buffers,
         float* s = static_cast<float*>(buffers[2]);
         gpuComplex* u = static_cast<gpuComplex*>(buffers[3]);
         gpuComplex* v = static_cast<gpuComplex*>(buffers[4]);
-        JAX_RETURN_IF_ERROR(JAX_AS_STATUS(cusolverDnCgesvdj(
-            handle.get(), d.jobz, d.econ, d.m, d.n, a, d.m, s, u, d.m, v, d.n,
-            static_cast<gpuComplex*>(work), d.lwork, info, params)));
+        for (int i = 0; i < d.batch; ++i) {
+          JAX_RETURN_IF_ERROR(JAX_AS_STATUS(cusolverDnCgesvdj(
+              handle.get(), d.jobz, d.econ, d.m, d.n, a, d.m, s, u, d.m, v, d.n,
+              static_cast<gpuComplex*>(work), d.lwork, info, params)));
+          a += d.m * d.n;
+          s += k;
+          u += d.m * (d.econ ? k : d.m);
+          v += (d.econ ? k : d.n) * d.n;
+          ++info;
+        }
         break;
       }
       case SolverType::C128: {
@@ -815,9 +800,16 @@ static absl::Status Gesvdj_(gpuStream_t stream, void** buffers,
         double* s = static_cast<double*>(buffers[2]);
         gpuDoubleComplex* u = static_cast<gpuDoubleComplex*>(buffers[3]);
         gpuDoubleComplex* v = static_cast<gpuDoubleComplex*>(buffers[4]);
-        JAX_RETURN_IF_ERROR(JAX_AS_STATUS(cusolverDnZgesvdj(
-            handle.get(), d.jobz, d.econ, d.m, d.n, a, d.m, s, u, d.m, v, d.n,
-            static_cast<gpuDoubleComplex*>(work), d.lwork, info, params)));
+        for (int i = 0; i < d.batch; ++i) {
+          JAX_RETURN_IF_ERROR(JAX_AS_STATUS(cusolverDnZgesvdj(
+              handle.get(), d.jobz, d.econ, d.m, d.n, a, d.m, s, u, d.m, v, d.n,
+              static_cast<gpuDoubleComplex*>(work), d.lwork, info, params)));
+          a += d.m * d.n;
+          s += k;
+          u += d.m * (d.econ ? k : d.m);
+          v += (d.econ ? k : d.n) * d.n;
+          ++info;
+        }
         break;
       }
     }

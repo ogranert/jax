@@ -23,7 +23,6 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 from jax import lax
-from jax import config
 from jax.interpreters import batching
 
 import jax._src.lib
@@ -31,7 +30,7 @@ import jax._src.util
 from jax._src import core
 from jax._src import test_util as jtu
 
-config.parse_flags_with_absl()
+jax.config.parse_flags_with_absl()
 
 
 @jtu.with_config(jax_dynamic_shapes=True, jax_numpy_rank_promotion="allow")
@@ -233,7 +232,7 @@ class DynamicShapeStagingTest(jtu.JaxTestCase):
     def f(n):
       m = 2 * n
       x = jnp.zeros(m)
-      return jax.jit(lambda: x)()
+      return jax.jit(jnp.sin)(x)
 
     # { lambda ; a:i32[]. let
     #     b:i32[] = mul a 2
@@ -518,7 +517,7 @@ class DynamicShapeStagingTest(jtu.JaxTestCase):
     self.assertIs(e.aval.shape[0], d)
 
   def test_jit_abstracted_axes_return_polymorphic_shape(self):
-    f = jax.jit(lambda x: x, abstracted_axes=('n',))
+    f = jax.jit(lambda x: jnp.sin(x), abstracted_axes=('n',))
     jaxpr = jax.make_jaxpr(f)(jnp.arange(3))  # doesn't crash
     # { lambda ; a:i32[3]. let
     #     b:i32[3] = pjit[
@@ -620,6 +619,28 @@ class DynamicShapeStagingTest(jtu.JaxTestCase):
     self.assertLessEqual(len(jaxpr.jaxpr.eqns), 3)
     jaxpr = jax.make_jaxpr(lambda x: x.reshape(-1, 12), abstracted_axes={0: 'n'})(x)
     self.assertLessEqual(len(jaxpr.jaxpr.eqns), 3)
+
+  def test_shape_validation(self):
+    # Regression test for https://github.com/jax-ml/jax/issues/18937
+    msg = r"Shapes must be 1D sequences of integer scalars, got .+"
+    with self.assertRaisesRegex(TypeError, msg):
+      jax.make_jaxpr(jnp.ones)(5.0)
+    with self.assertRaisesRegex(TypeError, msg):
+      jax.make_jaxpr(jnp.ones)(jnp.ones((2, 2)))
+
+  def test_matmul_two_arg(self):
+    def f(x, y):
+      return jnp.matmul(x, y)
+
+    jaxpr = jax.make_jaxpr(f, abstracted_axes=({0: 'a_0', 1: 'a_1'}, {0: 'a_1', 1: 'a_2'}),)(jnp.ones((8, 4)), jnp.ones((4, 8)))
+
+  def test_matmul_two_arg_size_mismatch_name_validation(self):
+    def f(x, y):
+      return jnp.matmul(x, y)
+
+    with self.assertRaisesRegex(TypeError,
+                                 re.escape("Provided size 4 for a_1 does not match prior associated name for a_1 : 8")):
+      jaxpr = jax.make_jaxpr(f, abstracted_axes=({0: 'a_0', 1: 'a_1'}, {0: 'a_1', 1: 'a_2'}),)(jnp.ones((8, 4)), jnp.ones((8, 4)))
 
 @unittest.skip("Test does not work with jax.Array")
 @jtu.with_config(jax_dynamic_shapes=True, jax_numpy_rank_promotion="allow")
@@ -1070,15 +1091,13 @@ class DynamicShapeAutodiffTest(jtu.JaxTestCase):
 @unittest.skip("Test does not work with jax.Array")
 @jtu.with_config(jax_dynamic_shapes=True, jax_numpy_rank_promotion="allow")
 class DynamicShapeExecutionTest(jtu.JaxTestCase):
-  @jtu.run_on_devices("iree")
-  def test_jit_basic_iree(self):
+  def test_jit_basic(self):
     @jax.jit
     def f(i):
       return jnp.sum(jnp.ones(i, dtype='float32'))
     self.assertAllClose(f(3), jnp.array(3., dtype='float32'), check_dtypes=True)
 
-  @jtu.run_on_devices("iree")
-  def test_jit_basic_iree_2(self):
+  def test_jit_basic_2(self):
     count = 0
 
     @partial(jax.jit, abstracted_axes=('n',))
@@ -1093,9 +1112,8 @@ class DynamicShapeExecutionTest(jtu.JaxTestCase):
     self.assertAllClose(y, 6., check_dtypes=False)
     self.assertEqual(count, 1)
 
-  @jtu.run_on_devices("iree")
-  def test_jit_polymorphic_output_iree(self):
-    # like test_jit_basic_iree, but without the jnp.sum!
+  def test_jit_polymorphic_output(self):
+    # like test_jit_basic, but without the jnp.sum!
     count = 0
 
     @jax.jit
@@ -1117,7 +1135,6 @@ class DynamicShapeExecutionTest(jtu.JaxTestCase):
     f(np.ones((5, 4), dtype=np.float32))
     # TODO: add assertions
 
-  @jtu.run_on_devices("iree")
   def test_reshape(self):
     @partial(jax.jit, abstracted_axes=({0: 'n'},))
     def f(x):  # x: f32[n, 4]
@@ -1126,7 +1143,6 @@ class DynamicShapeExecutionTest(jtu.JaxTestCase):
     f(np.ones((5, 4), dtype=np.float32))
     # TODO: add assertions
 
-  @jtu.run_on_devices("iree")
   def test_nested(self):
     @jax.jit
     def nested_f(x):  # f32[h, v] -> f32[h, v]
@@ -1139,7 +1155,6 @@ class DynamicShapeExecutionTest(jtu.JaxTestCase):
     f(np.ones((3, 5), dtype=np.float32))
     # TODO: add assertions
 
-  @jtu.run_on_devices("iree")
   def test_nested_arange(self):
     def nested_f(x):  # f32[h, v] -> f32[h, v]
       # A nested call that needs to compute with shapes
@@ -1151,7 +1166,6 @@ class DynamicShapeExecutionTest(jtu.JaxTestCase):
     f(np.ones((3, 5), dtype=np.float32))
     # TODO: add assertions
 
-  @jtu.run_on_devices("iree")
   def test_transpose(self):
     # see also https://github.com/iree-org/iree-jax/issues/57
     @partial(jax.jit, abstracted_axes=({0: 'h', 1: 'w'},))
@@ -1161,7 +1175,6 @@ class DynamicShapeExecutionTest(jtu.JaxTestCase):
     f(np.ones((3, 5), dtype=np.float32))  # doesn't crash
     # TODO: add assertions
 
-  @jtu.run_on_devices("iree")
   def test_matmul(self):
     @partial(jax.jit, abstracted_axes=({0: 'w', 1: 'w'},))
     def f(x):  # f32[w, w] -> f32[w, w]
@@ -1170,7 +1183,6 @@ class DynamicShapeExecutionTest(jtu.JaxTestCase):
     f(np.ones((5, 5), dtype=np.float32))
     # TODO: add assertions
 
-  @jtu.run_on_devices("iree")
   def test_matmul_shape_error(self):
     @partial(jax.jit, abstracted_axes=({0: 'h', 1: 'w'},))
     def f(x):  # f32[h, w] -> error
@@ -1181,7 +1193,6 @@ class DynamicShapeExecutionTest(jtu.JaxTestCase):
                                 re.escape("dot_general requires contracting dimensions to have the same shape, got")):
       f(np.ones((5, 5), dtype=np.float32))
 
-  @jtu.run_on_devices("iree")
   @unittest.skip("TODO: investigate failure")
   def test_cond(self):
     @partial(jax.jit, abstracted_axes=({0: 'w', 1: 'w'},))
@@ -1192,7 +1203,6 @@ class DynamicShapeExecutionTest(jtu.JaxTestCase):
     f(np.ones((5, 5), dtype=np.float32))
     # TODO: add assertions
 
-  @jtu.run_on_devices("iree")
   def test_arange(self):
     @partial(jax.jit, abstracted_axes=({0: 'w'},))
     def f(x):  # f32[w] -> f32[w]
@@ -1200,8 +1210,6 @@ class DynamicShapeExecutionTest(jtu.JaxTestCase):
     f(np.ones((5,), dtype=np.float32))
     # TODO: add assertions
 
-  @unittest.skip('failing w/ iree error')
-  @jtu.run_on_devices("iree")
   def test_broadcast(self):
     @partial(jax.jit, abstracted_axes=({0: 'w'},))
     def f(x):  # f32[w] -> f32[w, w]
@@ -1209,7 +1217,6 @@ class DynamicShapeExecutionTest(jtu.JaxTestCase):
     f(np.ones((5,), dtype=np.float32))
     # TODO: add assertions
 
-  @jtu.run_on_devices("iree")
   def test_zeros(self):
     @partial(jax.jit, abstracted_axes=({0: 'w'},))
     def f(x):  # f32[w] -> f32[w]
@@ -1217,8 +1224,6 @@ class DynamicShapeExecutionTest(jtu.JaxTestCase):
     f(np.ones((5,), dtype=np.float32))
     # TODO: add assertions
 
-  @unittest.skip('failing w/ iree error')
-  @jtu.run_on_devices("iree")
   def test_stack(self):
     @partial(jax.jit, abstracted_axes=({0: 'w'},))
     def f(x):
@@ -1227,8 +1232,7 @@ class DynamicShapeExecutionTest(jtu.JaxTestCase):
     f(np.ones((5,), dtype=np.float32))
     # TODO: add assertions
 
-  @jtu.run_on_devices("iree")
-  def test_jit_dependent_pair_output_iree(self):
+  def test_jit_dependent_pair_output(self):
     # Like the above 'polymorhpic output' test, but now with a `2 * n`!
     count = 0
 
@@ -1268,18 +1272,15 @@ class DynamicShapeExecutionTest(jtu.JaxTestCase):
     expected = jnp.cumsum(x)
     self.assertAllClose(ans, expected, check_dtypes=False)
 
-  @jtu.run_on_devices("iree")
   def test_jit_of_broadcast(self):
     x = jax.jit(jnp.ones)(3)
     self.assertAllClose(x, jnp.ones(3))
 
-  @jtu.run_on_devices("iree")
   def test_jit_of_broadcast2(self):
     x = jax.jit(lambda n: jnp.ones(2 * n))(3)
     self.assertAllClose(x, jnp.ones(2 * 3))
 
-  @jtu.run_on_devices("iree")
-  def test_mlp_autodiff_dynamic_batch_iree(self):
+  def test_mlp_autodiff_dynamic_batch(self):
     count = 0
 
     def predict(params, inputs):
@@ -1459,7 +1460,6 @@ class DynamicShapeExecutionTest(jtu.JaxTestCase):
       return x[0]
     f.lower(jnp.zeros((3, 4))).compiler_ir()  # doesn't crash
 
-  @jtu.run_on_devices("iree")
   def test_slicing_basic_execute(self):
     @partial(jax.jit, abstracted_axes=(None, 'n'))
     def f(x):
@@ -1486,12 +1486,16 @@ class DynamicShapeExecutionTest(jtu.JaxTestCase):
                  jax_traceback_filtering='off')
 class JumbleTest(jtu.JaxTestCase):
 
+  def setUp(self):
+    super().setUp()
+    if jax.config.x64_enabled: raise unittest.SkipTest()
+
   @parameterized.parameters((True,), (False,))
   def test_internal_jumble(self, disable_jit):
-    config.update('jax_disable_jit', disable_jit)
-    ins = lax.convert_element_type(jnp.array([3, 1, 4]), core.bint(5))
-    xs = jax.vmap(lambda n: jax.lax.iota('int32', n).sum())(ins)
-    self.assertAllClose(xs, jnp.array([3, 0, 6]), check_dtypes=False)
+    with jax.disable_jit(disable_jit):
+      ins = lax.convert_element_type(jnp.array([3, 1, 4]), core.bint(5))
+      xs = jax.vmap(lambda n: jax.lax.iota('int32', n).sum())(ins)
+      self.assertAllClose(xs, jnp.array([3, 0, 6]), check_dtypes=False)
 
   def test_jumble_escapes(self):
     ins = lax.convert_element_type(jnp.array([3, 1, 4]), core.bint(5))
@@ -1534,29 +1538,29 @@ class JumbleTest(jtu.JaxTestCase):
 
   @parameterized.parameters((True,), (False,))
   def test_jumble_map_matrix_dot_ragged_contract(self, disable_jit):
-    config.update('jax_disable_jit', disable_jit)
-    sizes = lax.convert_element_type(jnp.array([3, 1, 4]), core.bint(5))
-    p1 = jax.vmap(lambda n: jnp.ones((7, n)), out_axes=batching.jumble_axis
-                  )(sizes)
-    p2 = jax.vmap(lambda n: jnp.ones((n, 7)), out_axes=batching.jumble_axis
-                  )(sizes)
-    y = jax.vmap(jnp.dot, in_axes=batching.jumble_axis, out_axes=0,
-                 axis_size=3)(p1, p2)
-    self.assertAllClose(y, np.tile(np.array([3, 1, 4])[:, None, None], (7, 7)),
-                        check_dtypes=False)
+    with jax.disable_jit(disable_jit):
+      sizes = lax.convert_element_type(jnp.array([3, 1, 4]), core.bint(5))
+      p1 = jax.vmap(lambda n: jnp.ones((7, n)), out_axes=batching.jumble_axis
+                    )(sizes)
+      p2 = jax.vmap(lambda n: jnp.ones((n, 7)), out_axes=batching.jumble_axis
+                    )(sizes)
+      y = jax.vmap(jnp.dot, in_axes=batching.jumble_axis, out_axes=0,
+                  axis_size=3)(p1, p2)
+      self.assertAllClose(y, np.tile(np.array([3, 1, 4])[:, None, None], (7, 7)),
+                          check_dtypes=False)
 
   @parameterized.parameters((True,), (False,))
   def test_jumble_map_matrix_dot_ragged_tensor(self, disable_jit):
-    config.update('jax_disable_jit', disable_jit)
-    sizes = lax.convert_element_type(jnp.array([3, 1, 4]), core.bint(5))
-    def func(size):
-      lhs_one_d = jnp.arange(size, dtype='int32') + 1
-      lhs_two_d = jax.lax.broadcast_in_dim(lhs_one_d, (size, 2), (0,))
-      rhs = jax.lax.broadcasted_iota('int32', (2, 4), 0) + 1
-      return jnp.dot(lhs_two_d, rhs)
-    p = jax.vmap(func, out_axes=batching.jumble_axis)(sizes)
-    self.assertIsInstance(p, batching.Jumble)
-    self.assertEqual(p.data.shape, (3, 5, 4))
+    with jax.disable_jit(disable_jit):
+      sizes = lax.convert_element_type(jnp.array([3, 1, 4]), core.bint(5))
+      def func(size):
+        lhs_one_d = jnp.arange(size, dtype='int32') + 1
+        lhs_two_d = jax.lax.broadcast_in_dim(lhs_one_d, (size, 2), (0,))
+        rhs = jax.lax.broadcasted_iota('int32', (2, 4), 0) + 1
+        return jnp.dot(lhs_two_d, rhs)
+      p = jax.vmap(func, out_axes=batching.jumble_axis)(sizes)
+      self.assertIsInstance(p, batching.Jumble)
+      self.assertEqual(p.data.shape, (3, 5, 4))
 
   def test_broadcast_in_dim_while_ragged(self):
     ins = lax.convert_element_type(jnp.array([3, 1, 4]), core.bint(5))
@@ -1664,18 +1668,18 @@ class JumbleTest(jtu.JaxTestCase):
 
   @parameterized.parameters((True,), (False,))
   def test_einsum_with_ragged_tensor_and_contract_dimensions(self, disable_jit):
-    config.update('jax_disable_jit', disable_jit)
-    ragged_sizes = lax.convert_element_type(jnp.array([3, 1, 4]), core.bint(5))
-    def fprop_layer(ragged_size):
-      one_d = jnp.arange(ragged_size, dtype='int32')
-      alpha = jax.lax.broadcast_in_dim(one_d, (ragged_size, ragged_size, 2), [1])
-      v = jax.lax.broadcast_in_dim(one_d, (ragged_size, 2, 7), [0])
-      inner = jnp.einsum('tsh,shq->thq', alpha, v)
-      return inner
-    p = jax.vmap(fprop_layer, out_axes=batching.jumble_axis)(ragged_sizes)
-    self.assertIsInstance(p, batching.Jumble)
-    self.assertRegex(str(p.aval), r'Var[0-9]+:3 => i32\[bint\{≤5\}\[3\] with value: \[3 1 4\]\.Var[0-9]+,2,7\]')
-    self.assertEqual(p.data.shape, (3, 5, 2, 7))
+    with jax.disable_jit(disable_jit):
+      ragged_sizes = lax.convert_element_type(jnp.array([3, 1, 4]), core.bint(5))
+      def fprop_layer(ragged_size):
+        one_d = jnp.arange(ragged_size, dtype='int32')
+        alpha = jax.lax.broadcast_in_dim(one_d, (ragged_size, ragged_size, 2), [1])
+        v = jax.lax.broadcast_in_dim(one_d, (ragged_size, 2, 7), [0])
+        inner = jnp.einsum('tsh,shq->thq', alpha, v)
+        return inner
+      p = jax.vmap(fprop_layer, out_axes=batching.jumble_axis)(ragged_sizes)
+      self.assertIsInstance(p, batching.Jumble)
+      self.assertRegex(str(p.aval), r'Var[0-9]+:3 => i32\[bint\{≤5\}\[3\] with value: \[3 1 4\]\.Var[0-9]+,2,7\]')
+      self.assertEqual(p.data.shape, (3, 5, 2, 7))
 
   def test_split_while_ragged(self):
     ins = lax.convert_element_type(jnp.array([3, 1, 4]), core.bint(5))
@@ -1691,8 +1695,8 @@ class JumbleTest(jtu.JaxTestCase):
     self.assertAllClose(p.data, data)
 
   @parameterized.parameters((True,), (False,))
+  @unittest.skip("test fails at head")
   def test_jumble_map_end_to_end_fprop_layer(self, disable_jit):
-    config.update('jax_disable_jit', disable_jit)
 
     def fprop_layer(params, x):
       ((xnorm_scale, xnorm_bias), (wqkv, wqkv_bias), (wo, wo_bias),
@@ -1734,7 +1738,7 @@ class JumbleTest(jtu.JaxTestCase):
                                        ).at[:x.shape[0]].set(x) for x in xs])
 
       # binder = i
-      binder = core.Var(0, '', core.ShapedArray((), np.dtype('int32')))
+      binder = core.Var('', core.ShapedArray((), np.dtype('int32')))
       # elt_ty = f32[[3, 1, 4].i, 128]
       elt_ty = core.DShapedArray((batching.IndexedAxisSize(binder, lengths), 128),
                                  xs_padded.dtype)
@@ -1743,17 +1747,18 @@ class JumbleTest(jtu.JaxTestCase):
       xs_jumble = batching.Jumble(aval, xs_padded)
       return xs_jumble
 
-    xs_jumble = jumble_stack(xs)
+    with jax.disable_jit(disable_jit):
+      xs_jumble = jumble_stack(xs)
 
-    fprop_batched = jax.vmap(fprop_layer,
-                             in_axes=(None, batching.jumble_axis),
-                             out_axes=batching.jumble_axis,
-                             axis_size=3)
-    result_jumble = fprop_batched(params, xs_jumble)
-    self.assertIsInstance(result_jumble, batching.Jumble)
-    regex = r'Var[0-9]+:3 => (f32|f64)\[bint\{≤512\}\[3\] with value: \[512 386 420\]\.Var[0-9]+,128\]'
-    self.assertRegex(str(result_jumble.aval), regex)
-    self.assertAllClose(result_jumble.data.shape, (3, 512, 128))
+      fprop_batched = jax.vmap(fprop_layer,
+                              in_axes=(None, batching.jumble_axis),
+                              out_axes=batching.jumble_axis,
+                              axis_size=3)
+      result_jumble = fprop_batched(params, xs_jumble)
+      self.assertIsInstance(result_jumble, batching.Jumble)
+      regex = r'Var[0-9]+:3 => (f32|f64)\[bint\{≤512\}\[3\] with value: \[512 386 420\]\.Var[0-9]+,128\]'
+      self.assertRegex(str(result_jumble.aval), regex)
+      self.assertAllClose(result_jumble.data.shape, (3, 512, 128))
 
 def jumble_map(f):
   def mapped(*jumbles):

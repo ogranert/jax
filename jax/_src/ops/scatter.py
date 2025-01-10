@@ -14,9 +14,10 @@
 
 # Helpers for indexed updates.
 
-from collections.abc import Sequence
-import sys
-from typing import Callable, Optional, Union
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from typing import Union
 import warnings
 
 import numpy as np
@@ -34,11 +35,8 @@ from jax._src.numpy.util import check_arraylike, promote_dtypes
 from jax._src.typing import Array, ArrayLike
 
 
-if sys.version_info >= (3, 10):
-    from types import EllipsisType
-    SingleIndex = Union[None, int, slice, Sequence[int], Array, EllipsisType]
-else:
-    SingleIndex = Union[None, int, slice, Sequence[int], Array]
+from types import EllipsisType
+SingleIndex = int | slice | Sequence[int] | Array | EllipsisType | None
 Index = Union[SingleIndex, tuple[SingleIndex, ...]]
 Scalar = Union[complex, float, int, np.number]
 
@@ -116,20 +114,26 @@ def _scatter_impl(x, y, scatter_op, treedef, static_idx, dynamic_idx,
   if indexer.reversed_y_dims:
     y = lax.rev(y, indexer.reversed_y_dims)
 
+  if indexer.scalar_bool_dims:
+    x = lax.expand_dims(x, indexer.scalar_bool_dims)
+
   # Transpose the gather dimensions into scatter dimensions (cf.
   # lax._gather_transpose_rule)
   dnums = lax.ScatterDimensionNumbers(
     update_window_dims=indexer.dnums.offset_dims,
     inserted_window_dims=indexer.dnums.collapsed_slice_dims,
-    scatter_dims_to_operand_dims=indexer.dnums.start_index_map
+    scatter_dims_to_operand_dims=indexer.dnums.start_index_map,
+    operand_batching_dims=indexer.dnums.operand_batching_dims,
+    scatter_indices_batching_dims=indexer.dnums.start_indices_batching_dims,
   )
   out = scatter_op(
     x, indexer.gather_indices, y, dnums,
     indices_are_sorted=indexer.indices_are_sorted or indices_are_sorted,
     unique_indices=indexer.unique_indices or unique_indices,
     mode=mode)
+  if indexer.scalar_bool_dims:
+    out = lax.squeeze(out, indexer.scalar_bool_dims)
   return lax_internal._convert_element_type(out, dtype, weak_type)
-
 
 
 def _get_identity(op, dtype):
@@ -158,12 +162,12 @@ def _segment_update(name: str,
                     data: ArrayLike,
                     segment_ids: ArrayLike,
                     scatter_op: Callable,
-                    num_segments: Optional[int] = None,
+                    num_segments: int | None = None,
                     indices_are_sorted: bool = False,
                     unique_indices: bool = False,
-                    bucket_size: Optional[int] = None,
-                    reducer: Optional[Callable] = None,
-                    mode: Optional[lax.GatherScatterMode] = None) -> Array:
+                    bucket_size: int | None = None,
+                    reducer: Callable | None = None,
+                    mode: lax.GatherScatterMode | None = None) -> Array:
   check_arraylike(name, data, segment_ids)
   mode = lax.GatherScatterMode.FILL_OR_DROP if mode is None else mode
   data = jnp.asarray(data)
@@ -171,7 +175,7 @@ def _segment_update(name: str,
   dtype = data.dtype
   if num_segments is None:
     num_segments = np.max(segment_ids) + 1
-  num_segments = core.concrete_or_error(int, num_segments, "segment_sum() `num_segments` argument.")
+  num_segments = core.concrete_dim_or_error(num_segments, "segment_sum() `num_segments` argument.")
   if num_segments is not None and num_segments < 0:
     raise ValueError("num_segments must be non-negative.")
 
@@ -198,11 +202,11 @@ def _segment_update(name: str,
 
 def segment_sum(data: ArrayLike,
                 segment_ids: ArrayLike,
-                num_segments: Optional[int] = None,
+                num_segments: int | None = None,
                 indices_are_sorted: bool = False,
                 unique_indices: bool = False,
-                bucket_size: Optional[int] = None,
-                mode: Optional[lax.GatherScatterMode] = None) -> Array:
+                bucket_size: int | None = None,
+                mode: lax.GatherScatterMode | None = None) -> Array:
   """Computes the sum within segments of an array.
 
   Similar to TensorFlow's `segment_sum
@@ -253,11 +257,11 @@ def segment_sum(data: ArrayLike,
 
 def segment_prod(data: ArrayLike,
                  segment_ids: ArrayLike,
-                 num_segments: Optional[int] = None,
+                 num_segments: int | None = None,
                  indices_are_sorted: bool = False,
                  unique_indices: bool = False,
-                 bucket_size: Optional[int] = None,
-                 mode: Optional[lax.GatherScatterMode] = None) -> Array:
+                 bucket_size: int | None = None,
+                 mode: lax.GatherScatterMode | None = None) -> Array:
   """Computes the product within segments of an array.
 
   Similar to TensorFlow's `segment_prod
@@ -309,11 +313,11 @@ def segment_prod(data: ArrayLike,
 
 def segment_max(data: ArrayLike,
                 segment_ids: ArrayLike,
-                num_segments: Optional[int] = None,
+                num_segments: int | None = None,
                 indices_are_sorted: bool = False,
                 unique_indices: bool = False,
-                bucket_size: Optional[int] = None,
-                mode: Optional[lax.GatherScatterMode] = None) -> Array:
+                bucket_size: int | None = None,
+                mode: lax.GatherScatterMode | None = None) -> Array:
   """Computes the maximum within segments of an array.
 
   Similar to TensorFlow's `segment_max
@@ -364,11 +368,11 @@ def segment_max(data: ArrayLike,
 
 def segment_min(data: ArrayLike,
                 segment_ids: ArrayLike,
-                num_segments: Optional[int] = None,
+                num_segments: int | None = None,
                 indices_are_sorted: bool = False,
                 unique_indices: bool = False,
-                bucket_size: Optional[int] = None,
-                mode: Optional[lax.GatherScatterMode] = None) -> Array:
+                bucket_size: int | None = None,
+                mode: lax.GatherScatterMode | None = None) -> Array:
   """Computes the minimum within segments of an array.
 
   Similar to TensorFlow's `segment_min

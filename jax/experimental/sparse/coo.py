@@ -229,7 +229,7 @@ def _coo_todense_gpu_lowering(coo_todense_hlo, ctx, data, row, col, *, spinfo):
   result = coo_todense_hlo(
       data, row, col, shape=shape, data_dtype=dtype, index_dtype=row_aval.dtype)
   return (
-      [hlo.TransposeOp(result, mlir.dense_int_elements([1, 0])).result]
+      [hlo.transpose(result, mlir.dense_int_array([1, 0]))]
       if transpose else [result])
 
 
@@ -348,11 +348,11 @@ def _coo_fromdense_jvp(primals, tangents, *, nse, index_dtype):
   data, row, col = primals_out
 
   if type(Mdot) is ad.Zero:
-    data_dot = ad.Zero.from_value(data)
+    data_dot = ad.Zero.from_primal_value(data)
   else:
     data_dot = _coo_extract(row, col, Mdot)
 
-  tangents_out = (data_dot, ad.Zero.from_value(row), ad.Zero.from_value(col))
+  tangents_out = (data_dot, ad.Zero.from_primal_value(row), ad.Zero.from_primal_value(col))
 
   return primals_out, tangents_out
 

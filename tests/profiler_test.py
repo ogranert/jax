@@ -22,13 +22,13 @@ import threading
 import time
 import unittest
 from absl.testing import absltest
+import pathlib
 
 import jax
 import jax.numpy as jnp
 import jax.profiler
-from jax import config
-from jax._src.lib import xla_extension_version
 import jax._src.test_util as jtu
+from jax._src import profiler
 
 try:
   import portpicker
@@ -50,7 +50,7 @@ try:
 except ImportError:
   pass
 
-config.parse_flags_with_absl()
+jax.config.parse_flags_with_absl()
 
 
 class ProfilerTest(unittest.TestCase):
@@ -104,9 +104,27 @@ class ProfilerTest(unittest.TestCase):
         self.assertIn(b"/device:TPU", proto)
       self.assertIn(b"pxla.py", proto)
 
+  def testProgrammaticProfilingPathlib(self):
+    with tempfile.TemporaryDirectory() as tmpdir_string:
+      tmpdir = pathlib.Path(tmpdir_string)
+      try:
+        jax.profiler.start_trace(tmpdir)
+        jax.pmap(lambda x: jax.lax.psum(x + 1, 'i'), axis_name='i')(
+            jnp.ones(jax.local_device_count()))
+      finally:
+        jax.profiler.stop_trace()
+
+      proto_path = tuple(tmpdir.rglob("*.xplane.pb"))
+      self.assertEqual(len(proto_path), 1)
+      proto = proto_path[0].read_bytes()
+      # Sanity check that serialized proto contains host, device, and
+      # Python traces without deserializing.
+      self.assertIn(b"/host:CPU", proto)
+      if jtu.test_device_matches(["tpu"]):
+        self.assertIn(b"/device:TPU", proto)
+      self.assertIn(b"pxla.py", proto)
+
   def testProfilerGetFDOProfile(self):
-    if xla_extension_version < 206:
-      raise unittest.SkipTest("API version < 206")
     # Tests stop_and_get_fod_profile could run.
     try:
       jax.profiler.start_trace("test")
@@ -114,7 +132,7 @@ class ProfilerTest(unittest.TestCase):
           jnp.ones(jax.local_device_count())
       )
     finally:
-      fdo_profile = jax._src.profiler.stop_and_get_fdo_profile()
+      fdo_profile = profiler.stop_and_get_fdo_profile()
     if jtu.test_device_matches(["gpu"]) and jtu.is_device_cuda():
       self.assertIn(b"copy", fdo_profile)
 
@@ -144,6 +162,22 @@ class ProfilerTest(unittest.TestCase):
       self.assertEqual(len(proto_path), 1)
       with open(proto_path[0], "rb") as f:
         proto = f.read()
+      # Sanity check that serialized proto contains host and device traces
+      # without deserializing.
+      self.assertIn(b"/host:CPU", proto)
+      if jtu.test_device_matches(["tpu"]):
+        self.assertIn(b"/device:TPU", proto)
+
+  def testProgrammaticProfilingContextManagerPathlib(self):
+    with tempfile.TemporaryDirectory() as tmpdir_string:
+      tmpdir = pathlib.Path(tmpdir_string)
+      with jax.profiler.trace(tmpdir):
+        jax.pmap(lambda x: jax.lax.psum(x + 1, 'i'), axis_name='i')(
+            jnp.ones(jax.local_device_count()))
+
+      proto_path = tuple(tmpdir.rglob("*.xplane.pb"))
+      self.assertEqual(len(proto_path), 1)
+      proto = proto_path[0].read_bytes()
       # Sanity check that serialized proto contains host and device traces
       # without deserializing.
       self.assertIn(b"/host:CPU", proto)
@@ -238,6 +272,7 @@ class ProfilerTest(unittest.TestCase):
     port = portpicker.pick_unused_port()
     jax.profiler.start_server(port)
 
+    profile_done = threading.Event()
     logdir = absltest.get_default_test_tmpdir()
     # Remove any existing log files.
     shutil.rmtree(logdir, ignore_errors=True)
@@ -245,13 +280,18 @@ class ProfilerTest(unittest.TestCase):
       os.system(
           f"{sys.executable} -m jax.collect_profile {port} 500 "
           f"--log_dir {logdir} --no_perfetto_link")
+      profile_done.set()
 
     thread_profiler = threading.Thread(
         target=on_profile, args=())
     thread_profiler.start()
     start_time = time.time()
     y = jnp.zeros((5, 5))
-    while time.time() - start_time < 10:
+    while not profile_done.is_set():
+      # The timeout here must be relatively high. The profiler takes a while to
+      # start up on Cloud TPUs.
+      if time.time() - start_time > 30:
+        raise RuntimeError("Profile did not complete in 30s")
       y = jnp.dot(y, y)
     jax.profiler.stop_server()
     thread_profiler.join()

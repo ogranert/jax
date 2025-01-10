@@ -12,12 +12,13 @@ Key Creation & Manipulation
 .. autosummary::
   :toctree: _autosummary
 
-  PRNGKey
   key
   key_data
   wrap_key_data
   fold_in
   split
+  clone
+  PRNGKey
 
 Random Samplers
 ~~~~~~~~~~~~~~~
@@ -33,6 +34,7 @@ Random Samplers
     ball
     bernoulli
     beta
+    binomial
     bits
     categorical
     cauchy
@@ -60,7 +62,6 @@ Random Samplers
     rademacher
     randint
     rayleigh
-    shuffle
     t
     triangular
     truncated_normal

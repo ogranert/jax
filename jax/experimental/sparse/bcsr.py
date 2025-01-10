@@ -31,8 +31,7 @@ from jax.experimental.sparse._base import JAXSparse
 from jax.experimental.sparse import bcoo
 from jax.experimental.sparse.util import (
     nfold_vmap, _count_stored_elements,
-    _csr_to_coo, _dot_general_validated_shape,
-    CuSparseEfficiencyWarning, SparseInfo, Shape)
+    _csr_to_coo, CuSparseEfficiencyWarning, SparseInfo, Shape)
 from jax.util import split_list, safe_zip
 
 from jax._src import api_util
@@ -194,9 +193,10 @@ def bcsr_fromdense(mat: ArrayLike, *, nse: int | None = None, n_batch: int = 0,
     mat_bcsr: BCSR representation of the matrix.
   """
   mat_array = jnp.asarray(mat)
-  if nse is None:
-    nse = _count_stored_elements(mat_array, n_batch, n_dense)
-  nse_int: int = core.concrete_or_error(operator.index, nse, _TRACED_NSE_ERROR)
+  nse_arr: int | Array | None = nse
+  if nse_arr is None:
+    nse_arr = _count_stored_elements(mat_array, n_batch, n_dense)
+  nse_int: int = core.concrete_or_error(operator.index, nse_arr, _TRACED_NSE_ERROR)
   return BCSR(_bcsr_fromdense(mat_array, nse=nse_int, n_batch=n_batch,
                               n_dense=n_dense, index_dtype=index_dtype),
               shape=mat_array.shape)
@@ -271,11 +271,11 @@ def _bcsr_fromdense_jvp(primals, tangents, *, nse, n_batch, n_dense, index_dtype
   data, indices, indptr = primals_out
 
   if type(Mdot) is ad.Zero:
-    data_dot = ad.Zero.from_value(data)
+    data_dot = ad.Zero.from_primal_value(data)
   else:
     data_dot = bcsr_extract(indices, indptr, Mdot)
 
-  tangents_out = (data_dot, ad.Zero.from_value(indices), ad.Zero.from_value(indptr))
+  tangents_out = (data_dot, ad.Zero.from_primal_value(indices), ad.Zero.from_primal_value(indptr))
 
   return primals_out, tangents_out
 
@@ -462,7 +462,8 @@ bcsr_dot_general_p = core.Primitive('bcsr_dot_general')
 def bcsr_dot_general(lhs: BCSR | Array, rhs: Array, *,
                      dimension_numbers: DotDimensionNumbers,
                      precision: None = None,
-                     preferred_element_type: None = None) -> Array:
+                     preferred_element_type: None = None,
+                     out_type=None) -> Array:
   """A general contraction operation.
 
   Args:
@@ -479,7 +480,7 @@ def bcsr_dot_general(lhs: BCSR | Array, rhs: Array, *,
     are sparse, the result will be sparse, of type BCSR. If either input is
     dense, the result will be dense, of type ndarray.
   """
-  del precision  # unused
+  del precision, out_type  # unused
   if isinstance(rhs, (np.ndarray, jax.Array)):
     if isinstance(lhs, (np.ndarray, jax.Array)):
       return lax.dot_general(lhs, rhs, dimension_numbers=dimension_numbers,
@@ -670,8 +671,8 @@ def _bcsr_dot_general_gpu_lowering(
 
   # Account for a bug in cusparse: it references indices and data beyond
   # the extent of indptr.
-  (lhs_data,), (lhs_indices,) = _bcsr_correct_out_of_bound_indices_lowered(
-      ctx, lhs_data, lhs_indices, lhs_indptr, rhs, shape=lhs_spinfo.shape)
+  lhs_data, lhs_indices = _bcsr_correct_out_of_bound_indices_lowered(
+    ctx, lhs_data, lhs_indices, lhs_indptr, rhs, shape=lhs_spinfo.shape)
 
   if rhs_aval.ndim == 1:
     dot_general_fn = csr_matvec_lowering
@@ -680,8 +681,7 @@ def _bcsr_dot_general_gpu_lowering(
     dot_general_fn = csr_matmat_lowering
     x_dtype = 'B_dtype'
     if rhs_contract[0] == 1:
-      rhs = hlo.TransposeOp(
-          rhs, permutation=mlir.dense_int_elements([1, 0])).result
+      rhs = hlo.transpose(rhs, permutation=mlir.dense_int_array([1, 0]))
   else:
     raise ValueError(f"rhs has to be 1d or 2d; get {rhs_aval.ndim}d.")
 
@@ -714,7 +714,8 @@ if gpu_sparse.rocm_is_supported:
 #----------------------------------------------------------------------
 # BCOO functions that maybe should be primitives?
 
-def bcsr_broadcast_in_dim(mat: BCSR, *, shape: Shape, broadcast_dimensions: Sequence[int]) -> BCSR:
+def bcsr_broadcast_in_dim(mat: BCSR, *, shape: Shape, broadcast_dimensions: Sequence[int],
+                          sharding=None) -> BCSR:
   result_bcoo = bcoo.bcoo_broadcast_in_dim(
     mat.to_bcoo(), shape=shape, broadcast_dimensions=broadcast_dimensions)
   return BCSR.from_bcoo(result_bcoo)

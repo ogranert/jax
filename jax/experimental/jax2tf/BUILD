@@ -41,8 +41,6 @@ py_library(
         "call_tf.py",
         "impl_no_xla.py",
         "jax2tf.py",
-        "jax_export.py",  # TODO(necula): remove stub
-        "shape_poly.py",  # TODO(necula): remove stub
     ],
     srcs_version = "PY3",
     # TODO: b/255503696: enable pytype
@@ -50,6 +48,5 @@ py_library(
     visibility = jax_visibility("jax2tf_internal"),
     deps = [
         "//jax",
-        "//jax/experimental/export",
     ] + py_deps("numpy") + py_deps("tensorflow_core") + jax2tf_deps,
 )

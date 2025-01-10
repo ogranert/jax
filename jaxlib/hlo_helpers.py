@@ -14,9 +14,11 @@
 
 """A small library of helpers for use in jaxlib to build MLIR operations."""
 
-from collections.abc import Sequence
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
 from functools import partial
-from typing import Callable, Optional, Union
+from typing import Union
 
 import jaxlib.mlir.ir as ir
 import jaxlib.mlir.dialects.stablehlo as hlo
@@ -58,7 +60,7 @@ ShapeTypePair = tuple[Sequence[DimensionSize], ir.Type]
 
 def mk_result_types_and_shapes(
     shape_type_pairs: Sequence[ShapeTypePair]
-) -> tuple[list[ir.Type], Optional[list[ir.Value]]]:
+) -> tuple[list[ir.Type], list[ir.Value] | None]:
   result_types: list[ir.Type] = []
   result_shapes: list[ir.Value] = []
   has_dynamic_shapes = any(
@@ -76,7 +78,7 @@ def mk_result_types_and_shapes(
           result_shapes if has_dynamic_shapes else None)
 
 # TODO(necula): share this with mlir.shape_tensor
-def shape_tensor(sizes: Sequence[Union[int, ir.Value]]) -> ir.Value:
+def shape_tensor(sizes: Sequence[int | ir.Value]) -> ir.Value:
   int1d = shape_dtype_to_ir_type((1,), np.int32)
   i32_type = shape_dtype_to_ir_type((), np.int32)
   def dim_to_i32x1(d):
@@ -84,21 +86,21 @@ def shape_tensor(sizes: Sequence[Union[int, ir.Value]]) -> ir.Value:
       return hlo_const(np.array([d], dtype=np.int32))
     else:
       if d.type != i32_type:
-        d = hlo.ConvertOp(i32_type, d).result
-      return hlo.ReshapeOp(int1d, d).result
+        d = hlo.convert(i32_type, d)
+      return hlo.reshape(int1d, d)
   ds = [dim_to_i32x1(sz) for sz in sizes]
   if not ds:
     return hlo_const(np.array([], np.int32))
   elif len(ds) == 1:
     return ds[0]
   else:
-    return hlo.ConcatenateOp(
-        ds, ir.IntegerAttr.get(ir.IntegerType.get_signless(64), 0)).result
+    return hlo.concatenate(
+        ds, ir.IntegerAttr.get(ir.IntegerType.get_signless(64), 0))
 
 def hlo_const(x: np.ndarray) -> ir.Value:
   assert isinstance(x, np.ndarray)
-  return hlo.ConstantOp(
-      ir.DenseElementsAttr.get(x, type=dtype_to_ir_type(x.dtype))).result
+  return hlo.constant(
+      ir.DenseElementsAttr.get(x, type=dtype_to_ir_type(x.dtype)))
 
 def hlo_u8(x: int):
   return hlo_const(np.array(x, dtype=np.uint8))
@@ -108,6 +110,8 @@ def hlo_s32(x: int):
 def ensure_hlo_s32(x: DimensionSize):
   return hlo_s32(x) if isinstance(x, int) else x
 
+def dense_int_array(xs) -> ir.DenseI64ArrayAttr:
+  return ir.DenseI64ArrayAttr.get(np.asarray(xs, np.int64))
 
 def hlo_min(x: DimensionSize, y: DimensionSize) -> DimensionSize:
   if type(x) is int:
@@ -116,7 +120,7 @@ def hlo_min(x: DimensionSize, y: DimensionSize) -> DimensionSize:
     x = hlo_s32(x)
   if type(y) is int:
     y = hlo_s32(y)
-  return hlo.MinOp(x, y).result
+  return hlo.minimum(x, y)
 
 
 def hlo_add(x: DimensionSize, y: DimensionSize) -> DimensionSize:
@@ -126,7 +130,7 @@ def hlo_add(x: DimensionSize, y: DimensionSize) -> DimensionSize:
     x = hlo_s32(x)
   if type(y) is int:
     y = hlo_s32(y)
-  return hlo.AddOp(x, y).result
+  return hlo.add(x, y)
 
 
 # TODO(necula): this is identical with mlir.custom_call, but meant for use
@@ -136,15 +140,15 @@ def custom_call(
     *,
     result_types: Sequence[ir.Type],
     operands: Sequence[ir.Value],
-    backend_config: Union[str, bytes, dict[str, ir.Attribute]] = "",
+    backend_config: str | bytes | dict[str, ir.Attribute] = "",
     has_side_effect: bool = False,
-    result_shapes: Optional[Sequence[ir.Value]] = None,
+    result_shapes: Sequence[ir.Value] | None = None,
     called_computations: Sequence[str] = (),
     api_version: int = 2,
-    operand_output_aliases: Optional[dict[int, int]] = None,
-    operand_layouts: Optional[Sequence[Sequence[int]]] = None,
-    result_layouts: Optional[Sequence[Sequence[int]]] = None,
-    extra_attributes: Optional[dict[str, ir.Attribute]] = None,
+    operand_output_aliases: dict[int, int] | None = None,
+    operand_layouts: Sequence[Sequence[int]] | None = None,
+    result_layouts: Sequence[Sequence[int]] | None = None,
+    extra_attributes: dict[str, ir.Attribute] | None = None,
 ) -> ir.Operation:
   """Helper function for building an hlo.CustomCall.
 

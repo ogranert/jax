@@ -22,7 +22,6 @@ from jax._src import config
 from jax._src import test_util as jtu
 from jax._src import xla_bridge
 from jax._src.lib import xla_client
-from jax._src.lib import xla_extension_version
 import jax.numpy as jnp
 
 config.parse_flags_with_absl()
@@ -89,9 +88,6 @@ class DLPackTest(jtu.JaxTestCase):
 
   @jtu.sample_product(shape=all_shapes, dtype=torch_dtypes)
   def testJaxArrayToTorch(self, shape, dtype):
-    if xla_extension_version < 186:
-      self.skipTest("Need xla_extension_version >= 186")
-
     if not config.enable_x64.value and dtype in [
         jnp.int64,
         jnp.float64,
@@ -112,14 +108,18 @@ class DLPackTest(jtu.JaxTestCase):
       else:
         self.assertAllClose(np, y.cpu().numpy())
 
+  @jtu.ignore_warning(message="Calling from_dlpack with a DLPack tensor",
+                      category=DeprecationWarning)
   def testTorchToJaxInt64(self):
-    # See https://github.com/google/jax/issues/11895
+    # See https://github.com/jax-ml/jax/issues/11895
     x = jax.dlpack.from_dlpack(
         torch.utils.dlpack.to_dlpack(torch.ones((2, 3), dtype=torch.int64)))
     dtype_expected = jnp.int64 if config.enable_x64.value else jnp.int32
     self.assertEqual(x.dtype, dtype_expected)
 
   @jtu.sample_product(shape=all_shapes, dtype=torch_dtypes)
+  @jtu.ignore_warning(message="Calling from_dlpack with a DLPack tensor",
+                      category=DeprecationWarning)
   def testTorchToJax(self, shape, dtype):
     if not config.enable_x64.value and dtype in [
         jnp.int64,
@@ -145,9 +145,6 @@ class DLPackTest(jtu.JaxTestCase):
 
   @jtu.sample_product(shape=all_shapes, dtype=torch_dtypes)
   def testTorchToJaxArray(self, shape, dtype):
-    if xla_extension_version < 191:
-      self.skipTest("Need xla_extension_version >= 191")
-
     if not config.enable_x64.value and dtype in [
         jnp.int64,
         jnp.float64,

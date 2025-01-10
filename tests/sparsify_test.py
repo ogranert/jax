@@ -22,7 +22,7 @@ from absl.testing import parameterized
 import numpy as np
 
 import jax
-from jax import config, jit, lax
+from jax import jit, lax
 import jax.numpy as jnp
 import jax._src.test_util as jtu
 from jax.experimental.sparse import BCOO, BCSR, sparsify, todense, SparseTracer
@@ -31,7 +31,7 @@ from jax.experimental.sparse.transform import (
 from jax.experimental.sparse.util import CuSparseEfficiencyWarning
 from jax.experimental.sparse import test_util as sptu
 
-config.parse_flags_with_absl()
+jax.config.parse_flags_with_absl()
 
 def rand_sparse(rng, nse=0.5, post=lambda x: x, rand_method=jtu.rand_default):
   def _rand_sparse(shape, dtype, nse=nse):
@@ -610,7 +610,7 @@ class SparsifyTest(jtu.JaxTestCase):
     self.assertArraysEqual(jit(func)(Msp).todense(), expected)
 
   def testWeakTypes(self):
-    # Regression test for https://github.com/google/jax/issues/8267
+    # Regression test for https://github.com/jax-ml/jax/issues/8267
     M = jnp.arange(12, dtype='int32').reshape(3, 4)
     Msp = BCOO.fromdense(M)
     self.assertArraysEqual(
@@ -625,6 +625,7 @@ class SparsifyTest(jtu.JaxTestCase):
       for fmt in ["BCSR", "BCOO"]
       for op, dtype, kwds in [
         (jnp.copy, jnp.float32, {}),
+        (lax.conj, jnp.complex64, {}),
         (lax.abs, jnp.float32, {}),
         (lax.asin, jnp.float32, {}),
         (lax.asinh, jnp.float32, {}),

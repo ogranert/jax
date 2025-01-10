@@ -19,10 +19,11 @@ import math
 
 import jax
 from jax._src import core
+from jax._src import util
 from jax._src.typing import Array
 
 
-class JAXSparse(abc.ABC):
+class JAXSparse(util.StrictABC):
   """Base class for high-level JAX sparse objects."""
   data: jax.Array
   shape: tuple[int, ...]
@@ -44,7 +45,7 @@ class JAXSparse(abc.ABC):
     return len(self.shape)
 
   def __init__(self, args: tuple[Array, ...], *, shape: Sequence[int]):
-    self.shape = tuple(shape)
+    self.shape = core.canonicalize_shape(shape)
 
   def __repr__(self):
     name = self.__class__.__name__

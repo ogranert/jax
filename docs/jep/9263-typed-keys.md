@@ -1,3 +1,4 @@
+(jep-9263)=
 # JEP 9263: Typed keys & pluggable RNGs
 
 *Jake VanderPlas, Roy Frostig*
@@ -20,6 +21,7 @@ Array([0, 0], dtype=uint32)
 (2,)
 >>> key.dtype
 dtype('uint32')
+
 ```
 Starting now, new-style RNG keys can be created with
 {func}`jax.random.key`:
@@ -32,6 +34,7 @@ Array((), dtype=key<fry>) overlaying:
 ()
 >>> key.dtype
 key<fry>
+
 ```
 This (scalar-shaped) array behaves the same as any other JAX array, except
 that its element type is a key (and associated metadata). We can make
@@ -47,6 +50,7 @@ Array((4,), dtype=key<fry>) overlaying:
  [0 3]]
 >>> key_arr.shape
 (4,)
+
 ```
 Aside from switching to a new constructor, most PRNG-related code should
 continue to work as expected. You can continue to use keys in
@@ -61,14 +65,17 @@ data = jax.random.uniform(key, shape=(5,))
 However, not all numerical operations work on key arrays. They now
 intentionally raise errors:
 ```python
->>> key = key + 1
-ValueError: dtype=key<fry> is not a valid dtype for JAX type promotion.
+>>> key = key + 1  # doctest: +SKIP
+Traceback (most recent call last):
+TypeError: add does not accept dtypes key<fry>, int32.
+
 ```
 If for some reason you need to recover the underlying buffer
 (the old-style key), you can do so with {func}`jax.random.key_data`:
 ```python
 >>> jax.random.key_data(key)
 Array([0, 0], dtype=uint32)
+
 ```
 For old-style keys, {func}`~jax.random.key_data` is an identity operation.
 
@@ -107,6 +114,7 @@ True
 >>> raw_key = jax.random.PRNGKey(0)
 >>> jax.dtypes.issubdtype(raw_key.dtype, jax.dtypes.prng_key)
 False
+
 ```
 
 ### Type annotations for PRNG Keys
@@ -115,9 +123,10 @@ A PRNG key is distinguished from other arrays based on its `dtype`, and it is no
 currently possible to specify dtypes of JAX arrays within a type annotation.
 Previously it was possible to use `jax.random.KeyArray` or `jax.random.PRNGKeyArray`
 as type annotations, but these have always been aliased to `Any` under type checking,
-and so `jax.Array` has much more specificity. In a future JAX release, we will
-deprecate and remove `jax.random.KeyArray` and `jax.random.PRNGKeyArray` from the
-public API.
+and so `jax.Array` has much more specificity.
+
+*Note: `jax.random.KeyArray` and `jax.random.PRNGKeyArray` were deprecated in JAX
+version 0.4.16, and removed in JAX version 0.4.24*.
 
 ### Notes for JAX library authors
 If you maintain a JAX-based library, your users are also JAX users. Know that JAX
@@ -171,6 +180,7 @@ Array((), dtype=key<rbg>) overlaying:
 [0 0 0 0]
 >>> jax.random.uniform(key, shape=(3,))
 Array([0.39904642, 0.8805201 , 0.73571277], dtype=float32)
+
 ```
 
 ### Safe PRNG key use
@@ -235,15 +245,15 @@ time boils down to this:
 :class: red-background
 # Incorrect
 keys = random.split(random.PRNGKey(0))
-data = jax.vmap(random.uniform, axis=1)(keys)
+data = jax.vmap(random.uniform, in_axes=1)(keys)
 ```
 ```{code-block} python
 :class: green-background
 # Correct
 keys = random.split(random.PRNGKey(0))
-data = jax.vmap(random.uniform, axis=0)(keys)
+data = jax.vmap(random.uniform, in_axes=0)(keys)
 ```
-The bug here is subtle. By mapping over `axis=1`, this code makes new keys by
+The bug here is subtle. By mapping over `in_axes=1`, this code makes new keys by
 combining a single element from each key buffer in the batch. The resulting
 keys are different from one another, but are effectively "derived" in a
 non-standard way. Again, the PRNG is not designed or tested to produce
@@ -311,7 +321,7 @@ Why introduce extended dtypes in generality, beyond PRNGs? We reuse this same
 extended dtype mechanism elsewhere internally. For example, the
 `jax._src.core.bint` object, a bounded integer type used for experimental work
 on dynamic shapes, is another extended dtype. In recent JAX versions it satisfies
-the properties above (See [jax/_src/core.py#L1789-L1802](https://github.com/google/jax/blob/jax-v0.4.14/jax/_src/core.py#L1789-L1802)).
+the properties above (See [jax/_src/core.py#L1789-L1802](https://github.com/jax-ml/jax/blob/jax-v0.4.14/jax/_src/core.py#L1789-L1802)).
 
 ### PRNG dtypes
 PRNG dtypes are defined as a particular case of extended dtypes. Specifically,
@@ -320,6 +330,7 @@ which has the following property:
 ```python
 >>> jax.dtypes.issubdtype(jax.dtypes.prng_key, jax.dtypes.extended)
 True
+
 ```
 PRNG key arrays then have a dtype with the following properties:
 ```python
@@ -328,6 +339,7 @@ PRNG key arrays then have a dtype with the following properties:
 True
 >>> jax.dtypes.issubdtype(key.dtype, jax.dtypes.prng_key)
 True
+
 ```
 And in addition to `key.dtype._rules` as outlined for extended dtypes in
 general, PRNG dtypes define `key.dtype._impl`, which contains the metadata

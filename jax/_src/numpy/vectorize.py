@@ -11,16 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
+from collections.abc import Callable, Collection, Sequence
 import functools
 import re
-from typing import Any, Callable
+from typing import Any
+import warnings
 
 from jax._src import api
+from jax._src import config
 from jax import lax
 from jax._src.numpy import lax_numpy as jnp
-from jax._src.util import safe_map as map, safe_zip as zip
+from jax._src.util import set_module, safe_map as map, safe_zip as zip
 
+
+export = set_module('jax.numpy')
 
 # See http://docs.scipy.org/doc/numpy/reference/c-api.generalized-ufuncs.html
 _DIMENSION_NAME = r'\w+'
@@ -122,7 +128,7 @@ def _parse_input_dimensions(
     shapes.append(arg.shape[:ndim])
   broadcast_shape = lax.broadcast_shapes(*shapes)
   # TODO(mattjj): this code needs updating for dynamic shapes (hence ignore)
-  return broadcast_shape, dim_sizes  # type: ignore
+  return broadcast_shape, dim_sizes
 
 
 def _check_output_dims(
@@ -158,27 +164,30 @@ def _check_output_dims(
   return wrapped
 
 
-def _apply_excluded(func, excluded, args):
+def _apply_excluded(func: Callable[..., Any],
+                    excluded: Collection[int | str],
+                    args: Sequence[Any],
+                    kwargs: dict[str, Any]) -> tuple[Callable[..., Any], Sequence[Any], dict[str, Any]]:
   """Partially apply positional arguments in `excluded` to a function."""
   if not excluded:
-    return func, args
-
-  if max(excluded) >= len(args):
-    raise ValueError("excluded={!r} is invalid for {!r} argument(s)"
-                     .format(excluded, len(args)))
+    return func, args, kwargs
 
   dynamic_args = [arg for i, arg in enumerate(args) if i not in excluded]
-  static_args = [(i, args[i]) for i in sorted(excluded)]
+  dynamic_kwargs = {key: val for key, val in kwargs.items() if key not in excluded}
+  static_args = [(i, args[i]) for i in sorted(e for e in excluded if isinstance(e, int))
+                 if i < len(args)]
+  static_kwargs = {key: val for key, val in kwargs.items() if key in excluded}
 
-  def new_func(*args):
+  def new_func(*args, **kwargs):
     args = list(args)
     for i, arg in static_args:
       args.insert(i, arg)
-    return func(*args)
+    return func(*args, **kwargs, **static_kwargs)
 
-  return new_func, dynamic_args
+  return new_func, dynamic_args, dynamic_kwargs
 
 
+@export
 def vectorize(pyfunc, *, excluded=frozenset(), signature=None):
   """Define a vectorized function with broadcasting.
 
@@ -209,61 +218,61 @@ def vectorize(pyfunc, *, excluded=frozenset(), signature=None):
   Returns:
     Vectorized version of the given function.
 
-  Here are a few examples of how one could write vectorized linear algebra
-  routines using :func:`vectorize`:
+  Examples:
+    Here are a few examples of how one could write vectorized linear algebra
+    routines using :func:`vectorize`:
 
-  >>> from functools import partial
+    >>> from functools import partial
 
-  >>> @partial(jnp.vectorize, signature='(k),(k)->(k)')
-  ... def cross_product(a, b):
-  ...   assert a.shape == b.shape and a.ndim == b.ndim == 1
-  ...   return jnp.array([a[1] * b[2] - a[2] * b[1],
-  ...                     a[2] * b[0] - a[0] * b[2],
-  ...                     a[0] * b[1] - a[1] * b[0]])
+    >>> @partial(jnp.vectorize, signature='(k),(k)->(k)')
+    ... def cross_product(a, b):
+    ...   assert a.shape == b.shape and a.ndim == b.ndim == 1
+    ...   return jnp.array([a[1] * b[2] - a[2] * b[1],
+    ...                     a[2] * b[0] - a[0] * b[2],
+    ...                     a[0] * b[1] - a[1] * b[0]])
 
-  >>> @partial(jnp.vectorize, signature='(n,m),(m)->(n)')
-  ... def matrix_vector_product(matrix, vector):
-  ...   assert matrix.ndim == 2 and matrix.shape[1:] == vector.shape
-  ...   return matrix @ vector
+    >>> @partial(jnp.vectorize, signature='(n,m),(m)->(n)')
+    ... def matrix_vector_product(matrix, vector):
+    ...   assert matrix.ndim == 2 and matrix.shape[1:] == vector.shape
+    ...   return matrix @ vector
 
-  These functions are only written to handle 1D or 2D arrays (the ``assert``
-  statements will never be violated), but with vectorize they support
-  arbitrary dimensional inputs with NumPy style broadcasting, e.g.,
+    These functions are only written to handle 1D or 2D arrays (the ``assert``
+    statements will never be violated), but with vectorize they support
+    arbitrary dimensional inputs with NumPy style broadcasting, e.g.,
 
-  >>> cross_product(jnp.ones(3), jnp.ones(3)).shape
-  (3,)
-  >>> cross_product(jnp.ones((2, 3)), jnp.ones(3)).shape
-  (2, 3)
-  >>> cross_product(jnp.ones((1, 2, 3)), jnp.ones((2, 1, 3))).shape
-  (2, 2, 3)
-  >>> matrix_vector_product(jnp.ones(3), jnp.ones(3))  # doctest: +IGNORE_EXCEPTION_DETAIL
-  Traceback (most recent call last):
-  ValueError: input with shape (3,) does not have enough dimensions for all
-  core dimensions ('n', 'k') on vectorized function with excluded=frozenset()
-  and signature='(n,k),(k)->(k)'
-  >>> matrix_vector_product(jnp.ones((2, 3)), jnp.ones(3)).shape
-  (2,)
-  >>> matrix_vector_product(jnp.ones((2, 3)), jnp.ones((4, 3))).shape
-  (4, 2)
+    >>> cross_product(jnp.ones(3), jnp.ones(3)).shape
+    (3,)
+    >>> cross_product(jnp.ones((2, 3)), jnp.ones(3)).shape
+    (2, 3)
+    >>> cross_product(jnp.ones((1, 2, 3)), jnp.ones((2, 1, 3))).shape
+    (2, 2, 3)
+    >>> matrix_vector_product(jnp.ones(3), jnp.ones(3))  # doctest: +IGNORE_EXCEPTION_DETAIL
+    Traceback (most recent call last):
+    ValueError: input with shape (3,) does not have enough dimensions for all
+    core dimensions ('n', 'k') on vectorized function with excluded=frozenset()
+    and signature='(n,k),(k)->(k)'
+    >>> matrix_vector_product(jnp.ones((2, 3)), jnp.ones(3)).shape
+    (2,)
+    >>> matrix_vector_product(jnp.ones((2, 3)), jnp.ones((4, 3))).shape
+    (4, 2)
 
-  Note that this has different semantics than `jnp.matmul`:
+    Note that this has different semantics than `jnp.matmul`:
 
-  >>> jnp.matmul(jnp.ones((2, 3)), jnp.ones((4, 3)))  # doctest: +IGNORE_EXCEPTION_DETAIL
-  Traceback (most recent call last):
-  TypeError: dot_general requires contracting dimensions to have the same shape, got [3] and [4].
+    >>> jnp.matmul(jnp.ones((2, 3)), jnp.ones((4, 3)))  # doctest: +IGNORE_EXCEPTION_DETAIL
+    Traceback (most recent call last):
+    TypeError: dot_general requires contracting dimensions to have the same shape, got [3] and [4].
   """
-  if any(not isinstance(exclude, int) for exclude in excluded):
-    raise TypeError("jax.numpy.vectorize can only exclude integer arguments, "
+  if any(not isinstance(exclude, (str, int)) for exclude in excluded):
+    raise TypeError("jax.numpy.vectorize can only exclude integer or string arguments, "
                     "but excluded={!r}".format(excluded))
-  if excluded and min(excluded) < 0:
+  if any(isinstance(e, int) and e < 0 for e in excluded):
     raise ValueError(f"excluded={excluded!r} contains negative numbers")
 
   @functools.wraps(pyfunc)
-  def wrapped(*args):
+  def wrapped(*args, **kwargs):
     error_context = ("on vectorized function with excluded={!r} and "
                      "signature={!r}".format(excluded, signature))
-    excluded_func, args = _apply_excluded(pyfunc, excluded, args)
-    args = tuple(map(jnp.asarray, args))
+    excluded_func, args, kwargs = _apply_excluded(pyfunc, excluded, args, kwargs)
 
     if signature is not None:
       input_core_dims, output_core_dims = _parse_gufunc_signature(signature)
@@ -271,11 +280,37 @@ def vectorize(pyfunc, *, excluded=frozenset(), signature=None):
       input_core_dims = [()] * len(args)
       output_core_dims = None
 
+    none_args = {i for i, arg in enumerate(args) if arg is None}
+    if any(none_args):
+      if any(input_core_dims[i] != () for i in none_args):
+        raise ValueError(f"Cannot pass None at locations {none_args} with {signature=}")
+      excluded_func, args, _ = _apply_excluded(excluded_func, none_args, args, {})
+      input_core_dims = [dim for i, dim in enumerate(input_core_dims) if i not in none_args]
+
+    args = tuple(map(jnp.asarray, args))
+
     broadcast_shape, dim_sizes = _parse_input_dimensions(
         args, input_core_dims, error_context)
 
     checked_func = _check_output_dims(
         excluded_func, dim_sizes, output_core_dims, error_context)
+
+    # Detect implicit rank promotion:
+    if config.numpy_rank_promotion.value != "allow":
+      ranks = [arg.ndim - len(core_dims)
+               for arg, core_dims in zip(args, input_core_dims)
+               if arg.ndim != 0]
+      if len(set(ranks)) > 1:
+        msg = (f"operands with shapes {[arg.shape for arg in args]} require rank"
+               f" promotion for jnp.vectorize function with signature {signature}."
+               " Set the jax_numpy_rank_promotion config option to 'allow' to"
+               " disable this message; for more information, see"
+               " https://jax.readthedocs.io/en/latest/rank_promotion_warning.html.")
+        if config.numpy_rank_promotion.value == "warn":
+          warnings.warn(msg)
+        elif config.numpy_rank_promotion.value == "raise":
+          raise ValueError(msg)
+
 
     # Rather than broadcasting all arguments to full broadcast shapes, prefer
     # expanding dimensions using vmap. By pushing broadcasting
